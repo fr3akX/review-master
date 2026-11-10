@@ -1,0 +1,26 @@
+[package]
+name = "review-master"
+version = "0.1.0"
+edition = "2021"
+description = "review-master: agent pull-request reviews posted as line-anchored inline comments"
+
+[dependencies]
+base64 = "0.23.1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3.34"
+globset = "0.4.21"
+ignore = "0.4"
+jsonschema = { version = "0.60.2", default-features = false }
+regex = "1.13.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "gzip", "brotli", "zstd", "deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "signal", "net"] }
+toml = "1"
+uuid = { version = "1.29.0", features = ["v4"] }
+xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
+
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
