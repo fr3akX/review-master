@@ -539,14 +539,10 @@ function renderScopePop() {
     h('button', { class: 'btn small', onclick: restoreAll }, 'Show all'));
 }
 
-function buildSidebar() {
-  const add = S.order.reduce((n, fs) => n + fs.file.additions, 0);
-  const del = S.order.reduce((n, fs) => n + fs.file.deletions, 0);
-  const out = S.excluded.size;
-  $('#file-summary').replaceChildren(plural(S.order.length, 'file'), ' ', counts({ additions: add, deletions: del }),
-    ...(out ? [' · ', h('button', { class: 'link-btn scope-link', title: 'Excluded files', onclick: toggleScopePop }, `${out} excluded`)] : []));
+// Directory tree of the files in review: { dirs: Map(name → node), files: [fs] }.
+function fileTree(list) {
   const root = { dirs: new Map(), files: [] };
-  for (const fs of S.order) {
+  for (const fs of list) {
     let node = root;
     for (const part of fs.path.split('/').slice(0, -1)) {
       if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
@@ -554,6 +550,26 @@ function buildSidebar() {
     }
     node.files.push(fs);
   }
+  return root;
+}
+
+// Shared by the sidebar and the main column so both list files in the same order.
+const sortedDirs = node => [...node.dirs].sort((a, b) => a[0].localeCompare(b[0]));
+const sortedFiles = node => [...node.files].sort((a, b) => a.path.localeCompare(b.path));
+
+// Depth-first file order of the tree: directories first, then files.
+function treeOrder(node, out = []) {
+  for (const [, child] of sortedDirs(node)) treeOrder(child, out);
+  out.push(...sortedFiles(node));
+  return out;
+}
+
+function buildSidebar(root) {
+  const add = S.order.reduce((n, fs) => n + fs.file.additions, 0);
+  const del = S.order.reduce((n, fs) => n + fs.file.deletions, 0);
+  const out = S.excluded.size;
+  $('#file-summary').replaceChildren(plural(S.order.length, 'file'), ' ', counts({ additions: add, deletions: del }),
+    ...(out ? [' · ', h('button', { class: 'link-btn scope-link', title: 'Excluded files', onclick: toggleScopePop }, `${out} excluded`)] : []));
   $('#file-list').replaceChildren(...treeItems(root, ''));
 }
 
@@ -561,7 +577,7 @@ function buildSidebar() {
 // row, e.g. "src/block_meta/"), then files; folding state lives in S.collapsed.
 function treeItems(node, prefix) {
   const items = [];
-  for (const [name, child] of [...node.dirs].sort((a, b) => a[0].localeCompare(b[0]))) {
+  for (const [name, child] of sortedDirs(node)) {
     let label = `${name}/`;
     let dir = child;
     while (dir.dirs.size === 1 && !dir.files.length) {
@@ -583,7 +599,7 @@ function treeItems(node, prefix) {
       h('ul', { class: 'tree' }, treeItems(dir, path)));
     items.push(li);
   }
-  for (const fs of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) items.push(fs.nav);
+  for (const fs of sortedFiles(node)) items.push(fs.nav);
   return items;
 }
 
@@ -658,23 +674,26 @@ function makeFileState(f) {
   return fs;
 }
 
-// (Re)builds sections and the tree for the files in review scope; file states
-// (loaded diffs, panes) are reused when a file comes back into scope.
+// (Re)builds sections and the tree for the files in review scope, both in tree order;
+// file states (loaded diffs, panes) are reused when a file comes back into scope.
 function renderScope(files) {
   closeSym();
   if (S.viewer && S.excluded.has(S.viewer.path)) closeViewer();
   if (S.sel && S.excluded.has(S.sel.pane.path)) clearSel();
   S.files = new Map();
-  S.order = files.map((f, idx) => {
+  for (const f of files) {
     let fs = S.fileCache.get(f.path);
     if (!fs) {
       fs = makeFileState(f);
       S.fileCache.set(f.path, fs);
     }
+    S.files.set(f.path, fs);
+  }
+  const root = fileTree(S.files.values());
+  S.order = treeOrder(root);
+  S.order.forEach((fs, idx) => {
     fs.idx = idx;
     fs.section.dataset.idx = idx;
-    S.files.set(f.path, fs);
-    return fs;
   });
   const wrap = $('#sections');
   if (S.order.length) wrap.replaceChildren(...S.order.map(fs => fs.section));
@@ -684,7 +703,7 @@ function renderScope(files) {
     S.current.nav.classList.remove('active');
     S.current = null;
   }
-  buildSidebar();
+  buildSidebar(root);
   renderScopeControls();
   renderDraftCounts();
   renderAllAnnotations();
