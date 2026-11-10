@@ -813,8 +813,8 @@ function flashRange(pane, side, from, to) {
 // ───────────── #[cfg(test)] folds ─────────────
 // Ranges come from GET /api/folds (language server or text scan, can be slow): fetched
 // lazily once per Rust file and applied to already-rendered tables when they arrive.
-// Viewer: one bar per range. Diff: one bar per run of consecutive hunks lying wholly
-// inside ranges. Default open; collapsed folds are remembered per PR.
+// One bar per range in both views (the diff fold may start mid-hunk and span hunks).
+// Default open; collapsed folds are remembered per PR, keyed by range start.
 
 const foldPrefKey = () => `review-master:folds:${prId()}`;
 
@@ -864,7 +864,7 @@ async function attachFolds(pane) {
   const ranges = await fetchFolds(pane.path);
   if (!ranges.length || pane.folds.size) return;
   if (pane.kind === 'full') foldFullRows(pane, ranges);
-  else foldDiffHunks(pane, ranges);
+  else foldDiffRows(pane, ranges);
   for (const f of pane.folds.values()) {
     const keepOpen = pane.lastReveal && pane.lastReveal.dataset.fold === f.key;
     if (S.folded.has(`${pane.path}|${f.key}`) && !keepOpen) setFold(pane, f.key, false, false);
@@ -891,56 +891,39 @@ function foldFullRows(pane, ranges) {
   }
 }
 
-// A hunk is test code when it changes something inside a range and every changed
-// line is inside one. Context lines are ignored; whitespace-only added lines are
-// neutral (e.g. the blank separator before `#[cfg(test)]`).
-function foldDiffHunks(pane, ranges) {
-  const inRange = tr => {
-    if (tr.dataset.new) {
-      const n = +tr.dataset.new;
-      return ranges.some(([s, e]) => n >= s && n <= e);
-    }
-    const after = +tr.dataset.after; // deleted line: between new lines `after` and `after + 1`
-    return ranges.some(([s, e]) => s <= after && after < e);
-  };
-  const isTestHunk = lines => {
-    let inside = 0;
-    for (const tr of lines) {
-      const added = tr.classList.contains('add');
-      if (!added && !tr.classList.contains('del')) continue; // context
-      if (inRange(tr)) inside++;
-      else if (!(added && !tr.cells[3].textContent.trim())) return false;
-    }
-    return inside > 0;
-  };
-  const hunks = [];
-  for (const tr of pane.table.tBodies[0].rows) {
-    if (tr.classList.contains('hunk')) hunks.push({ head: tr, lines: [] });
-    else if (tr.classList.contains('ln-row') && hunks.length) hunks[hunks.length - 1].lines.push(tr);
-  }
-  let group = [];
-  const flush = () => {
-    if (!group.length) return;
-    const first = group[0].lines[0];
-    const key = `diff:${first.dataset.new || `d${first.dataset.after}`}`;
+// Diff: per range, the rows whose new line lies inside it (deleted rows: between two
+// in-range lines), widened over adjacent whitespace-only rows. The fold covers the
+// contiguous span, so it can start mid-hunk and swallows hunk separators within it.
+function foldDiffRows(pane, ranges) {
+  const rows = [...pane.table.tBodies[0].rows].filter(tr => tr.classList.contains('ln-row') || tr.classList.contains('hunk'));
+  const isLine = tr => tr.classList.contains('ln-row');
+  const blank = tr => isLine(tr) && !tr.dataset.fold && !tr.cells[3].textContent.trim();
+  for (const [s, e] of ranges) {
+    const inside = tr => {
+      if (!isLine(tr)) return false;
+      if (tr.dataset.new) return +tr.dataset.new >= s && +tr.dataset.new <= e;
+      const after = +tr.dataset.after;
+      return s <= after && after < e;
+    };
+    let first = rows.findIndex(inside);
+    if (first < 0) continue;
+    let last = rows.findLastIndex(inside);
+    while (first > 0 && blank(rows[first - 1])) first--;
+    while (last < rows.length - 1 && blank(rows[last + 1])) last++;
+    const key = `diff:${s}`;
+    let lines = 0;
     let add = 0;
     let del = 0;
-    for (const hk of group) {
-      hk.head.dataset.fold = key;
-      for (const tr of hk.lines) {
-        tr.dataset.fold = key;
-        if (tr.classList.contains('add')) add++;
-        if (tr.classList.contains('del')) del++;
-      }
+    for (let i = first; i <= last; i++) {
+      const tr = rows[i];
+      tr.dataset.fold = key;
+      if (!isLine(tr)) continue;
+      lines++;
+      if (tr.classList.contains('add')) add++;
+      else if (tr.classList.contains('del')) del++;
     }
-    addFoldBar(pane, key, group[0].head, `${plural(group.length, 'hunk')}, +${add} −${del}`);
-    group = [];
-  };
-  for (const hk of hunks) {
-    if (isTestHunk(hk.lines)) group.push(hk);
-    else flush();
+    addFoldBar(pane, key, rows[first], `${plural(lines, 'line')}, +${add} −${del}`);
   }
-  flush();
 }
 
 function addFoldBar(pane, key, before, desc) {
