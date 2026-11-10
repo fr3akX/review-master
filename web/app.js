@@ -50,7 +50,7 @@ const S = {
   scopePop: null, // open "N excluded" restore popover
   io: null, // IntersectionObserver that lazily loads diffs
   sym: null, // { el } — open symbol (LSP) popup
-  folded: new Set(), // "path|foldKey" of #[cfg(test)] folds the user collapsed (persisted)
+  foldOverrides: new Map(), // "path|foldKey" → open: per-fold choices since the last tests-toggle flip (persisted)
   foldCache: new Map(), // path → Promise<ranges> from /api/folds
   summary: { text: null, act: null, running: false, error: null, loadFailed: false, collapsed: false }, // PR summary card
   lspWarm: new Set(), // paths whose language server was asked to start
@@ -458,6 +458,7 @@ function changeScope(mutate, message = null) {
     S.scope.extra = new Set([...S.scope.extra].filter(p => S.excluded.has(p)));
     saveScopePrefs();
     renderScope(r.files || []);
+    if (prev.tests !== S.scope.tests) resetTestFolds();
     if (message) toast(typeof message === 'function' ? message() : message, 'info');
     return true;
   });
@@ -814,22 +815,26 @@ function flashRange(pane, side, from, to) {
 // Ranges come from GET /api/folds (language server or text scan, can be slow): fetched
 // lazily once per Rust file and applied to already-rendered tables when they arrive.
 // One bar per range in both views (the diff fold may start mid-hunk and span hunks).
-// Default open; collapsed folds are remembered per PR, keyed by range start.
+// Default: collapsed while "Exclude tests" is on, else open; flipping the toggle resets
+// every fold to that default and clears per-fold overrides (bar clicks, jumps), which
+// are remembered per PR, keyed by range start.
 
 const foldPrefKey = () => `review-master:folds:${prId()}`;
 
 function loadFoldPrefs() {
   try {
-    const keys = JSON.parse(localStorage.getItem(foldPrefKey()) || '[]');
-    S.folded = new Set(Array.isArray(keys) ? keys : []);
+    const saved = JSON.parse(localStorage.getItem(foldPrefKey()) || '{}');
+    S.foldOverrides = new Map(saved && typeof saved === 'object' && !Array.isArray(saved)
+      ? Object.entries(saved).filter(([, open]) => typeof open === 'boolean')
+      : []);
   } catch {
-    S.folded = new Set();
+    S.foldOverrides = new Map();
   }
 }
 
 function saveFoldPrefs() {
   try {
-    localStorage.setItem(foldPrefKey(), JSON.stringify([...S.folded]));
+    localStorage.setItem(foldPrefKey(), JSON.stringify(Object.fromEntries(S.foldOverrides)));
   } catch {
     /* storage unavailable */
   }
@@ -867,8 +872,21 @@ async function attachFolds(pane) {
   else foldDiffRows(pane, ranges);
   for (const f of pane.folds.values()) {
     const keepOpen = pane.lastReveal && pane.lastReveal.dataset.fold === f.key;
-    if (S.folded.has(`${pane.path}|${f.key}`) && !keepOpen) setFold(pane, f.key, false, false);
+    const open = keepOpen || (S.foldOverrides.get(`${pane.path}|${f.key}`) ?? !S.scope.tests);
+    if (!open) setFold(pane, f.key, false, false);
     else updateFoldBar(f);
+  }
+}
+
+// Tests toggle flipped: every rendered fold goes to the new default, overrides are dropped.
+function resetTestFolds() {
+  S.foldOverrides.clear();
+  saveFoldPrefs();
+  const panes = [...S.fileCache.values()].map(fs => fs.pane);
+  if (S.viewer) panes.push(S.viewer.pane);
+  for (const pane of panes) {
+    if (!pane) continue;
+    for (const key of pane.folds.keys()) setFold(pane, key, !S.scope.tests, false);
   }
 }
 
@@ -951,9 +969,7 @@ function setFold(pane, key, open, persist = true) {
   const rows = foldRows(f);
   for (const tr of rows) tr.hidden = !open;
   if (persist) {
-    const id = `${pane.path}|${key}`;
-    if (open) S.folded.delete(id);
-    else S.folded.add(id);
+    S.foldOverrides.set(`${pane.path}|${key}`, open);
     saveFoldPrefs();
   }
   updateFoldBar(f, rows);
