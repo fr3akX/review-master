@@ -379,6 +379,9 @@ struct ChatRequest {
     line: Option<u64>,
     #[serde(default)]
     side: Option<String>,
+    /// Exact code text the reviewer highlighted, for the prompt.
+    #[serde(default)]
+    snippet: Option<String>,
     question: String,
 }
 
@@ -449,7 +452,7 @@ fn file_window(st: &AppState, a: &Anchor) -> String {
 }
 
 /// Chat context: subject, PR description, then anchor hunks/excerpt or the file list.
-fn chat_prompt(st: &AppState, anchor: Option<&Anchor>, question: &str) -> String {
+fn chat_prompt(st: &AppState, anchor: Option<&Anchor>, snippet: Option<&str>, question: &str) -> String {
     let subject = st.subject();
     let mut p = subject.heading;
     let description: String = subject.description.trim().chars().take(4000).collect();
@@ -472,6 +475,10 @@ fn chat_prompt(st: &AppState, anchor: Option<&Anchor>, question: &str) -> String
             let list: Vec<String> = st.model.files.iter().map(|f| format!("{} ({})", f.path, f.status.api())).collect();
             p.push_str(&format!("\nChanged files: {}\n", list.join(", ")));
         }
+    }
+    if let Some(snippet) = snippet.map(str::trim).filter(|s| !s.is_empty()) {
+        let cut: String = snippet.chars().take(2000).collect();
+        p.push_str(&format!("\nThe reviewer highlighted exactly this part:\n<selection>\n{cut}\n</selection>\n"));
     }
     p.push_str(
         "\nAnswer the reviewer's question about this change. Investigate with the repository tools when the \
@@ -512,7 +519,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> 
                 None => "review-master: chat".to_owned(),
             };
             let session = st.engine.start_session(&name).await.map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
-            let prompt = chat_prompt(&st, anchor.as_ref(), &req.question);
+            let prompt = chat_prompt(&st, anchor.as_ref(), req.snippet.as_deref(), &req.question);
             let mut threads = st.threads.lock().unwrap();
             threads.next += 1;
             let id = threads.next;
