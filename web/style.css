@@ -625,6 +625,22 @@ tr.del-marker td { height: 6px; background: var(--del-bg); color: var(--red); fo
 tr.del-marker:hover td { background: var(--del-ln); }
 tr.del-marker td.code { font-family: var(--sans); }
 
+tr.fold-bar td {
+  padding: 2px 12px 2px 60px;
+  border-top: 1px dashed var(--border);
+  border-bottom: 1px dashed var(--border);
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+  font-family: var(--sans);
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  user-select: none;
+}
+tr.fold-bar:hover td { background: var(--bg-sunken); color: var(--fg); }
+tr.fold-bar.closed td { border-bottom-style: solid; }
+.fold-label { font-family: var(--mono); }
+
 tr.annot > td {
   padding: 8px 16px 8px 82px;
   border-top: 1px solid var(--border-soft);

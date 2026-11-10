@@ -50,6 +50,8 @@ const S = {
   scopePop: null, // open "N excluded" restore popover
   io: null, // IntersectionObserver that lazily loads diffs
   sym: null, // { el } — open symbol (LSP) popup
+  folded: new Set(), // "path|foldKey" of #[cfg(test)] folds the user collapsed (persisted)
+  foldCache: new Map(), // path → Promise<ranges> from /api/folds
   summary: { text: null, act: null, running: false, error: null, loadFailed: false, collapsed: false }, // PR summary card
   lspWarm: new Set(), // paths whose language server was asked to start
   composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
@@ -399,9 +401,10 @@ const pathsUnder = dir => [...S.allPaths].filter(p => underDir(p, dir));
 const testPaths = () => [...S.allPaths].filter(isTestPath);
 const coveredByControls = p => (S.scope.tests && isTestPath(p)) || [...S.scope.dirs].some(d => underDir(p, d));
 
+const prId = () => (S.info.pr ? `${S.info.pr.owner}/${S.info.pr.repo}#${S.info.pr.number}` : `local:${S.info.branch}`);
+
 function scopePrefKey() {
-  const { pr, branch } = S.info;
-  return `review-master:scope:${pr ? `${pr.owner}/${pr.repo}#${pr.number}` : `local:${branch}`}`;
+  return `review-master:scope:${prId()}`;
 }
 
 function saveScopePrefs() {
@@ -702,6 +705,8 @@ function makePane(path, kind, table, notes, host) {
   const pane = {
     path, fs: S.files.get(path) || null, kind, table, notes, host,
     cols: kind === 'diff' ? 4 : 3, rows: new Map(), boxes: new Map(),
+    folds: new Map(), // key → { key, bar, label, desc, open } (#[cfg(test)] folds)
+    lastReveal: null, // row most recently jumped to; keeps its fold open when folds arrive late
   };
   for (const tr of table.tBodies[0].rows) {
     const d = tr.dataset;
@@ -738,6 +743,7 @@ async function loadDiff(fs) {
   if (fs.file.status !== 'deleted') warmLsp(fs.path);
   fs.body.replaceChildren(fs.pane.table);
   renderAnnotations(fs.pane);
+  if (fs.file.status !== 'deleted') attachFolds(fs.pane);
 }
 
 function diffTable(fs) {
@@ -794,11 +800,205 @@ function fullTable(path, src) {
   });
 }
 
+// Flashes lines from..to, unfolding any #[cfg(test)] fold that hides them.
 function flashRange(pane, side, from, to) {
   for (let l = from; l <= (to ?? from); l++) {
     const tr = pane.rows.get(anchorKey(side, l));
-    if (tr) flash(tr);
+    if (!tr) continue;
+    unfoldRow(pane, tr);
+    flash(tr);
   }
+}
+
+// ───────────── #[cfg(test)] folds ─────────────
+// Ranges come from GET /api/folds (language server or text scan, can be slow): fetched
+// lazily once per Rust file and applied to already-rendered tables when they arrive.
+// Viewer: one bar per range. Diff: one bar per run of consecutive hunks lying wholly
+// inside ranges. Default open; collapsed folds are remembered per PR.
+
+const foldPrefKey = () => `review-master:folds:${prId()}`;
+
+function loadFoldPrefs() {
+  try {
+    const keys = JSON.parse(localStorage.getItem(foldPrefKey()) || '[]');
+    S.folded = new Set(Array.isArray(keys) ? keys : []);
+  } catch {
+    S.folded = new Set();
+  }
+}
+
+function saveFoldPrefs() {
+  try {
+    localStorage.setItem(foldPrefKey(), JSON.stringify([...S.folded]));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+// Sorted, valid ranges with nested ones dropped (the outermost range folds them).
+function normalizeFolds(list) {
+  const out = [];
+  const valid = (Array.isArray(list) ? list : []).filter(r => Array.isArray(r) && r[0] > 0 && r[1] >= r[0]);
+  for (const [s, e] of valid.sort((a, b) => a[0] - b[0] || b[1] - a[1])) {
+    const last = out[out.length - 1];
+    if (!last || s > last[1]) out.push([s, e]);
+  }
+  return out;
+}
+
+// One request per file per page load: the promise (including a failed, empty result)
+// stays cached, so re-renders and viewer opens never refetch.
+function fetchFolds(path) {
+  if (!/\.rs$/i.test(path)) return Promise.resolve([]);
+  let p = S.foldCache.get(path);
+  if (!p) {
+    p = api('GET', `/api/folds?path=${qpath(path)}`, undefined, true)
+      .then(r => normalizeFolds(r && r.test_folds))
+      .catch(() => []);
+    S.foldCache.set(path, p);
+  }
+  return p;
+}
+
+async function attachFolds(pane) {
+  const ranges = await fetchFolds(pane.path);
+  if (!ranges.length || pane.folds.size) return;
+  if (pane.kind === 'full') foldFullRows(pane, ranges);
+  else foldDiffHunks(pane, ranges);
+  for (const f of pane.folds.values()) {
+    const keepOpen = pane.lastReveal && pane.lastReveal.dataset.fold === f.key;
+    if (S.folded.has(`${pane.path}|${f.key}`) && !keepOpen) setFold(pane, f.key, false, false);
+    else updateFoldBar(f);
+  }
+}
+
+function foldFullRows(pane, ranges) {
+  const markers = new Map();
+  for (const tr of pane.table.querySelectorAll('tr.del-marker')) markers.set(+tr.dataset.after, tr);
+  for (const [s, e] of ranges) {
+    const first = pane.rows.get(`RIGHT:${s}`);
+    if (!first) continue;
+    const key = `full:${s}`;
+    let n = 0;
+    for (let l = s; l <= e; l++) {
+      const tr = pane.rows.get(`RIGHT:${l}`);
+      if (!tr) break;
+      tr.dataset.fold = key;
+      n++;
+      if (l < e && markers.has(l)) markers.get(l).dataset.fold = key;
+    }
+    addFoldBar(pane, key, first, plural(n, 'line'));
+  }
+}
+
+// A hunk is test code when it changes something inside a range and every changed
+// line is inside one. Context lines are ignored; whitespace-only added lines are
+// neutral (e.g. the blank separator before `#[cfg(test)]`).
+function foldDiffHunks(pane, ranges) {
+  const inRange = tr => {
+    if (tr.dataset.new) {
+      const n = +tr.dataset.new;
+      return ranges.some(([s, e]) => n >= s && n <= e);
+    }
+    const after = +tr.dataset.after; // deleted line: between new lines `after` and `after + 1`
+    return ranges.some(([s, e]) => s <= after && after < e);
+  };
+  const isTestHunk = lines => {
+    let inside = 0;
+    for (const tr of lines) {
+      const added = tr.classList.contains('add');
+      if (!added && !tr.classList.contains('del')) continue; // context
+      if (inRange(tr)) inside++;
+      else if (!(added && !tr.cells[3].textContent.trim())) return false;
+    }
+    return inside > 0;
+  };
+  const hunks = [];
+  for (const tr of pane.table.tBodies[0].rows) {
+    if (tr.classList.contains('hunk')) hunks.push({ head: tr, lines: [] });
+    else if (tr.classList.contains('ln-row') && hunks.length) hunks[hunks.length - 1].lines.push(tr);
+  }
+  let group = [];
+  const flush = () => {
+    if (!group.length) return;
+    const first = group[0].lines[0];
+    const key = `diff:${first.dataset.new || `d${first.dataset.after}`}`;
+    let add = 0;
+    let del = 0;
+    for (const hk of group) {
+      hk.head.dataset.fold = key;
+      for (const tr of hk.lines) {
+        tr.dataset.fold = key;
+        if (tr.classList.contains('add')) add++;
+        if (tr.classList.contains('del')) del++;
+      }
+    }
+    addFoldBar(pane, key, group[0].head, `${plural(group.length, 'hunk')}, +${add} −${del}`);
+    group = [];
+  };
+  for (const hk of hunks) {
+    if (isTestHunk(hk.lines)) group.push(hk);
+    else flush();
+  }
+  flush();
+}
+
+function addFoldBar(pane, key, before, desc) {
+  const label = h('span', { class: 'fold-label' });
+  const bar = h('tr', { class: 'fold-bar', 'data-fold-bar': key, title: 'Fold or unfold this #[cfg(test)] code' },
+    h('td', { colspan: String(pane.cols) }, label));
+  before.before(bar);
+  pane.folds.set(key, { key, bar, label, desc, open: true });
+}
+
+// Rows a fold hides: its tagged rows plus annotation rows (drafts, chips) anchored on them.
+function foldRows(f) {
+  const rows = [];
+  for (let tr = f.bar.nextElementSibling; tr; tr = tr.nextElementSibling) {
+    if (tr.dataset.fold !== f.key && !(rows.length && tr.classList.contains('annot'))) break;
+    rows.push(tr);
+  }
+  return rows;
+}
+
+function setFold(pane, key, open, persist = true) {
+  const f = pane.folds.get(key);
+  if (!f) return;
+  f.open = open;
+  const rows = foldRows(f);
+  for (const tr of rows) tr.hidden = !open;
+  if (persist) {
+    const id = `${pane.path}|${key}`;
+    if (open) S.folded.delete(id);
+    else S.folded.add(id);
+    saveFoldPrefs();
+  }
+  updateFoldBar(f, rows);
+}
+
+// Closed bars also count the drafts/chats they hide; clicking the bar unfolds them.
+function updateFoldBar(f, rows = null) {
+  const hidden = f.open ? 0 : (rows || foldRows(f))
+    .reduce((n, tr) => n + (tr.classList.contains('annot') ? tr.querySelectorAll('.card, .thread-chip, .composer').length : 0), 0);
+  f.bar.classList.toggle('closed', !f.open);
+  f.label.textContent = `${f.open ? '▾' : '▸'} #[cfg(test)] · ${f.desc}${hidden ? ` · ${plural(hidden, 'comment')}` : ''}`;
+}
+
+// After annotations re-render: new annotation rows inside closed folds stay hidden.
+function refreshFolds(pane) {
+  for (const f of pane.folds.values()) {
+    if (f.open) continue;
+    const rows = foldRows(f);
+    for (const tr of rows) tr.hidden = true;
+    updateFoldBar(f, rows);
+  }
+}
+
+// Jump targets inside a closed fold open it first.
+function unfoldRow(pane, tr) {
+  pane.lastReveal = tr;
+  const f = tr.dataset.fold && pane.folds.get(tr.dataset.fold);
+  if (f && !f.open) setFold(pane, f.key, true);
 }
 
 // ───────────────────────────── file viewer ─────────────────────────────
@@ -840,6 +1040,7 @@ async function openViewer(path, target = null) {
   scroll.replaceChildren(v.pane.notes.root, v.pane.table);
   scroll.scrollTop = 0;
   renderAnnotations(v.pane);
+  attachFolds(v.pane);
   watchViewerLsp(v);
   if (!target) return;
   const tr = v.pane.rows.get(`RIGHT:${target.line}`);
@@ -847,8 +1048,8 @@ async function openViewer(path, target = null) {
     toast(`${path} has no line ${target.line}`, 'warn');
     return;
   }
-  tr.scrollIntoView({ block: 'center' });
   flashRange(v.pane, 'RIGHT', target.line, target.end);
+  tr.scrollIntoView({ block: 'center' });
 }
 
 function closeViewer() {
@@ -878,6 +1079,7 @@ async function jumpToDeleted(fs, after) {
   const p = fs.pane;
   const tr = p.table.querySelector(`tr.del[data-after="${after}"]`) ||
     [...p.rows.values()].find(r => r.dataset.new && +r.dataset.new > after);
+  if (tr) unfoldRow(p, tr);
   (tr || fs.section).scrollIntoView({ block: tr ? 'center' : 'start' });
   if (tr) flash(tr);
 }
@@ -901,8 +1103,8 @@ async function revealLine(path, side, line, end = null) {
   if (!fs) return openViewer(path, { line, end });
   const { pane, tr } = await anchorRow(fs, side, line);
   if (tr) {
-    tr.scrollIntoView({ block: 'center' });
     flashRange(pane, side, line, end);
+    tr.scrollIntoView({ block: 'center' });
   } else if ((side || 'RIGHT') === 'RIGHT' && fs.file.status !== 'deleted') {
     await openViewer(path, { line, end });
   } else {
@@ -960,6 +1162,7 @@ function renderAnnotations(pane) {
     }
   }
   pane.notes.root.hidden = boxEmpty(pane.notes);
+  refreshFolds(pane);
 }
 
 function renderAllAnnotations() {
@@ -1006,7 +1209,8 @@ async function openComposer(a) {
     c.ta.value = a.body;
     c.ta.dispatchEvent(new Event('input'));
   }
-  const { pane } = await anchorRow(fs, a.side, a.line);
+  const { pane, tr } = await anchorRow(fs, a.side, a.line);
+  if (tr) unfoldRow(pane, tr);
   c.inViewer = pane.kind === 'full';
   renderFileAnnotations(fs.path);
   c.el.scrollIntoView({ block: 'nearest' });
@@ -1327,6 +1531,7 @@ function gotoSymbol(v, s) {
   closeOutline();
   const tr = v.pane && v.pane.rows.get(`RIGHT:${s.line}`);
   if (!tr) return;
+  unfoldRow(v.pane, tr);
   tr.scrollIntoView({ block: 'center' });
   flash(tr);
 }
@@ -1863,6 +2068,13 @@ function wire() {
       openCodeRef(ref.dataset.path, +ref.dataset.line, ref.dataset.end ? +ref.dataset.end : null);
       return;
     }
+    const bar = e.target.closest('tr.fold-bar');
+    const barPane = bar && paneOf(bar);
+    if (barPane) {
+      const f = barPane.folds.get(bar.dataset.foldBar);
+      if (f) setFold(barPane, f.key, !f.open);
+      return;
+    }
     const marker = e.target.closest('tr.del-marker');
     const pane = marker && paneOf(marker);
     if (pane && pane.fs) jumpToDeleted(pane.fs, +marker.dataset.after);
@@ -1931,6 +2143,7 @@ async function boot() {
     }
   }, { root: $('#main'), rootMargin: '600px 0px' });
   $('#hide-tests').addEventListener('change', e => setExcludeTests(e.target.checked));
+  loadFoldPrefs();
   renderScope(S.info.files.filter(f => !S.excluded.has(f.path)));
   try {
     S.summary.collapsed = localStorage.getItem(SUMMARY_COLLAPSED_KEY) === '1';

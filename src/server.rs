@@ -293,6 +293,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/submit", post_to(submit))
         .route("/api/scope", post_to(set_scope))
         .route("/api/summary", get(get_summary).post(regenerate_summary))
+        .route("/api/folds", get(folds))
         .route("/api/search", get(text_search))
         .route("/api/lsp/status", get(lsp_status))
         .route("/api/lsp/symbol", post_to(lsp_symbol))
@@ -1035,4 +1036,134 @@ fn spawn_summary(st: Arc<AppState>) -> ApiResult {
         }
     });
     Ok(Json(json!({ "summary": null, "job": job_id })))
+}
+
+// ---- test folds -------------------------------------------------------------
+
+/// Whether any of `lines[from..=to]` is a `#[cfg(…test…)]` gate (not `not(test)`).
+fn is_test_gated(lines: &[&str], from: usize, to: usize) -> bool {
+    let to = to.min(lines.len().saturating_sub(1));
+    lines.get(from..=to).into_iter().flatten().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("#[cfg(") && t.contains("test") && !t.contains("not(test")
+    })
+}
+
+/// Walk LSP document symbols; an item whose leading attribute lines carry
+/// `#[cfg(test)]` folds whole (children skipped). Lines are 0-based in LSP.
+fn gated_ranges(symbols: &[Value], lines: &[&str], out: &mut Vec<(u64, u64)>) {
+    for s in symbols {
+        let (Some(start), Some(end)) = (s["range"]["start"]["line"].as_u64(), s["range"]["end"]["line"].as_u64()) else { continue };
+        // Attributes sit between the item's range start and its name.
+        let name_line = s["selectionRange"]["start"]["line"].as_u64().unwrap_or(start);
+        if is_test_gated(lines, start as usize, name_line as usize) {
+            out.push((start + 1, end + 1));
+            continue;
+        }
+        if let Some(children) = s["children"].as_array() {
+            gated_ranges(children, lines, out);
+        }
+    }
+}
+
+/// Text fallback when no language server answers: match the attribute, then
+/// brace-count (string/comment aware, good enough for folding) to the close.
+fn rust_test_folds_text(text: &str) -> Vec<(u64, u64)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut folds = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        if t.starts_with("#[cfg(") && t.contains("test") && !t.contains("not(test") {
+            let start = i as u64 + 1;
+            let mut depth = 0i64;
+            let mut opened = false;
+            let mut in_block_comment = false;
+            let mut j = i;
+            'scan: while j < lines.len() {
+                let bytes = lines[j].as_bytes();
+                let (mut in_str, mut in_char) = (false, false);
+                let mut k = 0usize;
+                while k < bytes.len() {
+                    let c = bytes[k];
+                    if in_block_comment {
+                        if c == b'*' && bytes.get(k + 1) == Some(&b'/') {
+                            in_block_comment = false;
+                            k += 1;
+                        }
+                    } else if in_str {
+                        if c == b'\\' {
+                            k += 1;
+                        } else if c == b'"' {
+                            in_str = false;
+                        }
+                    } else if in_char {
+                        if c == b'\\' {
+                            k += 1;
+                        } else if c == b'\'' {
+                            in_char = false;
+                        }
+                    } else {
+                        match c {
+                            b'/' if bytes.get(k + 1) == Some(&b'/') => break,
+                            b'/' if bytes.get(k + 1) == Some(&b'*') => {
+                                in_block_comment = true;
+                                k += 1;
+                            }
+                            b'"' => in_str = true,
+                            b'\'' if bytes.get(k + 1) == Some(&b'\\') || bytes.get(k + 2) == Some(&b'\'') => in_char = true,
+                            b'{' => {
+                                depth += 1;
+                                opened = true;
+                            }
+                            b'}' => {
+                                depth -= 1;
+                                if opened && depth == 0 {
+                                    folds.push((start, j as u64 + 1));
+                                    i = j;
+                                    break 'scan;
+                                }
+                            }
+                            b';' if !opened && depth == 0 => break 'scan,
+                            _ => {}
+                        }
+                    }
+                    k += 1;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    folds
+}
+
+/// `#[cfg(test)]` fold ranges for a Rust file: language-server boundaries when
+/// available, text scanning otherwise.
+async fn folds(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> ApiResult {
+    if lang(&q.path) != "rs" {
+        return Ok(Json(json!({ "test_folds": [], "source": "text" })));
+    }
+    let (full, shown) = verify::resolve(&st.root, &q.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let meta = fs::metadata(&full).map_err(|e| fail(StatusCode::NOT_FOUND, e.to_string()))?;
+    if !meta.is_file() || meta.len() > MAX_SOURCE_BYTES {
+        return Ok(Json(json!({ "test_folds": [], "source": "text" })));
+    }
+    let bytes = fs::read(&full).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut ranges = Vec::new();
+    let mut source = "lsp";
+    match st.lsp.document_symbols(&full, &shown).await {
+        Ok(symbols) => {
+            let lines: Vec<&str> = text.lines().collect();
+            gated_ranges(&symbols, &lines, &mut ranges);
+        }
+        Err(_) => {
+            source = "text";
+            ranges = rust_test_folds_text(&text);
+        }
+    }
+    ranges.sort_unstable();
+    let test_folds: Vec<Value> = ranges.iter().map(|(s, e)| json!([s, e])).collect();
+    Ok(Json(json!({ "test_folds": test_folds, "source": source })))
 }

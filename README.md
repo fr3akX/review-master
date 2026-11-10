@@ -10,6 +10,9 @@ branch, its upstream, or the head commit — and it opens a local web UI:
 - browse the changed files in a collapsible **directory tree**; per-file
   **diff view**, and a **file viewer** for the whole file with highlighted
   changes and syntax highlighting;
+- **fold `#[cfg(test)]` modules** in diffs and the file viewer — boundaries come
+  from rust-analyzer's symbol tree (text scanning only as fallback); test-only
+  hunks collapse to one bar, folds remember their state per PR;
 - **exclude files from the review** right from the tree — a whole branch
   (`docs/`, generated code) or all test files with one toggle; excluded files
   leave the diff, the counts, and what the LLM is told about, and the set

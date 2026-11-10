@@ -596,13 +596,19 @@ impl Lsp {
         Ok(refs)
     }
 
-    /// The file's declarations, in source order, nested by depth.
-    pub async fn outline(&self, full: &Path, rel: &str) -> Result<Vec<OutlineItem>, String> {
+    /// Raw `textDocument/documentSymbol` result (hierarchical).
+    pub async fn document_symbols(&self, full: &Path, rel: &str) -> Result<Vec<Value>, String> {
         let (server, uri) = self.open(full, rel).await?;
         let params = json!({ "textDocument": { "uri": uri } });
         let result = server.request("textDocument/documentSymbol", params, REQUEST_TIMEOUT).await?;
+        Ok(result.as_array().cloned().unwrap_or_default())
+    }
+
+    /// The file's declarations, in source order, nested by depth.
+    pub async fn outline(&self, full: &Path, rel: &str) -> Result<Vec<OutlineItem>, String> {
+        let symbols = self.document_symbols(full, rel).await?;
         let mut out = Vec::new();
-        outline_items(result.as_array().map_or(&[][..], Vec::as_slice), 0, &mut out);
+        outline_items(&symbols, 0, &mut out);
         Ok(out)
     }
 
