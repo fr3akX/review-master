@@ -345,11 +345,12 @@ li.active .file-item { border-left-color: var(--accent); background: var(--accen
   text-align: left;
   cursor: pointer;
 }
-.dir-line { display: flex; align-items: center; }
-.dir-line:hover { background: var(--bg-sunken); }
+.dir-line, .file-line { display: flex; align-items: center; }
+.dir-line:hover, .file-line:hover { background: var(--bg-sunken); }
 .dir-line:hover .dir-row { color: var(--fg); }
+.file-line .file-item { flex: 1; min-width: 0; }
 .dir-row { flex: 1; min-width: 0; }
-.dir-hide {
+.row-hide {
   display: inline-flex;
   flex: none;
   align-items: center;
@@ -362,8 +363,8 @@ li.active .file-item { border-left-color: var(--accent); background: var(--accen
   cursor: pointer;
   visibility: hidden;
 }
-.dir-line:hover .dir-hide, .dir-hide:focus-visible { visibility: visible; }
-.dir-hide:hover { background: var(--bg-soft); color: var(--fg); }
+.dir-line:hover .row-hide, .file-line:hover .row-hide, .row-hide:focus-visible { visibility: visible; }
+.row-hide:hover { background: var(--bg-soft); color: var(--fg); }
 .dir-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .chevron { flex: none; width: 12px; font-size: 10px; text-align: center; transition: transform 0.12s; }
 .tree-dir.collapsed > .dir-line .chevron { transform: rotate(-90deg); }
@@ -419,6 +420,37 @@ li.active .file-item { border-left-color: var(--accent); background: var(--accen
 #main { position: relative; min-width: 0; overflow-y: auto; overflow-anchor: auto; }
 #sections { padding: 16px 20px 40vh; }
 
+/* PR summary card (top of the main column) */
+.summary-card {
+  margin: 16px 20px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.summary-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 4px;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: var(--bg-soft);
+}
+.summary-card:not(.collapsed) .summary-head { border-bottom: 1px solid var(--border); }
+.summary-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: none;
+  font-size: 13px;
+  cursor: pointer;
+}
+.summary-card.collapsed .summary-toggle .chevron { transform: rotate(-90deg); }
+.summary-card.collapsed .summary-body { display: none; }
+.summary-status { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
+.summary-body { display: flex; flex-direction: column; gap: 8px; padding: 10px 14px; }
+.summary-text { font-size: 13px; }
+
 section.file {
   position: relative;
   margin-bottom: 16px;
@@ -458,6 +490,7 @@ section.file {
 }
 body.drawer-open .viewer { right: var(--drawer-w); }
 .viewer-box {
+  position: relative;
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -468,6 +501,58 @@ body.drawer-open .viewer { right: var(--drawer-w); }
   background: var(--bg);
   box-shadow: var(--shadow);
 }
+
+/* viewer outline ("go to symbol") dropdown */
+.outline-pop {
+  position: absolute;
+  top: 44px;
+  right: 12px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  width: 440px;
+  max-height: 70%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.outline-filter {
+  flex: none;
+  margin: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px var(--sans);
+}
+.outline-filter:focus { border-color: var(--accent); outline: 2px solid var(--accent-soft); }
+.outline-list { margin: 0; padding: 0 4px 6px; overflow-y: auto; list-style: none; }
+.outline-list .hint { padding: 4px 8px; }
+.outline-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.outline-item:hover { background: var(--accent-soft); }
+.outline-item.d-1 { padding-left: 22px; }
+.outline-item.d-2 { padding-left: 36px; }
+.outline-item.d-3 { padding-left: 50px; }
+.outline-item.d-4 { padding-left: 64px; }
+.outline-item.d-5 { padding-left: 78px; }
+.outline-item.d-6 { padding-left: 92px; }
+.outline-item .tag { flex: none; }
+.outline-name { font-family: var(--mono); }
+.outline-detail { min-width: 0; overflow: hidden; color: var(--fg-faint); font-family: var(--mono); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
 .viewer-head {
   display: flex;
   flex: none;

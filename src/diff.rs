@@ -244,6 +244,30 @@ impl Model {
         dropped
     }
 
+    /// Faithful unified diff text of one file (for prompts).
+    pub fn render_file(file: &FileEntry, out: &mut String) {
+        let old = file.old_path.as_deref().unwrap_or(&file.path);
+        let (a, b) = match file.status {
+            Status::Added => ("/dev/null".to_owned(), format!("b/{}", file.path)),
+            Status::Deleted => (format!("a/{}", file.path), "/dev/null".to_owned()),
+            _ => (format!("a/{old}"), format!("b/{}", file.path)),
+        };
+        out.push_str(&format!("diff --git a/{old} b/{}\n--- {a}\n+++ {b}\n", file.path));
+        for hunk in &file.hunks {
+            out.push_str(&hunk.header);
+            out.push('\n');
+            for line in &hunk.lines {
+                out.push(match line.kind {
+                    Kind::Ctx => ' ',
+                    Kind::Add => '+',
+                    Kind::Del => '-',
+                });
+                out.push_str(&line.text);
+                out.push('\n');
+            }
+        }
+    }
+
     /// The anchor index for comment validation.
     pub fn anchors(&self) -> Diff {
         let mut files = HashMap::new();

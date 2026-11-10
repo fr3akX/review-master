@@ -183,6 +183,33 @@ pub fn pr_for_branch(slug: &str, branch: &str) -> Option<u64> {
     String::from_utf8_lossy(&out).trim().parse().ok()
 }
 
+/// The open PR this checkout corresponds to: by branch name, then by the
+/// branch's upstream (scratch worktrees track the real branch under another
+/// local name), then by exact head commit.
+pub fn resolve_pr(root: &std::path::Path, slug: &str) -> Option<u64> {
+    let branch = crate::repo::git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD");
+    if let Some(b) = &branch {
+        if let Some(n) = pr_for_branch(slug, b) {
+            println!("review-master: resolved open PR #{n} from branch `{b}`");
+            return Some(n);
+        }
+    }
+    if let Some(upstream) = crate::repo::git(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]) {
+        if let Some(b) = upstream.split_once('/').map(|(_, b)| b).filter(|b| Some(*b) != branch.as_deref()) {
+            if let Some(n) = pr_for_branch(slug, b) {
+                println!("review-master: resolved open PR #{n} from upstream `{upstream}`");
+                return Some(n);
+            }
+        }
+    }
+    let sha = crate::repo::git(root, &["rev-parse", "HEAD"])?;
+    let jq = format!(".[] | select(.headRefOid==\"{sha}\") | .number");
+    let out = gh(&["pr", "list", "--repo", slug, "--state", "open", "--limit", "100", "--json", "number,headRefOid", "--jq", &jq], None).ok()?;
+    let n = String::from_utf8_lossy(&out).split_whitespace().next()?.parse().ok()?;
+    println!("review-master: resolved open PR #{n} from head commit {}", &sha[..sha.len().min(12)]);
+    Some(n)
+}
+
 /// A worktree reviewed without a PR: its diff against the merge base with the
 /// default branch, including uncommitted edits.
 pub struct LocalChange {

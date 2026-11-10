@@ -87,6 +87,13 @@ fn on_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
+/// The rustup default toolchain name (`stable-aarch64-apple-darwin`), if rustup exists.
+fn default_rustup_toolchain() -> Option<String> {
+    let out = std::process::Command::new("rustup").arg("default").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().next().map(str::to_owned)
+}
+
 /// `file://` URI for an absolute path; everything but unreserved bytes and `/` is percent-encoded.
 pub fn path_to_uri(path: &Path) -> String {
     let mut uri = String::from("file://");
@@ -431,16 +438,33 @@ impl Lsp {
     }
 
     async fn start(&self, lang: &str, cmd: &str) -> Result<Arc<Server>, String> {
+        match self.start_with(lang, cmd, None).await {
+            // The rustup shim refuses to run when the project pins a toolchain
+            // without the rust-analyzer component (`profile = "minimal"`); retry on
+            // the default toolchain — navigation-compatible — and say how to fix it.
+            Err(e) if e.contains("Unknown binary 'rust-analyzer'") => {
+                let hint = format!("{e}; fix: `rustup component add rust-analyzer --toolchain <the pinned toolchain>`");
+                let Some(default) = default_rustup_toolchain() else { return Err(hint) };
+                self.start_with(lang, cmd, Some(("RUSTUP_TOOLCHAIN", default))).await.map_err(|_| hint)
+            }
+            other => other,
+        }
+    }
+
+    async fn start_with(&self, lang: &str, cmd: &str, env: Option<(&'static str, String)>) -> Result<Arc<Server>, String> {
         let argv: Vec<&str> = cmd.split_whitespace().collect();
-        let mut child = Command::new(argv[0])
+        let mut command = Command::new(argv[0]);
+        command
             .args(&argv[1..])
             .current_dir(&self.root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("cannot start `{cmd}`: {e}"))?;
+            .kill_on_drop(true);
+        if let Some((key, value)) = &env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().map_err(|e| format!("cannot start `{cmd}`: {e}"))?;
         let stdin: Stdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take().expect("piped stdin")));
         let stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");

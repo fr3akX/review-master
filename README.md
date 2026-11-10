@@ -1,8 +1,12 @@
 # review-master
 
 Code review for humans, with an LLM to help you understand the change. Point it
-at a pull request (or a bare worktree) and it opens a local web UI:
+at a pull request, or just a worktree path — the open PR is resolved from the
+branch, its upstream, or the head commit — and it opens a local web UI:
 
+- a generated **PR summary** (why the change, things to note, change outline
+  with clickable citations) appears at the top while you browse — cached per
+  head commit, regenerate on demand;
 - browse the changed files in a collapsible **directory tree**; per-file
   **diff view**, and a **file viewer** for the whole file with highlighted
   changes and syntax highlighting;

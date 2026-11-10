@@ -36,10 +36,11 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Pull request: URL, <owner>/<repo>#<number>, or a bare number (resolved
-    /// against the checkout's GitHub origin). Omitted: review the worktree's
-    /// change against the default branch (browse and chat; no submitting)
-    pr: Option<String>,
+    /// What to review: a pull request (URL, <owner>/<repo>#<number>, or a bare
+    /// number against the checkout's origin) or a path to a checkout/worktree,
+    /// whose branch resolves to its open PR. Omitted: review the --repo
+    /// worktree (its PR if one exists, else its diff against the default branch)
+    target: Option<String>,
     /// Local checkout of the repository; the PR head is fetched into a
     /// temporary worktree when the checkout is not already on it
     #[arg(long, default_value = ".")]
@@ -178,18 +179,18 @@ struct Change {
     _checkout: Option<pr::Checkout>,
 }
 
-fn acquire(args: &Args, repo: &repo::Repo) -> Result<Change, String> {
+fn acquire(pr_arg: Option<&str>, exclude: &[String], repo: &repo::Repo) -> Result<Change, String> {
     let origin = pr::origin_slug(&repo.root);
-    let Some(raw) = args.pr.as_deref() else {
+    // No PR given: resolve the open PR for this checkout, if any.
+    let resolved = pr_arg.map(str::to_owned).or_else(|| {
+        let (owner, name) = origin.as_ref()?;
+        pr::resolve_pr(&repo.root, &format!("{owner}/{name}")).map(|n| n.to_string())
+    });
+    let Some(raw) = resolved else {
         // Local mode: the worktree's change against the default branch.
         let local = pr::local_change(&repo.root)?;
         let mut model = diff::Model::parse(&local.diff_text);
-        let skipped = apply_excludes(&mut model, &args.exclude)?;
-        if let Some((owner, name)) = &origin {
-            if let Some(n) = pr::pr_for_branch(&format!("{owner}/{name}"), &local.branch) {
-                eprintln!("note: open PR #{n} matches branch `{}`; run `review-master {n}` to submit from the UI", local.branch);
-            }
-        }
+        let skipped = apply_excludes(&mut model, exclude)?;
         return Ok(Change {
             pr: None,
             root: repo.root.clone(),
@@ -201,7 +202,7 @@ fn acquire(args: &Args, repo: &repo::Repo) -> Result<Change, String> {
             _checkout: None,
         });
     };
-    let pref = pr::parse_ref(raw, origin.as_ref())?;
+    let pref = pr::parse_ref(&raw, origin.as_ref())?;
     if let Some((owner, name)) = &origin {
         if !owner.eq_ignore_ascii_case(&pref.owner) || !name.eq_ignore_ascii_case(&pref.repo) {
             eprintln!("note: the checkout's origin is {owner}/{name}, not {}; fetching the PR head may fail", pref.slug());
@@ -219,7 +220,7 @@ fn acquire(args: &Args, repo: &repo::Repo) -> Result<Change, String> {
         eprintln!("note: this pull request is {state}; reviews can still be posted");
     }
     let mut model = diff::Model::parse(&pr::diff(&pref)?);
-    let skipped = apply_excludes(&mut model, &args.exclude)?;
+    let skipped = apply_excludes(&mut model, exclude)?;
     if !skipped.is_empty() {
         eprintln!("  excluded from the reviewed diff: {}", skipped.join(", "));
     }
@@ -266,8 +267,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         choice.model = env("OPENAI_MODEL").or(choice.model);
     }
 
-    let repo = repo::Repo::open(&args.repo)?;
-    let change = acquire(&args, &repo)?;
+    // The positional target may be a PR reference or a path to a checkout/worktree.
+    let (repo_path, pr_arg) = match args.target.as_deref() {
+        Some(t) if Path::new(t).is_dir() => (PathBuf::from(t), None),
+        other => (args.repo.clone(), other.map(str::to_owned)),
+    };
+    let repo = repo::Repo::open(&repo_path)?;
+    let change = acquire(pr_arg.as_deref(), &args.exclude, &repo)?;
     if change.model.files.is_empty() {
         return Err("nothing to review: the diff is empty after exclusions".into());
     }
@@ -317,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewer,
         cache_dir.join(format!("drafts-{draft_key}.json")),
         cache_dir.join(format!("scope-{draft_key}.json")),
+        cache_dir.join(format!("summary-{draft_key}.json")),
         lsp,
     );
     let listener = match tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await {

@@ -50,6 +50,7 @@ const S = {
   scopePop: null, // open "N excluded" restore popover
   io: null, // IntersectionObserver that lazily loads diffs
   sym: null, // { el } — open symbol (LSP) popup
+  summary: { text: null, act: null, running: false, error: null, loadFailed: false, collapsed: false }, // PR summary card
   lspWarm: new Set(), // paths whose language server was asked to start
   composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
   drawer: null, // 'chat' | 'review' | null
@@ -125,11 +126,12 @@ const get = url => api('GET', url);
 const post = (url, body) => api('POST', url, body);
 const qpath = path => encodeURIComponent(path);
 
-// Shared job poller for chat turns: streams progress lines, resolves with result.
-async function pollJob(id, onProgress) {
+// Shared job poller (chat turns, PR summary): streams progress lines, resolves with result.
+// quiet: poll failures are not toasted (the caller shows them).
+async function pollJob(id, onProgress, quiet = false) {
   let since = 0;
   for (;;) {
-    const j = await get(`/api/job/${id}?since=${since}`);
+    const j = await api('GET', `/api/job/${id}?since=${since}`, undefined, quiet);
     if (j.progress && j.progress.length) onProgress(j.progress);
     since = j.next;
     if (j.done) {
@@ -463,6 +465,7 @@ function changeScope(mutate, message = null) {
 const setExcludeTests = on => changeScope(() => { S.scope.tests = on; });
 const restoreBranch = dir => changeScope(() => S.scope.dirs.delete(dir), `Restored ${dir}`);
 const restoreFile = path => changeScope(() => S.scope.extra.delete(path), `Restored ${path}`);
+const excludeFile = path => changeScope(() => S.scope.extra.add(path));
 const restoreAll = () => changeScope(() => {
   S.scope.tests = false;
   S.scope.dirs.clear();
@@ -572,7 +575,7 @@ function treeItems(node, prefix) {
     li.append(
       h('div', { class: 'dir-line' },
         h('button', { class: 'dir-row', title: path, onclick: toggle }, h('span', { class: 'chevron' }, '▾'), h('span', { class: 'dir-name' }, label)),
-        h('button', { class: 'dir-hide', title: 'Exclude from review', 'aria-label': `Exclude ${path} from the review`, onclick: () => excludeBranch(path), html: EYE_OFF })),
+        h('button', { class: 'row-hide', title: 'Exclude from review', 'aria-label': `Exclude ${path} from the review`, onclick: () => excludeBranch(path), html: EYE_OFF })),
       h('ul', { class: 'tree' }, treeItems(dir, path)));
     items.push(li);
   }
@@ -633,9 +636,11 @@ function makeFileState(f) {
   const fs = { file: f, path: f.path, idx: 0, diff: null, pane: null, loading: null };
   fs.navBadge = h('span', { class: 'nav-drafts', title: 'drafts', hidden: true });
   fs.nav = h('li', {},
-    h('button', { class: 'file-item', title: f.path, onclick: () => jumpToFile(fs) },
-      statusBadge(f.status), h('span', { class: 'path' }, h('span', { class: 'base' }, splitPath(f.path)[1])),
-      fs.navBadge, counts(f)));
+    h('div', { class: 'file-line' },
+      h('button', { class: 'file-item', title: f.path, onclick: () => jumpToFile(fs) },
+        statusBadge(f.status), h('span', { class: 'path' }, h('span', { class: 'base' }, splitPath(f.path)[1])),
+        fs.navBadge, counts(f)),
+      h('button', { class: 'row-hide', title: 'Exclude from review', 'aria-label': `Exclude ${f.path} from the review`, onclick: () => excludeFile(f.path), html: EYE_OFF })));
   const deleted = f.status === 'deleted';
   const full = h('button', {
     class: 'btn small', disabled: deleted,
@@ -809,12 +814,14 @@ async function openViewer(path, target = null) {
   S.viewer = v;
   const scroll = $('#viewer-scroll');
   v.lspChip = h('span', { class: 'chip lsp-chip', hidden: true });
+  v.outlineBtn = h('button', { class: 'btn small outline-btn', hidden: true, title: 'Go to symbol', onclick: () => toggleOutline(v) }, 'Outline');
   $('#viewer-head').replaceChildren(
     fs ? statusBadge(fs.file.status) : null,
     fs ? fileTitle(fs.file) : pathLabel(path),
     fs ? counts(fs.file) : h('span', { class: 'chip' }, 'not changed in this PR'),
     h('span', { class: 'spacer' }),
     v.lspChip,
+    v.outlineBtn,
     h('button', { class: 'btn small', onclick: closeViewer }, 'Close'));
   scroll.replaceChildren(h('div', { class: 'placeholder' }, 'Loading…'));
   $('#viewer').hidden = false;
@@ -849,6 +856,7 @@ function closeViewer() {
   if (!v) return;
   if (S.sel && S.sel.pane === v.pane) clearSel();
   closeSym();
+  closeOutline();
   S.viewer = null;
   $('#viewer').hidden = true;
   $('#viewer-scroll').replaceChildren();
@@ -1110,6 +1118,7 @@ function onDocMouseDown(e) {
   if (!(e.target instanceof Element)) return;
   if (S.sym && !e.target.closest('.sym-popup')) closeSym();
   if (S.scopePop && !e.target.closest('.scope-pop, .scope-link')) closeScopePop();
+  if (S.viewer && S.viewer.outlineEl && !e.target.closest('.outline-pop, .outline-btn')) closeOutline();
   const codeCell = (e.metaKey || e.ctrlKey) && e.target.closest('tr.ln-row td.code');
   if (codeCell && paneOf(codeCell)) {
     e.preventDefault(); // Cmd/Ctrl-click navigates (see click handler) instead of selecting text
@@ -1258,6 +1267,7 @@ async function watchViewerLsp(v) {
     if (S.viewer !== v) return;
     const busy = LSP_BUSY.has(st.state);
     v.lspChip.hidden = !(busy || st.state === 'failed');
+    v.outlineBtn.hidden = st.state === 'none' || st.state === 'failed';
     v.lspChip.className = `chip lsp-chip lsp-${st.state}`;
     v.lspChip.textContent = `${st.server || st.language || 'LSP'} ${st.state}${busy ? '…' : ''}`;
     v.lspChip.title = st.error || '';
@@ -1296,6 +1306,66 @@ function tokenAt(td, x, y) {
   while (s > 0 && isW(text[s - 1])) s--;
   while (e < text.length && isW(text[e])) e++;
   return { token: text.slice(s, e), character: s };
+}
+
+// ───────────── viewer outline ("go to symbol") ─────────────
+
+// LSP SymbolKind numbers → short labels (servers may also send names).
+const SYMBOL_KINDS = ['', 'file', 'module', 'namespace', 'package', 'class', 'method', 'property', 'field',
+  'constructor', 'enum', 'interface', 'fn', 'var', 'const', 'string', 'number', 'bool', 'array', 'object',
+  'key', 'null', 'variant', 'struct', 'event', 'operator', 'type param'];
+const kindLabel = k => (typeof k === 'number' ? SYMBOL_KINDS[k] || 'symbol' : String(k || 'symbol').toLowerCase());
+
+function closeOutline() {
+  const v = S.viewer;
+  if (!v || !v.outlineEl) return;
+  v.outlineEl.remove();
+  v.outlineEl = null;
+}
+
+function gotoSymbol(v, s) {
+  closeOutline();
+  const tr = v.pane && v.pane.rows.get(`RIGHT:${s.line}`);
+  if (!tr) return;
+  tr.scrollIntoView({ block: 'center' });
+  flash(tr);
+}
+
+// Filterable symbol list for the viewer's file; symbols are cached on the viewer.
+async function toggleOutline(v) {
+  if (v.outlineEl) return closeOutline();
+  const input = h('input', { class: 'outline-filter', type: 'search', placeholder: 'Filter symbols…', 'aria-label': 'Filter symbols' });
+  const list = h('ul', { class: 'outline-list' }, h('li', { class: 'hint' }, 'Loading outline…'));
+  const el = h('div', { class: 'outline-pop' }, input, list);
+  v.outlineEl = el;
+  $('#viewer .viewer-box').append(el);
+  input.focus();
+  if (!v.outline) {
+    try {
+      const r = await api('GET', `/api/lsp/outline?path=${qpath(v.path)}`, undefined, true);
+      v.outline = r.symbols || [];
+    } catch (e) {
+      if (v.outlineEl === el) list.replaceChildren(h('li', { class: 'hint' }, `outline unavailable: ${e.message}`));
+      return;
+    }
+  }
+  if (S.viewer !== v || v.outlineEl !== el) return;
+  let shown = [];
+  const render = () => {
+    const q = input.value.trim().toLowerCase();
+    shown = q ? v.outline.filter(s => s.name.toLowerCase().includes(q)) : v.outline;
+    list.replaceChildren(...(shown.length
+      ? shown.map(s => h('li', {}, h('button', { class: `outline-item d-${Math.min(s.depth || 0, 6)}`, title: `line ${s.line}`, onclick: () => gotoSymbol(v, s) },
+        h('span', { class: 'tag' }, kindLabel(s.kind)),
+        h('span', { class: 'outline-name' }, s.name),
+        s.detail && h('span', { class: 'outline-detail' }, s.detail))))
+      : [h('li', { class: 'hint' }, v.outline.length ? 'No matches.' : 'No symbols.')]));
+  };
+  input.addEventListener('input', render);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && shown.length) gotoSymbol(v, shown[0]);
+  });
+  render();
 }
 
 function closeSym() {
@@ -1679,6 +1749,94 @@ async function submitReview() {
   }
 }
 
+// ───────────────────────────── PR summary card ─────────────────────────────
+// Generated in the background by the server; never blocks browsing.
+
+const SUMMARY_COLLAPSED_KEY = 'review-master:summary-collapsed';
+
+async function loadSummary() {
+  const st = S.summary;
+  let r;
+  try {
+    r = await api('GET', '/api/summary', undefined, true);
+  } catch (e) {
+    Object.assign(st, { error: e.message, loadFailed: true });
+    renderSummary();
+    return;
+  }
+  Object.assign(st, { text: r.summary || null, error: null, loadFailed: false });
+  renderSummary();
+  if (r.job != null) await runSummaryJob(r.job);
+}
+
+async function runSummaryJob(job) {
+  const st = S.summary;
+  Object.assign(st, { act: makeActivity(), running: true, error: null });
+  renderSummary();
+  try {
+    const res = await pollJob(job, lines => {
+      st.act.lines.push(...lines);
+      updateActivity(st.act);
+    }, true);
+    st.text = res.summary || st.text;
+  } catch (e) {
+    st.error = e.message;
+  }
+  st.running = false;
+  st.act.running = false;
+  renderSummary();
+}
+
+async function regenerateSummary() {
+  const st = S.summary;
+  if (st.running) return;
+  let r;
+  try {
+    r = await api('POST', '/api/summary', undefined, true);
+  } catch (e) {
+    st.error = e.message;
+    renderSummary();
+    return;
+  }
+  await runSummaryJob(r.job);
+}
+
+function toggleSummary() {
+  const st = S.summary;
+  st.collapsed = !st.collapsed;
+  try {
+    localStorage.setItem(SUMMARY_COLLAPSED_KEY, st.collapsed ? '1' : '0');
+  } catch {
+    /* storage unavailable */
+  }
+  renderSummary();
+}
+
+function renderSummary() {
+  const st = S.summary;
+  const card = $('#summary-card');
+  card.hidden = false;
+  card.classList.toggle('collapsed', st.collapsed);
+  const head = h('div', { class: 'summary-head' },
+    h('button', { class: 'summary-toggle', 'aria-expanded': String(!st.collapsed), onclick: toggleSummary },
+      h('span', { class: 'chevron' }, '▾'), h('strong', {}, 'Summary')),
+    st.running && h('span', { class: 'dim summary-status' }, h('span', { class: 'spinner' }), ' generating…'),
+    h('span', { class: 'spacer' }),
+    h('button', { class: 'icon-btn', title: 'Regenerate', 'aria-label': 'Regenerate summary', disabled: st.running, onclick: regenerateSummary }, '↻'));
+  const body = h('div', { class: 'summary-body' });
+  if (st.error) {
+    body.append(h('div', { class: 'msg error' }, `Summary failed: ${st.error} `,
+      h('button', { class: 'btn small', onclick: () => (st.loadFailed ? loadSummary() : regenerateSummary()) }, 'Retry')));
+  }
+  if (st.running) {
+    body.append(h('div', { class: 'hint' }, 'The summary is being generated — browsing works meanwhile.'), updateActivity(st.act));
+  }
+  if (st.text) body.append(h('div', { class: 'md summary-text', html: md(st.text) }));
+  else if (!st.running && !st.error) {
+    body.append(h('div', { class: 'hint' }, 'No summary yet. ', h('button', { class: 'btn small', onclick: regenerateSummary }, 'Generate')));
+  }
+  card.replaceChildren(head, body);
+}
 
 // ───────────────────────────── wiring & boot ─────────────────────────────
 
@@ -1716,6 +1874,7 @@ function wire() {
     if (e.key !== 'Escape') return;
     if (S.sym) closeSym();
     else if (S.scopePop) closeScopePop();
+    else if (S.viewer && S.viewer.outlineEl) closeOutline();
     else if (S.viewer) closeViewer();
     else if (S.sel) clearSel();
     else if (S.drawer) openDrawer(null);
@@ -1773,6 +1932,12 @@ async function boot() {
   }, { root: $('#main'), rootMargin: '600px 0px' });
   $('#hide-tests').addEventListener('change', e => setExcludeTests(e.target.checked));
   renderScope(S.info.files.filter(f => !S.excluded.has(f.path)));
+  try {
+    S.summary.collapsed = localStorage.getItem(SUMMARY_COLLAPSED_KEY) === '1';
+  } catch {
+    /* storage unavailable */
+  }
+  loadSummary(); // runs in the background
   const [drafts, threads] = await Promise.all([get('/api/drafts'), get('/api/threads')]);
   S.drafts = drafts || [];
   S.threads = threads || [];

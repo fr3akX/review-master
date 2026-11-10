@@ -42,6 +42,8 @@ pub struct AppState {
     /// What this review currently covers (runtime exclusions applied).
     scope: Mutex<Scope>,
     scope_file: PathBuf,
+    summary: Mutex<SummaryState>,
+    summary_file: PathBuf,
     pub engine: Engine,
     /// The `gh` login, for own-PR hints in the UI.
     pub viewer: Option<String>,
@@ -85,11 +87,17 @@ impl AppState {
         viewer: Option<String>,
         drafts_file: PathBuf,
         scope_file: PathBuf,
+        summary_file: PathBuf,
         lsp: Lsp,
     ) -> Arc<AppState> {
         let stored: StoredScope = fs::read(&scope_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let excluded: Vec<String> = stored.excluded.into_iter().filter(|p| model.file(p).is_some()).collect();
         let scope = build_scope(&model, excluded);
+        let summary_text = fs::read(&summary_file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<StoredSummary>(&b).ok())
+            .filter(|s| s.head == head_sha)
+            .map(|s| s.summary);
         Arc::new(AppState {
             root,
             pr,
@@ -100,6 +108,8 @@ impl AppState {
             cli_skipped: skipped,
             scope: Mutex::new(scope),
             scope_file,
+            summary: Mutex::new(SummaryState { text: summary_text, job: None }),
+            summary_file,
             engine,
             viewer,
             lsp,
@@ -282,6 +292,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/drafts", get(drafts))
         .route("/api/submit", post_to(submit))
         .route("/api/scope", post_to(set_scope))
+        .route("/api/summary", get(get_summary).post(regenerate_summary))
         .route("/api/search", get(text_search))
         .route("/api/lsp/status", get(lsp_status))
         .route("/api/lsp/symbol", post_to(lsp_symbol))
@@ -895,4 +906,133 @@ async fn set_scope(State(st): State<Arc<AppState>>, Json(req): Json<ScopeRequest
     let response = json!({ "files": files_json(&scope.model), "skipped": st.cli_skipped, "excluded": scope.excluded });
     *st.scope.lock().unwrap() = scope;
     Ok(Json(response))
+}
+
+// ---- summary ----------------------------------------------------------------
+
+#[derive(Default)]
+struct SummaryState {
+    text: Option<String>,
+    job: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredSummary {
+    head: String,
+    summary: String,
+}
+
+/// Diff budget for the summary prompt; files beyond it are listed instead.
+const MAX_SUMMARY_DIFF_BYTES: usize = 384 * 1024;
+
+fn summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary"],
+        "properties": { "summary": { "type": "string", "minLength": 1, "description": "the Markdown summary" } }
+    })
+}
+
+#[derive(Deserialize)]
+struct SummaryAnswer {
+    summary: String,
+}
+
+fn summary_prompt(st: &AppState) -> String {
+    let subject = st.subject();
+    let mut p = subject.heading;
+    let description: String = subject.description.trim().chars().take(4000).collect();
+    if !description.is_empty() {
+        p.push_str(&format!("\n<description>\n{description}\n</description>\n"));
+    }
+    p.push_str(
+        "\nWrite the summary a reviewer should read before the diff. Markdown, exactly these sections:\n\
+## Why the change\nExactly one sentence: the problem this solves and what becomes possible.\n\
+## Special things to note\n1-3 bullets a reviewer must know — warnings, migrations, compatibility \
+constraints, deliberate omissions, surprising decisions. `- None.` when there are none.\n\
+## Change outline\nThe smallest set of structural views that explains the implementation: a shallow file \
+tree with changed responsibilities, key new or changed types and contracts, concise pseudocode or \
+control/data flow for changed behavior. Fenced code blocks; `diff` blocks for changes to existing shapes. \
+Cite `path:line` anchors so they are clickable. No file-by-file changelog, no praise, plain language, \
+written as one human explaining to another.\n\
+Investigate with the repository tools when the diff alone is not enough; verify cited line numbers by \
+reading the files.\n",
+    );
+    let mut diff_text = String::new();
+    let mut deferred: Vec<&str> = Vec::new();
+    for file in &st.full.files {
+        if diff_text.len() < MAX_SUMMARY_DIFF_BYTES {
+            Model::render_file(file, &mut diff_text);
+        } else {
+            deferred.push(&file.path);
+        }
+    }
+    p.push_str(&format!("\n<diff>\n{diff_text}</diff>\n"));
+    if !deferred.is_empty() {
+        p.push_str(&format!("\nAlso changed, diff omitted for size (read them if relevant): {}\n", deferred.join(", ")));
+    }
+    p
+}
+
+async fn get_summary(State(st): State<Arc<AppState>>) -> ApiResult {
+    {
+        let s = st.summary.lock().unwrap();
+        if let Some(text) = &s.text {
+            return Ok(Json(json!({ "summary": text, "job": null })));
+        }
+        if let Some(job) = s.job {
+            let running = st.jobs.lock().unwrap().by_id.get(&job).is_some_and(|j| !j.inner.lock().unwrap().done);
+            if running {
+                return Ok(Json(json!({ "summary": null, "job": job })));
+            }
+        }
+    }
+    spawn_summary(st)
+}
+
+/// Force a fresh summary.
+async fn regenerate_summary(State(st): State<Arc<AppState>>) -> ApiResult {
+    st.summary.lock().unwrap().text = None;
+    spawn_summary(st)
+}
+
+fn spawn_summary(st: Arc<AppState>) -> ApiResult {
+    let job = new_job(&mut st.jobs.lock().unwrap());
+    st.summary.lock().unwrap().job = Some(job.id);
+    let job_id = job.id;
+    let name = match &st.pr {
+        Some((r, _)) => format!("review-master: summary {}#{}", r.slug(), r.number),
+        None => format!("review-master: summary {}", st.branch),
+    };
+    let st2 = st.clone();
+    tokio::spawn(async move {
+        let prompt = summary_prompt(&st2);
+        let result = async {
+            let session = st2.engine.start_session(&name).await?;
+            let progress = |line: String| job.push(line);
+            let out = st2.engine.turn::<SummaryAnswer>(&session, &prompt, &summary_schema(), &job.cancel, progress).await?;
+            Ok::<String, String>(out.answer.summary)
+        }
+        .await;
+        match result {
+            Ok(summary) => {
+                {
+                    let mut s = st2.summary.lock().unwrap();
+                    s.text = Some(summary.clone());
+                    s.job = None;
+                }
+                let stored = StoredSummary { head: st2.head_sha.clone(), summary: summary.clone() };
+                if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+                    let _ = fs::write(&st2.summary_file, bytes);
+                }
+                job.finish(Ok(json!({ "summary": summary })));
+            }
+            Err(e) => {
+                st2.summary.lock().unwrap().job = None;
+                job.finish(Err(e));
+            }
+        }
+    });
+    Ok(Json(json!({ "summary": null, "job": job_id })))
 }
