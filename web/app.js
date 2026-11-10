@@ -14,6 +14,7 @@ const STATUS_LETTER = { added: 'A', modified: 'M', deleted: 'D', renamed: 'R' };
 const MARK = { add: '+', del: '−', ctx: '' };
 const HL_LINE_LIMIT = 8000; // files with more lines than this are shown unhighlighted
 const POLL_MS = 700;
+const MOD = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'; // key shown in hints
 
 // File extension (or hljs alias) → highlight.js language name.
 const LANGS = {
@@ -52,11 +53,17 @@ const S = {
   sym: null, // { el } — open symbol (LSP) popup
   foldOverrides: new Map(), // "path|foldKey" → open: per-fold choices since the last tests-toggle flip (persisted)
   foldCache: new Map(), // path → Promise<ranges> from /api/folds
-  summary: { text: null, act: null, running: false, error: null, loadFailed: false, collapsed: false }, // PR summary card
+  summary: { text: null, act: null, running: false, error: null, loadFailed: false, collapsed: false, jobId: null }, // PR summary card
   lspWarm: new Set(), // paths whose language server was asked to start
   composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
+  viewed: new Map(), // path → file sig it was marked viewed at (persisted per PR)
+  filter: '', // sidebar file filter
+  remote: { threads: [], show: true, error: null }, // review comments already on the PR
+  replies: new Map(), // thread root comment id → { el, ta }: reply boxes being written
+  lastChange: null, // row the n/p change navigation last landed on
+  help: null, // open shortcuts dialog
   drawer: null, // 'chat' | 'review' | null
-  chat: { threadId: null, anchor: null, snippet: null, thread: null, jobs: new Map() }, // jobs: threadId → ChatJob
+  chat: { threadId: null, anchor: null, snippet: null, thread: null, jobs: new Map(), stopId: null }, // jobs: threadId → ChatJob; stopId: job the send button would stop
   review: { body: '', event: 'comment', submitting: false, list: null },
 };
 
@@ -142,6 +149,34 @@ async function pollJob(id, onProgress, quiet = false) {
     }
     await sleep(POLL_MS);
   }
+}
+
+// localStorage that never throws (private windows, blocked site data).
+function loadPref(key, fallback) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) ?? 'null');
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function savePref(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function relTime(iso) {
+  const t = Date.parse(iso);
+  if (!t) return '';
+  const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  if (mins < 60 * 24) return `${Math.round(mins / 60)}h ago`;
+  if (mins < 60 * 24 * 30) return `${Math.round(mins / 1440)}d ago`;
+  return new Date(t).toLocaleDateString();
 }
 
 function lineLabel({ side, start, line }) {
@@ -379,6 +414,49 @@ function renderDraftCounts() {
   }
 }
 
+// ───────────── viewed files ─────────────
+// A file is viewed while its diff is the one that was marked (the server's `sig`);
+// a mark left on a since-changed diff shows as "changed since viewed". Viewed files
+// collapse. Kept per PR in localStorage.
+
+const viewedKey = () => `review-master:viewed:${prId()}`;
+const isViewed = fs => S.viewed.get(fs.path) === fs.file.sig;
+const viewedStale = fs => S.viewed.has(fs.path) && !isViewed(fs);
+
+function setViewed(fs, on) {
+  if (on) S.viewed.set(fs.path, fs.file.sig);
+  else S.viewed.delete(fs.path);
+  savePref(viewedKey(), Object.fromEntries(S.viewed));
+  setCollapsed(fs, on);
+  renderViewed();
+}
+
+// Collapsing a file whose header is stuck to the top would leave the reader
+// somewhere below it; keep the header in place instead.
+function setCollapsed(fs, collapsed) {
+  const stuck = fs.section.isConnected && fs.section.getBoundingClientRect().top < $('#main').getBoundingClientRect().top;
+  fs.collapsed = collapsed;
+  fs.section.classList.toggle('collapsed', collapsed);
+  fs.fold.setAttribute('aria-expanded', String(!collapsed));
+  if (collapsed && stuck) fs.section.scrollIntoView({ block: 'start' });
+  if (!collapsed) ensureLoaded(fs).catch(() => {});
+}
+
+function renderViewed() {
+  let n = 0;
+  for (const fs of S.order) {
+    const on = isViewed(fs);
+    if (on) n++;
+    fs.viewedBox.checked = on;
+    fs.nav.classList.toggle('viewed', on);
+    fs.staleTag.hidden = !viewedStale(fs);
+  }
+  const total = S.order.length;
+  $('#viewed-count').textContent = total ? `${n}/${total} viewed` : '';
+  $('#viewed-bar').style.width = total ? `${(100 * n) / total}%` : '0';
+  $('#viewed-progress').classList.toggle('done', total > 0 && n === total);
+}
+
 // ───────────── review scope: excluded files ─────────────
 // Excluding takes changed files out of the review on the server (POST /api/scope):
 // no sections or tree rows, not in chat context, drafts on them are not submitted.
@@ -387,6 +465,8 @@ function renderDraftCounts() {
 
 const TEST_DIRS = new Set(['tests', 'test', '__tests__', 'testdata', 'testing', 'spec', 'fixtures']);
 const TEST_BASE = /(^test_.+\..+$)|(^.+_tests?\..+$)|(^.+_spec\..+$)|(^.+\.(test|spec)\..+$)|(^conftest\.py$)/;
+const COPY_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">' +
+  '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>';
 const EYE_OFF = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">' +
   '<path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/><path d="M2.5 13.5l11-11"/></svg>';
 
@@ -564,13 +644,23 @@ function treeOrder(node, out = []) {
   return out;
 }
 
-function buildSidebar(root) {
+// Files the sidebar filter keeps: every space-separated term must occur in the path.
+function filteredFiles() {
+  const terms = S.filter.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return S.order;
+  return S.order.filter(fs => terms.every(t => fs.path.toLowerCase().includes(t)));
+}
+
+function buildSidebar() {
   const add = S.order.reduce((n, fs) => n + fs.file.additions, 0);
   const del = S.order.reduce((n, fs) => n + fs.file.deletions, 0);
   const out = S.excluded.size;
   $('#file-summary').replaceChildren(plural(S.order.length, 'file'), ' ', counts({ additions: add, deletions: del }),
     ...(out ? [' · ', h('button', { class: 'link-btn scope-link', title: 'Excluded files', onclick: toggleScopePop }, `${out} excluded`)] : []));
-  $('#file-list').replaceChildren(...treeItems(root, ''));
+  const shown = filteredFiles();
+  $('#file-list').replaceChildren(...(shown.length || !S.order.length
+    ? treeItems(fileTree(shown), '')
+    : [h('li', { class: 'empty' }, 'No files match the filter.')]));
 }
 
 // Sidebar tree items: directories first (single-child chains compressed into one
@@ -586,7 +676,7 @@ function treeItems(node, prefix) {
       dir = sub;
     }
     const path = prefix + label;
-    const li = h('li', { class: `tree-dir${S.collapsed.has(path) ? ' collapsed' : ''}` });
+    const li = h('li', { class: `tree-dir${S.collapsed.has(path) && !S.filter ? ' collapsed' : ''}` });
     const toggle = () => {
       const closed = !S.collapsed.delete(path);
       if (closed) S.collapsed.add(path);
@@ -603,17 +693,25 @@ function treeItems(node, prefix) {
   return items;
 }
 
+const posKey = () => `review-master:pos:${prId()}`;
+
 function setCurrent(fs) {
   if (!fs || S.current === fs) return;
   if (S.current) S.current.nav.classList.remove('active');
   S.current = fs;
+  try {
+    sessionStorage.setItem(posKey(), fs.path); // a reload comes back to this file
+  } catch {
+    /* storage unavailable */
+  }
   fs.nav.classList.add('active');
   fs.nav.scrollIntoView({ block: 'nearest' });
 }
 
-// Highlights the last file section whose top has scrolled past the top of the main column.
+// Highlights the last file section whose top has reached the top of the main column
+// (a small margin only: a collapsed file is 40px tall and must still be told apart).
 function trackCurrent() {
-  const top = $('#main').getBoundingClientRect().top + 60;
+  const top = $('#main').getBoundingClientRect().top + 10;
   let cur = null;
   for (const fs of S.order) {
     if (cur && fs.section.getBoundingClientRect().top > top) break;
@@ -632,12 +730,13 @@ function jumpToFile(fs) {
 // ───────────────────────────── file sections ─────────────────────────────
 
 function makeBox() {
+  const remote = h('div', { class: 'box-drafts' });
   const drafts = h('div', { class: 'box-drafts' });
   const chips = h('div', { class: 'box-chips' });
   const composers = h('div', { class: 'box-composers' });
-  return { root: h('div', { class: 'annot-box' }, drafts, chips, composers), drafts, chips, composers };
+  return { root: h('div', { class: 'annot-box' }, remote, drafts, chips, composers), remote, drafts, chips, composers };
 }
-const boxEmpty = b => !b.drafts.childElementCount && !b.chips.childElementCount && !b.composers.childElementCount;
+const boxEmpty = b => !b.remote.childElementCount && !b.drafts.childElementCount && !b.chips.childElementCount && !b.composers.childElementCount;
 
 // Box for comments whose anchor row is not part of the rendered table.
 function makeNotes() {
@@ -653,13 +752,15 @@ const fileTitle = f => (f.status === 'renamed' && f.old_path
   : pathLabel(f.path));
 
 function makeFileState(f) {
-  const fs = { file: f, path: f.path, idx: 0, diff: null, pane: null, loading: null };
-  fs.navBadge = h('span', { class: 'nav-drafts', title: 'drafts', hidden: true });
+  const fs = { file: f, path: f.path, idx: 0, diff: null, pane: null, loading: null, collapsed: false };
+  fs.navBadge = h('span', { class: 'nav-drafts', title: 'your drafts', hidden: true });
+  fs.navRemote = h('span', { class: 'nav-remote', title: 'comment threads on the PR', hidden: true });
   fs.nav = h('li', {},
     h('div', { class: 'file-line' },
       h('button', { class: 'file-item', title: f.path, onclick: () => jumpToFile(fs) },
         statusBadge(f.status), h('span', { class: 'path' }, h('span', { class: 'base' }, splitPath(f.path)[1])),
-        fs.navBadge, counts(f)),
+        h('span', { class: 'nav-check', title: 'viewed', 'aria-hidden': 'true' }, '✓'),
+        fs.navRemote, fs.navBadge, counts(f)),
       h('button', { class: 'row-hide', title: 'Exclude from review', 'aria-label': `Exclude ${f.path} from the review`, onclick: () => excludeFile(f.path), html: EYE_OFF })));
   const deleted = f.status === 'deleted';
   const full = h('button', {
@@ -667,7 +768,19 @@ function makeFileState(f) {
     title: deleted ? 'File was deleted; only the diff is available' : 'Open the whole file at HEAD',
     onclick: () => openViewer(f.path),
   }, 'Full file');
-  fs.head = h('div', { class: 'file-head' }, statusBadge(f.status), fileTitle(f), counts(f), h('span', { class: 'spacer' }), full);
+  fs.fold = h('button', {
+    class: 'icon-btn file-fold', title: 'Collapse or expand (x)', 'aria-label': `Collapse or expand ${f.path}`, 'aria-expanded': 'true',
+    onclick: () => setCollapsed(fs, !fs.collapsed),
+  }, h('span', { class: 'chevron' }, '▾'));
+  fs.viewedBox = h('input', { type: 'checkbox', onchange: () => setViewed(fs, fs.viewedBox.checked) });
+  fs.staleTag = h('span', { class: 'tag tag-excluded', title: 'This diff is not the one you marked as viewed', hidden: true }, 'changed since viewed');
+  const copy = h('button', {
+    class: 'icon-btn copy-path', title: 'Copy path', 'aria-label': `Copy path ${f.path}`,
+    onclick: () => navigator.clipboard.writeText(f.path).then(() => toast(`Copied ${f.path}`, 'ok', 2000), () => toast('Could not copy the path', 'warn')),
+    html: COPY_ICON,
+  });
+  fs.head = h('div', { class: 'file-head' }, fs.fold, statusBadge(f.status), fileTitle(f), copy, counts(f), fs.staleTag, h('span', { class: 'spacer' }),
+    h('label', { class: 'pill-toggle viewed-toggle', title: 'Mark as viewed and collapse (v)' }, fs.viewedBox, 'Viewed'), full);
   fs.notes = makeNotes();
   fs.body = h('div', { class: 'file-body' }, h('div', { class: 'placeholder' }, 'Loading…'));
   fs.section = h('section', { class: 'file' }, fs.head, fs.notes.root, fs.body);
@@ -686,11 +799,11 @@ function renderScope(files) {
     if (!fs) {
       fs = makeFileState(f);
       S.fileCache.set(f.path, fs);
+      if (isViewed(fs)) setCollapsed(fs, true);
     }
     S.files.set(f.path, fs);
   }
-  const root = fileTree(S.files.values());
-  S.order = treeOrder(root);
+  S.order = treeOrder(fileTree(S.files.values()));
   S.order.forEach((fs, idx) => {
     fs.idx = idx;
     fs.section.dataset.idx = idx;
@@ -703,8 +816,9 @@ function renderScope(files) {
     S.current.nav.classList.remove('active');
     S.current = null;
   }
-  buildSidebar(root);
+  buildSidebar();
   renderScopeControls();
+  renderViewed();
   renderDraftCounts();
   renderAllAnnotations();
   renderReviewDrafts();
@@ -766,25 +880,223 @@ async function loadDiff(fs) {
   if (fs.file.status !== 'deleted') attachFolds(fs.pane);
 }
 
+// ───────────── word-level diff inside changed lines ─────────────
+// A run of deleted lines directly followed by as many added lines is read as line-by-line
+// edits; the tokens that differ within each pair are marked, unless the lines share too little.
+
+const WORD_TOKENS = /[\p{L}\p{N}_]+|\s+|[^\p{L}\p{N}_\s]/gu;
+const INTRA_MAX_LEN = 600;
+const INTRA_MIN_SHARED = 0.35; // fraction of the longer line's non-blank text both sides must share
+
+// → [rangesInA, rangesInB] as [start, end) character offsets, or null.
+function intraline(a, b) {
+  if (a === b || a.length > INTRA_MAX_LEN || b.length > INTRA_MAX_LEN) return null;
+  const ta = a.match(WORD_TOKENS) || [];
+  const tb = b.match(WORD_TOKENS) || [];
+  const n = ta.length;
+  const m = tb.length;
+  // Longest common subsequence of tokens; lcs[i][j] covers ta[i..] and tb[j..].
+  const lcs = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) lcs[i][j] = ta[i] === tb[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+  }
+  const keepA = new Array(n).fill(false);
+  const keepB = new Array(m).fill(false);
+  let shared = 0;
+  for (let i = 0, j = 0; i < n && j < m;) {
+    if (ta[i] === tb[j]) {
+      keepA[i] = keepB[j] = true;
+      if (ta[i].trim()) shared += ta[i].length;
+      i++;
+      j++;
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) i++;
+    else j++;
+  }
+  const solid = t => t.replace(/\s+/g, '').length;
+  if (shared < INTRA_MIN_SHARED * Math.max(solid(a), solid(b))) return null;
+  const ranges = (tokens, keep) => {
+    const out = [];
+    let pos = 0;
+    let bridge = false; // only kept whitespace since the last range: join the next one to it
+    tokens.forEach((t, k) => {
+      if (!keep[k]) {
+        if (bridge && out.length) out[out.length - 1][1] = pos + t.length;
+        else out.push([pos, pos + t.length]);
+        bridge = true;
+      } else if (t.trim()) bridge = false;
+      pos += t.length;
+    });
+    return out;
+  };
+  return [ranges(ta, keepA), ranges(tb, keepB)];
+}
+
+// Wraps character ranges of the raw text in <mark> inside its highlighted HTML
+// (tags are skipped, an entity counts as one character).
+function markRanges(html, ranges) {
+  if (!ranges || !ranges.length) return html;
+  let out = '';
+  let pos = 0;
+  let ri = 0;
+  let open = false;
+  for (const [tok] of html.matchAll(/<[^>]*>|&[#\w]+;|[^<&]+|[<&]/g)) {
+    if (tok[0] === '<' && tok.length > 1) {
+      if (open) out += '</mark>';
+      open = false;
+      out += tok;
+      continue;
+    }
+    const entity = tok[0] === '&';
+    const len = entity ? 1 : tok.length;
+    for (let off = 0; off < len;) {
+      while (ri < ranges.length && ranges[ri][1] <= pos) ri++;
+      const r = ranges[ri];
+      const inside = !!r && r[0] <= pos;
+      const step = Math.min(len - off, r ? (inside ? r[1] : r[0]) - pos : len - off);
+      if (inside !== open) out += inside ? '<mark class="intra">' : '</mark>';
+      open = inside;
+      out += entity ? tok : tok.slice(off, off + step);
+      off += step;
+      pos += step;
+    }
+  }
+  return open ? `${out}</mark>` : out;
+}
+
+// line index in the hunk → ranges to mark, for paired deleted/added lines.
+function intraMarks(lines) {
+  const marks = new Map();
+  for (let i = 0; i < lines.length;) {
+    if (lines[i].k !== 'del') {
+      i++;
+      continue;
+    }
+    let d = i;
+    while (d < lines.length && lines[d].k === 'del') d++;
+    let a = d;
+    while (a < lines.length && lines[a].k === 'add') a++;
+    if (d - i === a - d) {
+      for (let k = 0; k < d - i; k++) {
+        const pair = intraline(lines[i + k].text, lines[d + k].text);
+        if (!pair) continue;
+        marks.set(i + k, pair[0]);
+        marks.set(d + k, pair[1]);
+      }
+    }
+    i = a;
+  }
+  return marks;
+}
+
+// ───────────── hidden context between hunks ─────────────
+// A hunk header stands for the unchanged lines above its hunk ("gap"): new-file lines
+// from..to, old numbers = new − delta. Its buttons reveal them from the head file, 20 at a
+// time from either end or all at once; a "tail" row does the same below the last hunk.
+
+const EXPAND_STEP = 20;
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+// First/last old and new line numbers a hunk covers (an empty side starts after its anchor line).
+function hunkSpan(header) {
+  const m = HUNK_RE.exec(header);
+  if (!m) return null;
+  const oc = m[2] == null ? 1 : +m[2];
+  const nc = m[4] == null ? 1 : +m[4];
+  const os = oc ? +m[1] : +m[1] + 1;
+  const ns = nc ? +m[3] : +m[3] + 1;
+  return { os, oe: os + oc - 1, ns, ne: ns + nc - 1 };
+}
+
+// Cells of a gap row. kind: 'first' (above the first hunk), 'mid', 'tail' (below the last).
+function gapCells(kind, from, to, header) {
+  const n = to - from + 1;
+  const btn = (how, label, title) => `<button class="gap-btn" type="button" data-expand="${how}" title="${title}" aria-label="${title}">${label}</button>`;
+  let ctl = '';
+  if (n > 0 && n <= EXPAND_STEP) ctl = btn('all', '↕', `Show the ${plural(n, 'hidden line')}`);
+  else if (n > 0) {
+    if (kind !== 'first') ctl += btn('down', '↓', `Show ${EXPAND_STEP} more lines below`);
+    if (kind !== 'tail') ctl += btn('up', '↑', `Show ${EXPAND_STEP} more lines above`);
+  }
+  const all = n > 0 ? `<button class="link-btn" type="button" data-expand="all">${kind === 'tail' ? plural(n, 'more line') : plural(n, 'hidden line')}</button>` : '';
+  return `<td class="ln gap-ctl" colspan="2">${ctl}</td><td class="mk"></td><td class="code">${esc(header)}${header && all ? ' · ' : ''}${all}</td>`;
+}
+
+const gapRow = (kind, from, to, delta, header) =>
+  `<tr class="hunk" data-kind="${kind}" data-from="${from}" data-to="${to}" data-delta="${delta}" data-header="${esc(header)}">${gapCells(kind, from, to, header)}</tr>`;
+
+async function expandGap(pane, tr, how) {
+  let src = S.sources.get(pane.path);
+  if (!src) {
+    src = await get(`/api/source?path=${qpath(pane.path)}`);
+    S.sources.set(pane.path, src);
+  }
+  if (!tr.isConnected) return; // expanded by another click meanwhile
+  const lines = src.text.split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  const { kind } = tr.dataset;
+  const delta = +tr.dataset.delta;
+  let from = +tr.dataset.from;
+  let to = Math.min(+tr.dataset.to, lines.length);
+  const take = how === 'all' ? to - from + 1 : Math.min(EXPAND_STEP, to - from + 1);
+  const first = how === 'up' ? to - take + 1 : from;
+  const lang = lines.length <= HL_LINE_LIMIT ? langForPath(pane.path) : null;
+  let html = '';
+  for (let n = first; n < first + take; n++) {
+    html += `<tr class="ln-row ctx" data-old="${n - delta}" data-new="${n}"><td class="ln">${n - delta}</td><td class="ln">${n}</td>` +
+      `<td class="mk"></td><td class="code">${hlCode(lines[n - 1], lang)}</td></tr>`;
+  }
+  // Lines grown upwards from a hunk go below its header; the others above it.
+  const below = how === 'up';
+  tr.insertAdjacentHTML(below ? 'afterend' : 'beforebegin', html);
+  const fold = tr.dataset.fold && pane.folds.get(tr.dataset.fold); // a header inside a test fold: so are its lines
+  let row = tr;
+  for (let k = 0; k < take; k++) {
+    row = below ? row.nextElementSibling : row.previousElementSibling;
+    pane.rows.set(`LEFT:${row.dataset.old}`, row);
+    pane.rows.set(`RIGHT:${row.dataset.new}`, row);
+    if (fold) {
+      row.dataset.fold = fold.key;
+      row.hidden = !fold.open;
+    }
+  }
+  if (how === 'up') to -= take;
+  else from += take;
+  if (from > to) tr.remove();
+  else {
+    Object.assign(tr.dataset, { from, to });
+    tr.innerHTML = gapCells(kind, from, to, tr.dataset.header);
+  }
+  renderAnnotations(pane); // comments on the revealed lines move out of the notes box
+}
+
 function diffTable(fs) {
   const hunks = fs.diff.hunks || [];
   const total = hunks.reduce((n, hk) => n + hk.lines.length, 0);
   const lang = total <= HL_LINE_LIMIT ? langForPath(fs.path) : null;
   const rows = [];
+  const expandable = fs.file.status !== 'deleted' && fs.diff.new_lines != null;
+  let prev = null; // span of the hunk above
   for (const hk of hunks) {
-    rows.push(`<tr class="hunk"><td class="ln"></td><td class="ln"></td><td class="mk"></td><td class="code">${esc(hk.header)}</td></tr>`);
+    const marks = total <= HL_LINE_LIMIT ? intraMarks(hk.lines) : new Map();
+    const span = expandable ? hunkSpan(hk.header) : null;
+    if (span) {
+      const from = prev ? prev.ne + 1 : 1;
+      rows.push(gapRow(prev ? 'mid' : 'first', from, span.ns - 1, span.ns - span.os, hk.header));
+      prev = span;
+    } else rows.push(`<tr class="hunk"><td class="ln"></td><td class="ln"></td><td class="mk"></td><td class="code">${esc(hk.header)}</td></tr>`);
     const m = /\+(\d+)/.exec(hk.header);
     let lastNew = m ? +m[1] - 1 : 0; // new-file line preceding the current row, for deleted-line jumps
-    for (const l of hk.lines) {
+    hk.lines.forEach((l, li) => {
       let attrs = '';
       if (l.old != null) attrs += ` data-old="${l.old}"`;
       if (l.new != null) attrs += ` data-new="${l.new}"`;
       if (l.k === 'del') attrs += ` data-after="${lastNew}"`;
       if (l.new != null) lastNew = l.new;
       rows.push(`<tr class="ln-row ${l.k}"${attrs}><td class="ln">${l.old ?? ''}</td><td class="ln">${l.new ?? ''}</td>` +
-        `<td class="mk">${MARK[l.k] ?? ''}</td><td class="code">${hlCode(l.text, lang)}</td></tr>`);
-    }
+        `<td class="mk">${MARK[l.k] ?? ''}</td><td class="code">${markRanges(hlCode(l.text, lang), marks.get(li))}</td></tr>`);
+    });
   }
+  if (prev && prev.ne < fs.diff.new_lines) rows.push(gapRow('tail', prev.ne + 1, fs.diff.new_lines, prev.ne - prev.oe, ''));
   if (!hunks.length) rows.push('<tr class="note"><td colspan="4">No textual changes (binary file or mode change).</td></tr>');
   return h('table', {
     class: 'code-table diff',
@@ -1014,6 +1326,7 @@ function refreshFolds(pane) {
 
 // Jump targets inside a closed fold open it first.
 function unfoldRow(pane, tr) {
+  if (pane.kind === 'diff' && pane.fs && pane.fs.collapsed) setCollapsed(pane.fs, false);
   pane.lastReveal = tr;
   const f = tr.dataset.fold && pane.folds.get(tr.dataset.fold);
   if (f && !f.open) setFold(pane, f.key, true);
@@ -1087,7 +1400,7 @@ function closeViewer() {
       moved = true;
     }
   }
-  if (moved && v.fs) renderAnnotations(v.fs.pane);
+  if ((moved || S.replies.size) && v.fs) renderAnnotations(v.fs.pane); // reply boxes too
 }
 
 // Viewer "N deleted lines" marker → the file's inline diff, scrolled to those deletions.
@@ -1109,6 +1422,7 @@ async function anchorRow(fs, side, line) {
   const v = S.viewer;
   if (v && v.fs === fs && v.pane && v.pane.rows.has(key)) return { pane: v.pane, tr: v.pane.rows.get(key) };
   closeViewer();
+  if (fs.collapsed) setCollapsed(fs, false);
   await ensureLoaded(fs);
   return { pane: fs.pane, tr: fs.pane.rows.get(key) || null };
 }
@@ -1160,10 +1474,16 @@ function renderAnnotations(pane) {
   if (!pane) return;
   const inViewer = pane.kind === 'full';
   for (const b of [...pane.boxes.values(), pane.notes]) {
+    b.remote.replaceChildren();
     b.drafts.replaceChildren();
     b.chips.replaceChildren();
   }
   const place = akey => boxAt(pane, akey) || pane.notes;
+  if (S.remote.show) {
+    for (const t of S.remote.threads) {
+      if (t.path === pane.path) (t.line != null ? place(anchorKey(t.side, t.line)) : pane.notes).remote.append(remoteCard(t));
+    }
+  }
   for (const d of S.drafts) {
     if (d.path === pane.path && !S.composers.has(`d${d.id}`)) place(anchorKey(d.side, d.line)).drafts.append(draftCard(d));
   }
@@ -1207,6 +1527,117 @@ function draftCard(d) {
     d.problem && h('div', { class: 'warn-line' }, `⚠ won't anchor: ${d.problem}; will go into the review body`));
 }
 
+// ───────────── comments already on the PR ─────────────
+// Read-only: what other reviewers and the author already said, shown where it is
+// anchored; outdated threads (their code changed since) go to the file's notes box.
+
+const REMOTE_SHOW_KEY = 'review-master:show-pr-comments';
+
+// Replies join their root comment's thread; the list is oldest first.
+function remoteThreads(list) {
+  const byId = new Map();
+  const threads = [];
+  for (const c of list) {
+    const root = c.reply_to != null ? byId.get(c.reply_to) : null;
+    if (root) root.comments.push(c);
+    else threads.push({ path: c.path, side: c.side || 'RIGHT', line: c.line, start: c.start, original: c.original_line, comments: [c] });
+    byId.set(c.id, root || threads[threads.length - 1]);
+  }
+  return threads;
+}
+
+async function loadRemote(refresh = false) {
+  if (!S.info.pr) return;
+  try {
+    const r = await api('GET', `/api/comments${refresh ? '?refresh=true' : ''}`, undefined, true);
+    S.remote.threads = remoteThreads(r.comments || []);
+    S.remote.error = null;
+  } catch (e) {
+    S.remote.error = e.message;
+  }
+  renderRemoteControls();
+  renderAllAnnotations();
+}
+
+function renderRemoteControls() {
+  const n = S.remote.threads.length;
+  $('#remote-toggle').hidden = n === 0;
+  $('#show-remote').checked = S.remote.show;
+  $('#remote-count').textContent = `PR comments · ${n}`;
+  const retry = $('#remote-retry');
+  retry.hidden = !S.remote.error;
+  retry.title = S.remote.error || '';
+  const per = new Map();
+  for (const t of S.remote.threads) per.set(t.path, (per.get(t.path) || 0) + 1);
+  for (const fs of S.fileCache.values()) {
+    const c = per.get(fs.path) || 0;
+    fs.navRemote.textContent = `💬${c}`;
+    fs.navRemote.hidden = c === 0 || !S.remote.show;
+  }
+}
+
+// Reply box of a thread; kept in S.replies so re-renders do not lose what was typed.
+function toggleReply(t) {
+  const id = t.comments[0].id;
+  const open = S.replies.get(id);
+  if (open) {
+    S.replies.delete(id);
+    open.el.remove();
+    return;
+  }
+  const ta = h('textarea', { class: 'composer-text', rows: '2', placeholder: `Reply… (markdown, ${MOD}+Enter to post)` });
+  autosize(ta);
+  const send = h('button', { class: 'btn primary small' }, 'Reply on GitHub');
+  const r = { ta, el: null };
+  r.el = h('div', { class: 'reply-box' }, ta,
+    h('div', { class: 'composer-actions' },
+      h('span', { class: 'hint' }, 'Posted right away, not with the review'), h('span', { class: 'spacer' }),
+      h('button', { class: 'btn small', onclick: () => toggleReply(t) }, 'Cancel'), send));
+  const submit = async () => {
+    const body = ta.value.trim();
+    if (!body) return ta.focus();
+    send.disabled = true;
+    try {
+      await post('/api/comments/reply', { id, body });
+    } catch {
+      send.disabled = false;
+      return;
+    }
+    S.replies.delete(id);
+    toast('Reply posted', 'ok', 3000);
+    await loadRemote(true);
+  };
+  send.addEventListener('click', submit);
+  onCtrlEnter(ta, submit);
+  S.replies.set(id, r);
+  renderFileAnnotations(t.path);
+  ta.focus({ preventScroll: true });
+}
+
+function remoteCard(t) {
+  const outdated = t.line == null;
+  const first = t.comments[0];
+  const reply = S.replies.get(first.id);
+  const ask = () => {
+    openChatNew({ path: t.path, side: t.side, line: t.line, start: t.start ?? null });
+    const input = $('#chat-input');
+    input.value = `Another reviewer (${first.author || 'unknown'}) commented here:\n${String(first.body || '').split('\n').map(l => `> ${l}`).join('\n')}\n\nIs this concern valid?`;
+    input.dispatchEvent(new Event('input'));
+  };
+  return h('div', { class: `card remote${outdated ? ' outdated' : ''}` }, t.comments.map((c, i) =>
+    h('div', { class: 'remote-comment' },
+      h('div', { class: 'card-head' },
+        h('strong', {}, c.author || 'unknown'),
+        h('span', { class: 'dim', title: c.created || '' }, relTime(c.created)),
+        i === 0 && outdated && h('span', { class: 'tag' }, `outdated${t.original != null ? ` · was line ${t.original}` : ''}`),
+        h('span', { class: 'spacer' }),
+        i === 0 && !outdated && h('button', { class: 'link-btn', title: 'Ask the LLM about this comment', onclick: ask }, 'Ask'),
+        i === 0 && h('button', { class: 'link-btn', title: 'Reply in this thread on GitHub', onclick: () => toggleReply(t) }, 'Reply'),
+        c.url && h('a', { class: 'link-btn', href: c.url, target: '_blank', rel: 'noopener noreferrer' }, 'GitHub ↗')),
+      h('div', { class: 'md card-body', html: md(c.body || '') }))),
+  reply && reply.el);
+}
+
 function threadChip(t) {
   return h('button', { class: 'chip thread-chip', title: t.last, onclick: () => openThread(t.id) }, `💬 chat (${t.messages})`);
 }
@@ -1239,11 +1670,11 @@ function makeComposer(key, a) {
   const sev = h('select', { class: 'sev-select', 'aria-label': 'Severity' },
     SEVERITIES.map(s => h('option', { value: s }, s)));
   sev.value = a.severity || 'minor';
-  const ta = h('textarea', { class: 'composer-text', rows: '3', placeholder: 'Leave a comment… (markdown, Ctrl+Enter to save)' });
+  const ta = h('textarea', { class: 'composer-text', rows: '3', placeholder: `Leave a comment… (markdown, ${MOD}+Enter to save)` });
   ta.value = a.body || '';
   autosize(ta);
   const save = h('button', { class: 'btn primary small' }, a.draft ? 'Update draft' : 'Save draft');
-  const c = { key, path: a.path, akey: anchorKey(a.side, a.line), ta };
+  const c = { key, path: a.path, akey: anchorKey(a.side, a.line), ta, initial: ta.value };
   const cancel = h('button', { class: 'btn small', onclick: () => closeComposer(c) }, 'Cancel');
   c.el = h('div', { class: 'composer' },
     h('div', { class: 'composer-head' },
@@ -1742,11 +2173,24 @@ function renderThreadList() {
     return;
   }
   list.replaceChildren(...S.threads.map(t =>
-    h('button', { class: `thread-item${t.id === S.chat.threadId ? ' on' : ''}`, onclick: () => openThread(t.id) },
-      h('span', { class: 'thread-anchor' }, anchorText(t.anchor)),
-      h('span', { class: 'count' }, t.messages),
-      h('span', { class: 'thread-last' }, t.last))));
+    h('div', { class: `thread-row${t.id === S.chat.threadId ? ' on' : ''}` },
+      h('button', { class: 'thread-item', onclick: () => openThread(t.id) },
+        h('span', { class: 'thread-anchor' }, anchorText(t.anchor)),
+        h('span', { class: 'count' }, t.messages),
+        h('span', { class: 'thread-last' }, t.last)),
+      h('button', { class: 'icon-btn', title: 'Delete conversation', 'aria-label': `Delete conversation about ${anchorText(t.anchor)}`, onclick: () => deleteThread(t) }, '×'))));
 }
+
+async function deleteThread(t) {
+  if (!confirm(`Delete the conversation about ${anchorText(t.anchor)}?`)) return;
+  await api('DELETE', `/api/thread/${t.id}`);
+  S.chat.jobs.delete(t.id);
+  if (S.chat.threadId === t.id) Object.assign(S.chat, { threadId: null, anchor: null, snippet: null, thread: null });
+  await refreshThreads();
+  renderConvo();
+}
+
+const stopJob = id => post(`/api/job/${id}/cancel`).catch(() => {});
 
 // New thread composer; `snippet` is selected code text sent along with the first question.
 function openChatNew(anchor, snippet = null) {
@@ -1830,6 +2274,7 @@ function renderConvo() {
     nodes.push(h('div', { class: 'working' }, h('span', { class: 'spinner' }), 'Working…'));
   }
   if (job && job.error) nodes.push(h('div', { class: 'msg error' }, job.error));
+  if (job && job.stopped) nodes.push(h('div', { class: 'msg note' }, 'Stopped before an answer.'));
   if (!nodes.length) {
     nodes.push(h('div', { class: 'empty' }, anchor ? `Ask a question about ${anchorText(anchor)}.` : 'Ask a question about the whole pull request.'));
   }
@@ -1839,13 +2284,20 @@ function renderConvo() {
   const box = $('#messages');
   box.replaceChildren(...nodes);
   box.scrollTop = box.scrollHeight;
-  $('#chat-send').disabled = !!(running || (t && t.busy));
+  // While a turn runs the send button stops it (when the job is known to this page or the server).
+  const busy = !!(running || (t && t.busy));
+  c.stopId = busy ? (running ? job.id : t.job) ?? null : null;
+  const send = $('#chat-send');
+  send.textContent = c.stopId != null ? 'Stop' : 'Send';
+  send.classList.toggle('primary', c.stopId == null);
+  send.classList.toggle('danger', c.stopId != null);
+  send.disabled = busy && c.stopId == null;
 }
 
 async function sendChat() {
   const input = $('#chat-input');
   const question = input.value.trim();
-  if (!question || $('#chat-send').disabled) return;
+  if (!question || $('#chat-send').disabled || S.chat.stopId != null) return;
   const from = S.chat.threadId;
   const a = S.chat.anchor;
   const snippet = from == null ? S.chat.snippet : null;
@@ -1862,7 +2314,7 @@ async function sendChat() {
   }
   input.value = '';
   input.dispatchEvent(new Event('input'));
-  const job = { question, act: makeActivity(), error: null, answer: null };
+  const job = { id: r.job, question, act: makeActivity(), error: null, answer: null, stopped: false };
   S.chat.jobs.set(r.thread, job);
   const viewing = () => S.drawer === 'chat' && S.chat.threadId === r.thread;
   if (S.chat.threadId === from) {
@@ -1881,8 +2333,11 @@ async function sendChat() {
     });
     job.answer = result.answer || null;
   } catch (e) {
-    job.error = e.message;
-    if (!e.toasted) toast(`Chat failed: ${e.message}`, 'error');
+    if (e.message === 'cancelled') job.stopped = true;
+    else {
+      job.error = e.message;
+      if (!e.toasted) toast(`Chat failed: ${e.message}`, 'error');
+    }
   }
   job.act.running = false;
   updateActivity(job.act);
@@ -1892,33 +2347,44 @@ async function sendChat() {
 
 // ───────────────────────────── review drawer ─────────────────────────────
 
+// The unsent review form survives reloads, per PR.
+const reviewKey = () => `review-master:review:${prId()}`;
+const saveReviewForm = () => savePref(reviewKey(), { body: S.review.body, event: S.review.event });
+
 function renderReview() {
   const info = S.info;
   const rv = S.review;
   const local = info.mode === 'local';
   const own = !!(info.pr && info.viewer && info.viewer === info.pr.author);
-  const locked = !!info.submitted;
   const restricted = local || own;
   if (restricted && rv.event !== 'comment') rv.event = 'comment';
 
-  const summary = h('textarea', { class: 'review-summary', rows: '6', disabled: locked, placeholder: 'Review summary (markdown, optional)…' });
+  const summary = h('textarea', { class: 'review-summary', rows: '6', placeholder: 'Review summary (markdown, optional)…' });
   summary.value = rv.body;
-  summary.addEventListener('input', () => { rv.body = summary.value; });
+  summary.addEventListener('input', () => {
+    rv.body = summary.value;
+    saveReviewForm();
+  });
   autosize(summary);
 
   const radios = EVENTS.map(ev => {
-    const off = locked || (ev.value !== 'comment' && restricted);
+    const off = ev.value !== 'comment' && restricted;
+    const pick = () => {
+      rv.event = ev.value;
+      saveReviewForm();
+    };
     return h('label', { class: `radio${off ? ' disabled' : ''}` },
-      h('input', { type: 'radio', name: 'review-event', value: ev.value, checked: rv.event === ev.value, disabled: off, onchange: () => { rv.event = ev.value; } }),
+      h('input', { type: 'radio', name: 'review-event', value: ev.value, checked: rv.event === ev.value, disabled: off, onchange: pick }),
       h('span', { class: 'radio-text' }, h('strong', {}, ev.label), h('span', { class: 'dim' }, ev.hint)));
   });
 
   rv.list = h('div', { class: 'review-drafts' });
-  const submit = h('button', { class: 'btn primary', disabled: local || locked || rv.submitting, onclick: submitReview },
+  const submit = h('button', { class: 'btn primary', disabled: local || rv.submitting, onclick: submitReview },
     rv.submitting ? 'Submitting…' : 'Submit review');
+  const unviewed = S.order.filter(fs => !isViewed(fs)).length;
 
   $('#review-body').replaceChildren(...[
-    locked && submittedNode(),
+    info.submitted && submittedNode(),
     local && h('div', { class: 'banner info' }, 'Local mode: this worktree has no known pull request, so submitting is disabled. Chat and drafts still work.'),
     h('label', { class: 'field-label' }, 'Summary'),
     summary,
@@ -1926,7 +2392,9 @@ function renderReview() {
     h('div', { class: 'radios' }, radios),
     own && !local && h('div', { class: 'hint' }, 'You authored this pull request; GitHub only allows comment reviews on your own PR.'),
     rv.list,
-    h('div', { class: 'review-actions' }, submit),
+    h('div', { class: 'review-actions' },
+      unviewed > 0 && h('span', { class: 'hint' }, `${plural(unviewed, 'file')} not marked viewed`),
+      h('span', { class: 'spacer' }), submit),
   ].filter(Boolean));
   renderReviewDrafts();
 }
@@ -1963,9 +2431,11 @@ async function submitReview() {
     const r = await post('/api/submit', { event: S.review.event, body: S.review.body });
     S.info.submitted = r.url;
     S.review.body = '';
+    saveReviewForm();
     renderBanner();
     toast('Review submitted', 'ok');
     refreshDrafts().catch(() => {});
+    loadRemote(true); // the comments just posted now live on the PR
   } finally {
     S.review.submitting = false;
     if (S.drawer === 'review') renderReview();
@@ -1994,7 +2464,7 @@ async function loadSummary() {
 
 async function runSummaryJob(job) {
   const st = S.summary;
-  Object.assign(st, { act: makeActivity(), running: true, error: null });
+  Object.assign(st, { act: makeActivity(), running: true, error: null, jobId: job });
   renderSummary();
   try {
     const res = await pollJob(job, lines => {
@@ -2003,7 +2473,7 @@ async function runSummaryJob(job) {
     }, true);
     st.text = res.summary || st.text;
   } catch (e) {
-    st.error = e.message;
+    st.error = e.message === 'cancelled' ? null : e.message;
   }
   st.running = false;
   st.act.running = false;
@@ -2045,7 +2515,9 @@ function renderSummary() {
       h('span', { class: 'chevron' }, '▾'), h('strong', {}, 'Summary')),
     st.running && h('span', { class: 'dim summary-status' }, h('span', { class: 'spinner' }), ' generating…'),
     h('span', { class: 'spacer' }),
-    h('button', { class: 'icon-btn', title: 'Regenerate', 'aria-label': 'Regenerate summary', disabled: st.running, onclick: regenerateSummary }, '↻'));
+    st.running
+      ? h('button', { class: 'btn small', title: 'Stop generating', onclick: () => stopJob(st.jobId) }, 'Stop')
+      : h('button', { class: 'icon-btn', title: 'Regenerate', 'aria-label': 'Regenerate summary', onclick: regenerateSummary }, '↻'));
   const body = h('div', { class: 'summary-body' });
   if (st.error) {
     body.append(h('div', { class: 'msg error' }, `Summary failed: ${st.error} `,
@@ -2059,6 +2531,146 @@ function renderSummary() {
     body.append(h('div', { class: 'hint' }, 'No summary yet. ', h('button', { class: 'btn small', onclick: regenerateSummary }, 'Generate')));
   }
   card.replaceChildren(head, body);
+}
+
+// ───────────────────────────── keyboard navigation & help ─────────────────────────────
+
+function stepFile(dir) {
+  if (!S.order.length) return;
+  const i = S.current ? S.current.idx + dir : 0;
+  jumpToFile(S.order[Math.max(0, Math.min(S.order.length - 1, i))]);
+}
+
+const isChange = tr => !!tr && tr.classList.contains('ln-row') && (tr.classList.contains('add') || tr.classList.contains('del'));
+
+// Next/previous run of changed lines among the visible diff rows: continues from the
+// run it last landed on while that is still on screen, else from the top of the view.
+function stepChange(dir) {
+  const starts = [...$('#sections').querySelectorAll('tr.ln-row.add, tr.ln-row.del')]
+    .filter(tr => tr.offsetParent !== null && !isChange(tr.previousElementSibling));
+  const view = $('#main').getBoundingClientRect();
+  const top = tr => tr.getBoundingClientRect().top;
+  let i = starts.indexOf(S.lastChange);
+  if (i >= 0 && top(S.lastChange) > view.top && top(S.lastChange) < view.bottom) i += dir;
+  else i = dir > 0 ? starts.findIndex(tr => top(tr) > view.top + 60) : starts.findLastIndex(tr => top(tr) < view.top + 60);
+  const tr = starts[i];
+  if (!tr) {
+    // nothing further in the loaded diffs: move on to the next file that is not loaded yet
+    const next = dir > 0 && S.order.find(fs => !fs.pane && !fs.collapsed && (!S.current || fs.idx > S.current.idx));
+    if (next) jumpToFile(next);
+    return;
+  }
+  S.lastChange = tr;
+  tr.scrollIntoView({ block: 'center' });
+  for (let r = tr; isChange(r); r = r.nextElementSibling) flash(r);
+}
+
+function toggleHelp() {
+  if (S.help) {
+    S.help.remove();
+    S.help = null;
+    return;
+  }
+  const row = (keys, text) => h('tr', {}, h('td', { class: 'keys' }, keys.map(k => h('kbd', {}, k))), h('td', {}, text));
+  const group = (title, rows) => [h('tr', {}, h('th', { colspan: '2' }, title)), ...rows];
+  S.help = h('div', { class: 'modal', onclick: e => { if (e.target === S.help) toggleHelp(); } },
+    h('div', { class: 'modal-box', role: 'dialog', 'aria-label': 'Keyboard shortcuts' },
+      h('div', { class: 'drawer-head' }, h('h2', {}, 'Shortcuts'), h('span', { class: 'spacer' }),
+        h('button', { class: 'icon-btn', 'aria-label': 'Close', onclick: toggleHelp }, '×')),
+      h('table', { class: 'help-table' }, h('tbody', {},
+        group('Move around', [
+          row(['j', 'k'], 'Next / previous file'),
+          row(['n', 'p'], 'Next / previous change'),
+          row(['/'], 'Filter the file list (Enter jumps to the first match)'),
+          row(['o'], 'Open the whole file'),
+        ]),
+        group('Review', [
+          row(['v'], 'Mark the current file viewed (collapses it)'),
+          row(['x'], 'Collapse or expand the current file'),
+          row(['c'], 'Chat'),
+          row(['r'], 'Review drawer: summary, drafts, submit'),
+          row([`${MOD}+Enter`], 'Save the comment / send the question'),
+          row(['Esc'], 'Close whatever is open'),
+        ]),
+        group('In the code', [
+          row(['click', 'drag'], 'Line numbers select lines (Shift-click extends) → Comment or Ask'),
+          row(['select'], 'Selecting code text asks or comments about exactly that text'),
+          row([`${MOD}+click`], 'An identifier: hover, definition, references'),
+        ])))));
+  document.body.append(S.help);
+}
+
+// Text entry swallows the single-key shortcuts; a focused checkbox (e.g. "Viewed") does not.
+const typing = el => el instanceof Element && !!el.closest('textarea, select, [contenteditable], input:not([type=checkbox]):not([type=radio])');
+
+function onKeyDown(e) {
+  if (e.key === 'Escape') {
+    if (S.help) toggleHelp();
+    else if (S.sym) closeSym();
+    else if (S.scopePop) closeScopePop();
+    else if (S.viewer && S.viewer.outlineEl) closeOutline();
+    else if (S.viewer) closeViewer();
+    else if (S.sel) clearSel();
+    else if (S.drawer) openDrawer(null);
+    return;
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || !S.info) return;
+  if (S.help && e.key !== '?') return;
+  const cur = S.current || S.order[0];
+  const inDiff = !S.viewer; // these act on the diff column behind the file viewer
+  if (e.key === 'j' || e.key === 'k') stepFile(e.key === 'j' ? 1 : -1);
+  else if ((e.key === 'n' || e.key === 'p') && inDiff) stepChange(e.key === 'n' ? 1 : -1);
+  else if (e.key === 'v' && inDiff && cur) setViewed(cur, !isViewed(cur));
+  else if (e.key === 'x' && inDiff && cur) setCollapsed(cur, !cur.collapsed);
+  else if (e.key === 'o' && inDiff && cur && cur.file.status !== 'deleted') openViewer(cur.path);
+  else if (e.key === 'c') toggleDrawer('chat');
+  else if (e.key === 'r') toggleDrawer('review');
+  else if (e.key === '/') $('#file-filter').focus();
+  else if (e.key === '?') toggleHelp();
+  else return;
+  e.preventDefault();
+}
+
+// ───────────────────────────── resizable panels ─────────────────────────────
+
+const LAYOUT_KEY = 'review-master:layout';
+
+function wireResizers() {
+  const layout = loadPref(LAYOUT_KEY, {});
+  const vars = { side: '--side-w', drawer: '--drawer-w' };
+  const apply = () => {
+    for (const [name, prop] of Object.entries(vars)) {
+      if (layout[name] > 0) document.documentElement.style.setProperty(prop, `${layout[name]}px`);
+      else document.documentElement.style.removeProperty(prop);
+    }
+  };
+  apply();
+  for (const el of document.querySelectorAll('.resizer')) {
+    const name = el.dataset.resize;
+    el.addEventListener('mousedown', e => {
+      e.preventDefault();
+      document.body.classList.add('resizing');
+      const move = ev => {
+        const w = name === 'side' ? ev.clientX : window.innerWidth - ev.clientX;
+        const [min, max] = name === 'side' ? [180, 0.4] : [320, 0.6];
+        layout[name] = Math.round(Math.max(min, Math.min(w, window.innerWidth * max)));
+        apply();
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        document.body.classList.remove('resizing');
+        savePref(LAYOUT_KEY, layout);
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+    el.addEventListener('dblclick', () => {
+      delete layout[name]; // back to the default width
+      apply();
+      savePref(LAYOUT_KEY, layout);
+    });
+  }
 }
 
 // ───────────────────────────── wiring & boot ─────────────────────────────
@@ -2086,6 +2698,12 @@ function wire() {
       openCodeRef(ref.dataset.path, +ref.dataset.line, ref.dataset.end ? +ref.dataset.end : null);
       return;
     }
+    const gap = e.target.closest('button[data-expand]');
+    const gapPane = gap && paneOf(gap);
+    if (gapPane) {
+      expandGap(gapPane, gap.closest('tr'), gap.dataset.expand).catch(() => {});
+      return;
+    }
     const bar = e.target.closest('tr.fold-bar');
     const barPane = bar && paneOf(bar);
     if (barPane) {
@@ -2100,14 +2718,43 @@ function wire() {
   $('#viewer').addEventListener('click', e => {
     if (e.target.id === 'viewer') closeViewer(); // backdrop
   });
-  document.addEventListener('keydown', e => {
-    if (e.key !== 'Escape') return;
-    if (S.sym) closeSym();
-    else if (S.scopePop) closeScopePop();
-    else if (S.viewer && S.viewer.outlineEl) closeOutline();
-    else if (S.viewer) closeViewer();
-    else if (S.sel) clearSel();
-    else if (S.drawer) openDrawer(null);
+  document.addEventListener('keydown', onKeyDown);
+  wireResizers();
+  $('#btn-help').addEventListener('click', toggleHelp);
+
+  const filter = $('#file-filter');
+  const setFilter = value => {
+    filter.value = value;
+    S.filter = value.trim();
+    buildSidebar();
+  };
+  filter.addEventListener('input', () => setFilter(filter.value));
+  filter.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      const first = filteredFiles()[0];
+      if (!first) return;
+      filter.blur();
+      jumpToFile(first);
+    } else if (e.key === 'Escape') {
+      e.stopPropagation(); // clears the filter instead of closing a drawer
+      setFilter('');
+      filter.blur();
+    }
+  });
+
+  $('#show-remote').addEventListener('change', e => {
+    S.remote.show = e.target.checked;
+    savePref(REMOTE_SHOW_KEY, S.remote.show);
+    renderRemoteControls();
+    renderAllAnnotations();
+  });
+  $('#remote-retry').addEventListener('click', () => loadRemote(true));
+
+  // Leaving with a comment still being written would lose it.
+  window.addEventListener('beforeunload', e => {
+    const typed = [...S.composers.values()].some(c => c.ta.value.trim() && c.ta.value !== c.initial) ||
+      [...S.replies.values()].some(r => r.ta.value.trim());
+    if (typed) e.preventDefault();
   });
 
   let ticking = false;
@@ -2124,8 +2771,10 @@ function wire() {
   $('#btn-review').addEventListener('click', () => toggleDrawer('review'));
   for (const b of document.querySelectorAll('[data-close]')) b.addEventListener('click', () => openDrawer(null));
   $('#chat-new').addEventListener('click', () => openChatNew(null));
-  $('#chat-send').addEventListener('click', sendChat);
+  $('#chat-send').addEventListener('click', () => (S.chat.stopId != null ? stopJob(S.chat.stopId) : sendChat()));
   const input = $('#chat-input');
+  input.placeholder = `Ask about this code… (${MOD}+Enter to send)`;
+  $('#chat-hint').textContent = `${MOD}+Enter to send`;
   onCtrlEnter(input, sendChat);
   autosize(input);
 
@@ -2162,13 +2811,26 @@ async function boot() {
   }, { root: $('#main'), rootMargin: '600px 0px' });
   $('#hide-tests').addEventListener('change', e => setExcludeTests(e.target.checked));
   loadFoldPrefs();
+  S.viewed = new Map(Object.entries(loadPref(viewedKey(), {})));
+  S.remote.show = loadPref(REMOTE_SHOW_KEY, true) !== false;
+  const form = loadPref(reviewKey(), {});
+  if (typeof form.body === 'string') S.review.body = form.body;
+  if (EVENTS.some(ev => ev.value === form.event)) S.review.event = form.event;
+  let resume = null;
+  try {
+    resume = sessionStorage.getItem(posKey());
+  } catch {
+    /* storage unavailable */
+  }
   renderScope(S.info.files.filter(f => !S.excluded.has(f.path)));
+  if (S.files.has(resume) && S.files.get(resume).idx > 0) jumpToFile(S.files.get(resume));
   try {
     S.summary.collapsed = localStorage.getItem(SUMMARY_COLLAPSED_KEY) === '1';
   } catch {
     /* storage unavailable */
   }
   loadSummary(); // runs in the background
+  loadRemote(); // too
   const [drafts, threads] = await Promise.all([get('/api/drafts'), get('/api/threads')]);
   S.drafts = drafts || [];
   S.threads = threads || [];

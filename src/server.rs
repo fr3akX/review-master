@@ -52,6 +52,8 @@ pub struct AppState {
     threads: Mutex<Threads>,
     jobs: Mutex<Jobs>,
     submitted: Mutex<Option<String>>,
+    /// Review comments already on the PR, fetched on first use.
+    comments: Mutex<Option<Vec<Value>>>,
 }
 
 /// The files this review currently covers.
@@ -88,6 +90,7 @@ impl AppState {
         drafts_file: PathBuf,
         scope_file: PathBuf,
         summary_file: PathBuf,
+        threads_file: PathBuf,
         lsp: Lsp,
     ) -> Arc<AppState> {
         let stored: StoredScope = fs::read(&scope_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -114,9 +117,10 @@ impl AppState {
             viewer,
             lsp,
             drafts: Mutex::new(DraftStore::load(drafts_file)),
-            threads: Mutex::default(),
+            threads: Mutex::new(Threads::load(threads_file)),
             jobs: Mutex::default(),
             submitted: Mutex::new(None),
+            comments: Mutex::new(None),
         })
     }
 
@@ -182,7 +186,7 @@ impl DraftStore {
 
 // ---- chat threads -----------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Anchor {
     path: String,
     start: Option<u64>,
@@ -203,19 +207,42 @@ impl Anchor {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Thread {
     id: u64,
     anchor: Option<Anchor>,
     session: String,
     /// (role, text)
-    messages: Vec<(&'static str, String)>,
+    messages: Vec<(String, String)>,
+    #[serde(skip)]
     busy: bool,
+    /// The running turn's job, so any page can stop it.
+    #[serde(skip)]
+    job: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Threads {
     next: u64,
     by_id: HashMap<u64, Thread>,
+    #[serde(skip)]
+    file: PathBuf,
+}
+
+impl Threads {
+    /// Conversations survive restarts like drafts do; their engine sessions
+    /// are persisted by the engines themselves.
+    fn load(file: PathBuf) -> Threads {
+        let mut threads: Threads = fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        threads.file = file;
+        threads
+    }
+
+    fn save(&self) {
+        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
+            let _ = fs::write(&self.file, bytes);
+        }
+    }
 }
 
 // ---- jobs -------------------------------------------------------------------
@@ -285,8 +312,12 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/source", get(source))
         .route("/api/chat", post_to(chat))
         .route("/api/thread", get(thread))
+        .route("/api/thread/{id}", delete(delete_thread))
         .route("/api/threads", get(threads))
         .route("/api/job/{id}", get(job_status))
+        .route("/api/job/{id}/cancel", post_to(cancel_job))
+        .route("/api/comments", get(pr_comments))
+        .route("/api/comments/reply", post_to(reply_comment))
         .route("/api/draft", post_to(upsert_draft))
         .route("/api/draft/{id}", delete(delete_draft))
         .route("/api/drafts", get(drafts))
@@ -318,12 +349,16 @@ fn files_json(model: &Model) -> Vec<Value> {
         .files
         .iter()
         .map(|f| {
+            // Identifies this file's diff, so "viewed" marks reset when it changes.
+            let mut text = String::new();
+            Model::render_file(f, &mut text);
             json!({
                 "path": f.path,
                 "status": f.status.api(),
                 "old_path": f.old_path,
                 "additions": f.additions,
                 "deletions": f.deletions,
+                "sig": format!("{:016x}", xxhash_rust::xxh64::xxh64(text.as_bytes(), 0)),
             })
         })
         .collect()
@@ -384,7 +419,20 @@ async fn file_diff(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) 
             json!({ "header": h.header, "lines": lines })
         })
         .collect();
-    Ok(Json(json!({ "path": file.path, "hunks": hunks })))
+    // Head-file line count, so the UI can offer the unchanged lines below the last hunk.
+    let new_lines = (file.status != Status::Deleted)
+        .then(|| verify::resolve(&st.root, &q.path).ok())
+        .flatten()
+        .filter(|(full, _)| fs::metadata(full).is_ok_and(|m| m.is_file() && m.len() <= MAX_SOURCE_BYTES))
+        .and_then(|(full, _)| fs::read(full).ok())
+        .map(|bytes| line_count(&bytes));
+    Ok(Json(json!({ "path": file.path, "hunks": hunks, "new_lines": new_lines })))
+}
+
+/// Lines in a file as diffs number them: a final newline ends the last line.
+fn line_count(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    newlines + usize::from(bytes.last().is_some_and(|&b| b != b'\n'))
 }
 
 /// Language hint for the UI: the lowercased file extension.
@@ -654,7 +702,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> 
                 return Err(fail(StatusCode::CONFLICT, "this thread is already answering"));
             }
             t.busy = true;
-            t.messages.push(("user", req.question.clone()));
+            t.messages.push(("user".to_owned(), req.question.clone()));
             (id, t.session.clone(), format!("Follow-up question from the reviewer: {}\n", req.question))
         }
         None => {
@@ -677,35 +725,39 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> 
             let id = threads.next;
             threads.by_id.insert(
                 id,
-                Thread { id, anchor, session: session.clone(), messages: vec![("user", req.question.clone())], busy: true },
+                Thread { id, anchor, session: session.clone(), messages: vec![("user".to_owned(), req.question.clone())], busy: true, job: None },
             );
             (id, session, prompt)
         }
     };
     let job = new_job(&mut st.jobs.lock().unwrap());
     let job_id = job.id;
+    {
+        let mut threads = st.threads.lock().unwrap();
+        if let Some(t) = threads.by_id.get_mut(&thread_id) {
+            t.job = Some(job_id);
+        }
+        threads.save();
+    }
     let st2 = st.clone();
     tokio::spawn(async move {
         let progress = |line: String| job.push(line);
         let out = st2.engine.turn::<ChatAnswer>(&session, &prompt, &chat_schema(), &job.cancel, progress).await;
-        let result = match out {
-            Ok(out) => {
-                let answer = out.answer.answer;
-                let mut threads = st2.threads.lock().unwrap();
-                if let Some(t) = threads.by_id.get_mut(&thread_id) {
-                    t.messages.push(("assistant", answer.clone()));
-                    t.busy = false;
-                }
-                Ok(json!({ "answer": answer }))
+        let mut threads = st2.threads.lock().unwrap();
+        let thread = threads.by_id.get_mut(&thread_id);
+        let result = out.map(|out| {
+            let answer = out.answer.answer;
+            if let Some(t) = thread {
+                t.messages.push(("assistant".to_owned(), answer.clone()));
             }
-            Err(e) => {
-                let mut threads = st2.threads.lock().unwrap();
-                if let Some(t) = threads.by_id.get_mut(&thread_id) {
-                    t.busy = false;
-                }
-                Err(e)
-            }
-        };
+            json!({ "answer": answer })
+        });
+        if let Some(t) = threads.by_id.get_mut(&thread_id) {
+            t.busy = false;
+            t.job = None;
+        }
+        threads.save();
+        drop(threads);
         job.finish(result);
     });
     Ok(Json(json!({ "thread": thread_id, "job": job_id })))
@@ -725,7 +777,20 @@ async fn thread(State(st): State<Arc<AppState>>, Query(q): Query<ThreadQuery>) -
         "anchor": t.anchor.as_ref().map(Anchor::json),
         "messages": messages,
         "busy": t.busy,
+        "job": t.job,
     })))
+}
+
+async fn delete_thread(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>) -> ApiResult {
+    let mut threads = st.threads.lock().unwrap();
+    match threads.by_id.get(&id) {
+        None => return Err(fail(StatusCode::NOT_FOUND, format!("no thread {id}"))),
+        Some(t) if t.busy => return Err(fail(StatusCode::CONFLICT, "this thread is still answering; stop it first")),
+        Some(_) => {}
+    }
+    threads.by_id.remove(&id);
+    threads.save();
+    Ok(Json(json!({})))
 }
 
 async fn threads(State(st): State<Arc<AppState>>) -> Json<Value> {
@@ -760,6 +825,61 @@ async fn job_status(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>, 
         "error": inner.error,
         "result": inner.result,
     })))
+}
+
+/// Stop a running engine turn; its job then finishes with the error `cancelled`.
+async fn cancel_job(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>) -> ApiResult {
+    let jobs = st.jobs.lock().unwrap();
+    let job = jobs.by_id.get(&id).ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no job {id}")))?;
+    job.cancel.notify_one();
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct CommentsQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// Review comments already on the pull request (none in local mode).
+async fn pr_comments(State(st): State<Arc<AppState>>, Query(q): Query<CommentsQuery>) -> ApiResult {
+    let Some((r, _)) = &st.pr else { return Ok(Json(json!({ "comments": [] }))) };
+    let cached = if q.refresh { None } else { st.comments.lock().unwrap().clone() };
+    let list = match cached {
+        Some(list) => list,
+        None => {
+            let pref = PrRef { owner: r.owner.clone(), repo: r.repo.clone(), number: r.number };
+            let list = tokio::task::spawn_blocking(move || crate::pr::review_comments(&pref))
+                .await
+                .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+            *st.comments.lock().unwrap() = Some(list.clone());
+            list
+        }
+    };
+    Ok(Json(json!({ "comments": list })))
+}
+
+#[derive(Deserialize)]
+struct ReplyRequest {
+    /// The thread's first comment.
+    id: u64,
+    body: String,
+}
+
+/// Reply in an existing review thread; unlike drafts this is posted right away.
+async fn reply_comment(State(st): State<Arc<AppState>>, Json(req): Json<ReplyRequest>) -> ApiResult {
+    let Some((r, _)) = &st.pr else { return Err(fail(StatusCode::BAD_REQUEST, "no pull request to reply on")) };
+    if req.body.trim().is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "the reply is empty"));
+    }
+    let pref = PrRef { owner: r.owner.clone(), repo: r.repo.clone(), number: r.number };
+    tokio::task::spawn_blocking(move || crate::pr::reply(&pref, req.id, &req.body))
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    *st.comments.lock().unwrap() = None; // the next listing fetches the reply too
+    Ok(Json(json!({})))
 }
 
 #[derive(Deserialize)]
@@ -1166,4 +1286,16 @@ async fn folds(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> A
     ranges.sort_unstable();
     let test_folds: Vec<Value> = ranges.iter().map(|(s, e)| json!([s, e])).collect();
     Ok(Json(json!({ "test_folds": test_folds, "source": source })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lines_are_counted_like_diff_line_numbers() {
+        for (text, want) in [("", 0), ("a", 1), ("a\n", 1), ("a\nb", 2), ("a\nb\n", 2), ("\n", 1), ("a\n\n", 2)] {
+            assert_eq!(line_count(text.as_bytes()), want, "{text:?}");
+        }
+    }
 }

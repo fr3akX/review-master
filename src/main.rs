@@ -324,6 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache_dir.join(format!("drafts-{draft_key}.json")),
         cache_dir.join(format!("scope-{draft_key}.json")),
         cache_dir.join(format!("summary-{draft_key}.json")),
+        cache_dir.join(format!("threads-{draft_key}.json")),
         lsp,
     );
     let listener = match tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await {

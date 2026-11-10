@@ -171,6 +171,43 @@ pub fn checkout(repo: &crate::repo::Repo, r: &PrRef, want_sha: &str) -> Result<(
     Ok((Checkout { root, repo_root: repo.root.clone(), temp: true }, fetched))
 }
 
+/// Review comments already on the PR, oldest first. `line` is null for comments
+/// whose code has since changed (outdated); `original_line` still says where.
+pub fn review_comments(r: &PrRef) -> Result<Vec<Value>, String> {
+    let path = format!("repos/{}/pulls/{}/comments?per_page=100", r.slug(), r.number);
+    let out = gh(&["api", &path, "--paginate", "--jq", ".[]"], None)?;
+    parse_review_comments(&out).map_err(|e| format!("gh api {path}: {e}"))
+}
+
+/// Post `body` as a reply in the review thread started by comment `comment`.
+pub fn reply(r: &PrRef, comment: u64, body: &str) -> Result<(), String> {
+    let path = format!("repos/{}/pulls/{}/comments/{comment}/replies", r.slug(), r.number);
+    let payload = serde_json::to_vec(&serde_json::json!({ "body": body })).map_err(|e| e.to_string())?;
+    gh(&["api", &path, "-X", "POST", "--input", "-"], Some(&payload)).map(|_| ())
+}
+
+/// One JSON object per comment, concatenated (what `--paginate --jq '.[]'` prints).
+fn parse_review_comments(out: &[u8]) -> Result<Vec<Value>, String> {
+    let mut list = Vec::new();
+    for v in serde_json::Deserializer::from_slice(out).into_iter::<Value>() {
+        let v = v.map_err(|e| e.to_string())?;
+        list.push(serde_json::json!({
+            "id": v["id"],
+            "reply_to": v["in_reply_to_id"],
+            "path": v["path"],
+            "line": v["line"],
+            "original_line": v["original_line"],
+            "start": v["start_line"],
+            "side": v["side"].as_str().unwrap_or("RIGHT"),
+            "author": v["user"]["login"],
+            "body": v["body"],
+            "created": v["created_at"],
+            "url": v["html_url"],
+        }));
+    }
+    Ok(list)
+}
+
 /// The logged-in `gh` user, for own-PR hints in the UI.
 pub fn viewer() -> Option<String> {
     let v: Value = serde_json::from_slice(&gh(&["api", "user"], None).ok()?).ok()?;
@@ -261,5 +298,19 @@ mod tests {
         assert!(parse_ref("176", None).unwrap_err().contains("origin"));
         assert!(parse_ref("https://github.com/acme/widgets", Some(&origin)).is_err());
         assert!(parse_ref("acme/widgets#x", Some(&origin)).is_err());
+    }
+
+    #[test]
+    fn review_comments_parse_from_concatenated_objects() {
+        let out = br#"{"id":1,"in_reply_to_id":null,"path":"a.rs","line":7,"original_line":7,"side":"LEFT","start_line":null,"user":{"login":"alice"},"body":"hm","created_at":"2026-01-01T00:00:00Z","html_url":"u1"}
+{"id":2,"in_reply_to_id":1,"path":"a.rs","line":null,"original_line":7,"user":{"login":"bob"},"body":"ok"}"#;
+        let list = parse_review_comments(out).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0]["author"].as_str(), list[0]["side"].as_str(), list[0]["line"].as_u64()), (Some("alice"), Some("LEFT"), Some(7)));
+        // An outdated reply: no current line, side defaults to RIGHT.
+        assert_eq!((list[1]["reply_to"].as_u64(), list[1]["side"].as_str()), (Some(1), Some("RIGHT")));
+        assert!(list[1]["line"].is_null());
+        assert!(parse_review_comments(b"").unwrap().is_empty());
+        assert!(parse_review_comments(b"{oops").is_err());
     }
 }

@@ -7,9 +7,17 @@ branch, its upstream, or the head commit — and it opens a local web UI:
 - a generated **PR summary** (why the change, things to note, change outline
   with clickable citations) appears at the top while you browse — cached per
   head commit, regenerate on demand;
-- browse the changed files in a collapsible **directory tree**; per-file
-  **diff view**, and a **file viewer** for the whole file with highlighted
-  changes and syntax highlighting;
+- browse the changed files in a collapsible, filterable **directory tree**;
+  per-file **diff view** with word-level highlights inside changed lines and
+  expandable context between hunks, and a **file viewer** for the whole file
+  with highlighted changes and syntax highlighting;
+- mark files **viewed** as you go — they collapse, the sidebar shows progress,
+  and a mark resets when that file's diff changes (kept per PR);
+- see the **review comments already on the PR** inline, replies threaded,
+  outdated ones flagged — reply in a thread (posted right away), or ask the
+  LLM whether a comment has a point;
+- **keyboard-driven**: `j`/`k` files, `n`/`p` changes, `v` viewed, `/` filter,
+  `?` for the full list;
 - **fold `#[cfg(test)]` modules** in diffs and the file viewer — boundaries come
   from rust-analyzer's symbol tree (text scanning only as fallback); test-only
   hunks collapse to one bar, folds remember their state per PR;
@@ -22,9 +30,10 @@ branch, its upstream, or the head commit — and it opens a local web UI:
   definitions and references, with whole-word text search as the fallback;
 - select code (lines or exact text) and **chat with an LLM about it**: it
   answers from a read-only checkout of the PR head, gets your exact selection,
-  and its `path:line` citations are clickable jumps;
-- write **draft inline comments** (severity + markdown) as you go; drafts
-  persist across restarts;
+  and its `path:line` citations are clickable jumps; a running answer can be
+  stopped;
+- write **draft inline comments** (severity + markdown) as you go; drafts,
+  conversations and the unsent review summary persist across restarts;
 - submit everything as **one GitHub review** — comment / approve /
   request-changes — with every comment anchored to the exact diff line.
 
@@ -92,6 +101,13 @@ settings.
 | `--configure` | | interactive setup, then exit |
 | `--anthropic-login` | | Claude subscription OAuth sign-in, then exit |
 
+## Tests
+
+`cargo test` covers the Rust side. `tests/ui/run.sh` drives the real binary and
+web UI in headless Chrome against a demo repository, a fake `gh` and a fake
+engine — no network, nothing is posted (needs node ≥ 22 and Chrome; `$CHROME`
+overrides the macOS default path, `--keep` leaves screenshots behind).
+
 ## Notes
 
 - The chat engine is read-only and confined to the checkout: no shell (native
@@ -101,4 +117,8 @@ settings.
   them there and says why.
 - Chat sessions persist under the cache dir (native engines) or the engine's
   own store (Codex threads, Claude Code sessions), named
-  `review-master: chat path:line`; follow-ups continue their session.
+  `review-master: chat path:line`; follow-ups continue their session. The
+  conversation list itself is kept in the cache dir, so it is back after a
+  restart; delete a conversation from the chat drawer.
+- Viewed marks, panel widths and fold choices live in the browser's
+  localStorage; drafts, conversations, scope and the summary in the cache dir.

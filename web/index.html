@@ -17,8 +17,9 @@
     </div>
     <div class="top-actions">
       <span id="engine-chip" class="chip engine" title="Review engine"></span>
-      <button id="btn-chat" class="btn" type="button">Chat</button>
-      <button id="btn-review" class="btn primary" type="button">Review <span id="draft-count" class="count-badge" hidden>0</span></button>
+      <button id="btn-help" class="btn" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+      <button id="btn-chat" class="btn" type="button" title="Chat (c)">Chat</button>
+      <button id="btn-review" class="btn primary" type="button" title="Review drawer (r)">Review <span id="draft-count" class="count-badge" hidden>0</span></button>
     </div>
   </header>
 
@@ -29,11 +30,20 @@
       <div class="side-head">
         <span class="side-title">Files changed</span>
         <span id="file-summary" class="dim"></span>
+        <input id="file-filter" class="side-filter" type="search" placeholder="Filter files…  ( / )" aria-label="Filter files" autocomplete="off" spellcheck="false">
         <label id="test-toggle" class="pill-toggle" title="Exclude test files from the review (drafts on them won't be submitted)" hidden>
           <input id="hide-tests" type="checkbox"> <span id="test-count"></span>
         </label>
+        <label id="remote-toggle" class="pill-toggle" title="Show the review comments already on this pull request" hidden>
+          <input id="show-remote" type="checkbox"> <span id="remote-count"></span>
+        </label>
+        <button id="remote-retry" class="link-btn" type="button" hidden>PR comments failed · retry</button>
+        <span class="spacer"></span>
+        <span id="viewed-count" class="dim" title="Files marked viewed (v)"></span>
+        <div id="viewed-progress" class="viewed-progress" aria-hidden="true"><div id="viewed-bar"></div></div>
       </div>
       <ul id="file-list"></ul>
+      <div class="resizer" data-resize="side" title="Drag to resize, double-click to reset"></div>
     </nav>
 
     <main id="main">
@@ -42,6 +52,7 @@
     </main>
 
     <aside id="chat-drawer" class="drawer" aria-label="Chat" hidden>
+      <div class="resizer" data-resize="drawer" title="Drag to resize, double-click to reset"></div>
       <div class="drawer-head">
         <h2>Chat</h2>
         <span class="spacer"></span>
@@ -53,9 +64,9 @@
         <div id="convo-head" class="convo-head"></div>
         <div id="messages" class="messages"></div>
         <div class="chat-compose">
-          <textarea id="chat-input" rows="3" placeholder="Ask about this code… (Ctrl+Enter to send)"></textarea>
+          <textarea id="chat-input" rows="3" placeholder="Ask about this code…"></textarea>
           <div class="compose-row">
-            <span class="hint">Ctrl+Enter to send</span>
+            <span id="chat-hint" class="hint"></span>
             <span class="spacer"></span>
             <button id="chat-send" class="btn primary small" type="button">Send</button>
           </div>
@@ -64,6 +75,7 @@
     </aside>
 
     <aside id="review-drawer" class="drawer" aria-label="Submit review" hidden>
+      <div class="resizer" data-resize="drawer" title="Drag to resize, double-click to reset"></div>
       <div class="drawer-head">
         <h2>Submit review</h2>
         <span class="spacer"></span>
