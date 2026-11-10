@@ -55,6 +55,9 @@ const S = {
   foldCache: new Map(), // path → Promise<ranges> from /api/folds
   summary: { text: null, act: null, running: false, error: null, loadFailed: false, collapsed: false, jobId: null }, // PR summary card
   lspWarm: new Set(), // paths whose language server was asked to start
+  findings: { list: [], sources: [], show: true, showAll: false, notice: null, paste: '' }, // imported LLM review findings
+  flows: { list: null, act: null, running: false, error: null, collapsed: false, jobId: null }, // PR flows card
+  walk: null, // { flow, fi, index, playing, timer, marks, note } while walking a flow
   composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
   viewed: new Map(), // path → file sig it was marked viewed at (persisted per PR)
   filter: '', // sidebar file filter
@@ -465,6 +468,8 @@ function renderViewed() {
 
 const TEST_DIRS = new Set(['tests', 'test', '__tests__', 'testdata', 'testing', 'spec', 'fixtures']);
 const TEST_BASE = /(^test_.+\..+$)|(^.+_tests?\..+$)|(^.+_spec\..+$)|(^.+\.(test|spec)\..+$)|(^conftest\.py$)/;
+// JVM test classes by name (ScalaTest/specs2/MUnit/JUnit conventions); sbt keeps integration tests in src/it.
+const JVM_TEST = /^[A-Z]\w*(Spec|Suite|Test|Tests|IT)\.(scala|sc|java|kt|kts|groovy)$/;
 const COPY_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">' +
   '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>';
 const EYE_OFF = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">' +
@@ -473,7 +478,7 @@ const EYE_OFF = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" str
 function isTestPath(path) {
   const parts = path.toLowerCase().split('/');
   const base = parts.pop();
-  return parts.some(p => TEST_DIRS.has(p)) || TEST_BASE.test(base);
+  return parts.some(p => TEST_DIRS.has(p)) || TEST_BASE.test(base) || JVM_TEST.test(splitPath(path)[1]) || /(^|\/)src\/it\//.test(path);
 }
 
 const underDir = (path, dir) => path.startsWith(dir);
@@ -731,12 +736,14 @@ function jumpToFile(fs) {
 
 function makeBox() {
   const remote = h('div', { class: 'box-drafts' });
+  const findings = h('div', { class: 'box-drafts' });
   const drafts = h('div', { class: 'box-drafts' });
   const chips = h('div', { class: 'box-chips' });
   const composers = h('div', { class: 'box-composers' });
-  return { root: h('div', { class: 'annot-box' }, remote, drafts, chips, composers), remote, drafts, chips, composers };
+  return { root: h('div', { class: 'annot-box' }, remote, findings, drafts, chips, composers), remote, findings, drafts, chips, composers };
 }
-const boxEmpty = b => !b.remote.childElementCount && !b.drafts.childElementCount && !b.chips.childElementCount && !b.composers.childElementCount;
+const boxEmpty = b => !b.remote.childElementCount && !b.findings.childElementCount && !b.drafts.childElementCount &&
+  !b.chips.childElementCount && !b.composers.childElementCount;
 
 // Box for comments whose anchor row is not part of the rendered table.
 function makeNotes() {
@@ -755,12 +762,13 @@ function makeFileState(f) {
   const fs = { file: f, path: f.path, idx: 0, diff: null, pane: null, loading: null, collapsed: false };
   fs.navBadge = h('span', { class: 'nav-drafts', title: 'your drafts', hidden: true });
   fs.navRemote = h('span', { class: 'nav-remote', title: 'comment threads on the PR', hidden: true });
+  fs.navFindings = h('span', { class: 'nav-findings', title: 'open LLM findings', hidden: true });
   fs.nav = h('li', {},
     h('div', { class: 'file-line' },
       h('button', { class: 'file-item', title: f.path, onclick: () => jumpToFile(fs) },
         statusBadge(f.status), h('span', { class: 'path' }, h('span', { class: 'base' }, splitPath(f.path)[1])),
         h('span', { class: 'nav-check', title: 'viewed', 'aria-hidden': 'true' }, '✓'),
-        fs.navRemote, fs.navBadge, counts(f)),
+        fs.navFindings, fs.navRemote, fs.navBadge, counts(f)),
       h('button', { class: 'row-hide', title: 'Exclude from review', 'aria-label': `Exclude ${f.path} from the review`, onclick: () => excludeFile(f.path), html: EYE_OFF })));
   const deleted = f.status === 'deleted';
   const full = h('button', {
@@ -820,6 +828,7 @@ function renderScope(files) {
   renderScopeControls();
   renderViewed();
   renderDraftCounts();
+  renderFindingControls();
   renderAllAnnotations();
   renderReviewDrafts();
   trackCurrent();
@@ -1341,19 +1350,23 @@ async function openViewer(path, target = null) {
   if (fs && fs.file.status === 'deleted') return;
   closeViewer();
   clearSel();
-  const v = { path, fs, pane: null };
+  const v = { path, fs, pane: null, lsp: null, outline: [], outlineFrom: 'patterns', lspOutline: false, outlineEl: null, renderOutline: null };
   S.viewer = v;
   const scroll = $('#viewer-scroll');
   v.lspChip = h('span', { class: 'chip lsp-chip', hidden: true });
-  v.outlineBtn = h('button', { class: 'btn small outline-btn', hidden: true, title: 'Go to symbol', onclick: () => toggleOutline(v) }, 'Outline');
+  v.outlineBtn = h('button', { class: 'btn small outline-btn', title: 'Go to symbol', onclick: () => toggleOutline(v) }, 'Outline');
+  v.backBtn = h('button', { class: 'icon-btn nav-btn', title: 'Back (Alt+←)', 'aria-label': 'Back', onclick: () => navStep(-1) }, '‹');
+  v.fwdBtn = h('button', { class: 'icon-btn nav-btn', title: 'Forward (Alt+→)', 'aria-label': 'Forward', onclick: () => navStep(1) }, '›');
   $('#viewer-head').replaceChildren(
-    fs ? statusBadge(fs.file.status) : null,
+    v.backBtn, v.fwdBtn,
+    fs ? statusBadge(fs.file.status) : '',
     fs ? fileTitle(fs.file) : pathLabel(path),
     fs ? counts(fs.file) : h('span', { class: 'chip' }, 'not changed in this PR'),
     h('span', { class: 'spacer' }),
     v.lspChip,
     v.outlineBtn,
     h('button', { class: 'btn small', onclick: closeViewer }, 'Close'));
+  updateNavButtons();
   scroll.replaceChildren(h('div', { class: 'placeholder' }, 'Loading…'));
   $('#viewer').hidden = false;
   let src = S.sources.get(path);
@@ -1368,6 +1381,7 @@ async function openViewer(path, target = null) {
   }
   if (S.viewer !== v) return;
   v.pane = makePane(path, 'full', fullTable(path, src), makeNotes(), scroll);
+  v.outline = guessOutline((src.text || '').split('\n'), path);
   scroll.replaceChildren(v.pane.notes.root, v.pane.table);
   scroll.scrollTop = 0;
   renderAnnotations(v.pane);
@@ -1449,6 +1463,7 @@ function openCodeRef(rawPath, line, end) {
   let path = rawPath.replace(/^\.\//, '');
   const known = p => S.files.has(p) || S.excluded.has(p);
   if (!known(path) && /^[ab]\//.test(path) && known(path.slice(2))) path = path.slice(2); // diff prefixes
+  navPush();
   closeViewer(); // changed files prefer their diff
   return revealLine(path, 'RIGHT', line, end != null && end > line ? end : null);
 }
@@ -1475,6 +1490,7 @@ function renderAnnotations(pane) {
   const inViewer = pane.kind === 'full';
   for (const b of [...pane.boxes.values(), pane.notes]) {
     b.remote.replaceChildren();
+    b.findings.replaceChildren();
     b.drafts.replaceChildren();
     b.chips.replaceChildren();
   }
@@ -1482,6 +1498,11 @@ function renderAnnotations(pane) {
   if (S.remote.show) {
     for (const t of S.remote.threads) {
       if (t.path === pane.path) (t.line != null ? place(anchorKey(t.side, t.line)) : pane.notes).remote.append(remoteCard(t));
+    }
+  }
+  if (S.findings.show) {
+    for (const f of S.findings.list) {
+      if (f.status === 'open' && f.path === pane.path) place(anchorKey(f.side, f.line)).findings.append(findingCard(f));
     }
   }
   for (const d of S.drafts) {
@@ -1642,6 +1663,175 @@ function threadChip(t) {
   return h('button', { class: 'chip thread-chip', title: t.last, onclick: () => openThread(t.id) }, `💬 chat (${t.messages})`);
 }
 
+// ───────────── imported LLM findings ─────────────
+// Another model's review, imported as Markdown (--findings, the Findings drawer, or a
+// file dropped on the page). The server splits it into findings and places each on the
+// line it cites; here they sit on those lines like comments. The reviewer turns the ones
+// they agree with into drafts (editable, never posted as is) or dismisses them.
+
+const FINDINGS_SHOW_KEY = 'review-master:show-findings';
+const SEV_RANK = { blocker: 0, major: 1, minor: 2, nit: 3 };
+
+function setFindings(r) {
+  S.findings.list = (r && r.findings) || [];
+  S.findings.sources = (r && r.sources) || [];
+  renderFindingControls();
+  renderAllAnnotations();
+  renderFindingsDrawer();
+}
+
+async function loadFindings() {
+  try {
+    setFindings(await api('GET', '/api/findings', undefined, true));
+  } catch {
+    /* no findings: nothing to show */
+  }
+}
+
+async function setFindingStatus(id, status) {
+  setFindings(await post(`/api/findings/${id}`, { status }));
+}
+
+async function importFindings(name, text) {
+  const r = await post('/api/findings', { name, text });
+  S.findings.notice = r.imported;
+  setFindings(r);
+  const n = r.imported ? r.imported.added : 0;
+  toast(`Imported ${plural(n, 'finding')} from ${name}`, n ? 'ok' : 'warn');
+  return r;
+}
+
+async function importFindingFiles(files) {
+  for (const file of files) await importFindings(file.name, await file.text());
+}
+
+function renderFindingControls() {
+  const open = S.findings.list.filter(f => f.status === 'open');
+  $('#findings-toggle').hidden = !S.findings.list.length;
+  $('#show-findings').checked = S.findings.show;
+  $('#findings-count').textContent = `LLM findings · ${open.length}`;
+  const badge = $('#findings-badge');
+  badge.textContent = open.length;
+  badge.hidden = open.length === 0;
+  const per = new Map();
+  for (const f of open) per.set(f.path, (per.get(f.path) || 0) + 1);
+  for (const fs of S.fileCache.values()) {
+    const c = per.get(fs.path) || 0;
+    fs.navFindings.textContent = `⚑${c}`;
+    fs.navFindings.hidden = c === 0 || !S.findings.show;
+  }
+}
+
+function draftFromFinding(f) {
+  openComposer({
+    path: f.path, side: f.side, line: f.line, start: f.start ?? null, severity: f.severity,
+    body: f.title && f.body !== f.title ? `**${f.title}**\n\n${f.body}` : f.body,
+    onSaved: () => setFindingStatus(f.id, 'drafted'),
+  });
+}
+
+function askFinding(f) {
+  openChatNew({ path: f.path, side: f.side, line: f.line, start: f.start ?? null });
+  const input = $('#chat-input');
+  const quoted = `**${f.title}**\n${f.body}`.split('\n').map(l => `> ${l}`).join('\n');
+  input.value = `An LLM review flagged this as ${f.severity}:\n${quoted}\n\nIs this a real problem here?`;
+  input.dispatchEvent(new Event('input'));
+}
+
+function findingCard(f) {
+  const fs = S.files.get(f.path);
+  return h('div', { class: `card finding edge-${f.severity}` },
+    h('div', { class: 'card-head' },
+      sevPill(f.severity),
+      h('span', { class: 'tag tag-llm', title: `Imported from ${f.source}` }, 'LLM'),
+      h('span', { class: 'card-title' }, f.title),
+      h('span', { class: 'dim' }, lineLabel(f)),
+      h('span', { class: 'spacer' }),
+      fs && h('button', { class: 'link-btn', title: 'Start a draft comment from this finding', onclick: () => draftFromFinding(f) }, 'Draft'),
+      h('button', { class: 'link-btn', title: 'Ask the LLM whether this holds', onclick: () => askFinding(f) }, 'Ask'),
+      h('button', { class: 'link-btn', title: 'Hide this finding (restore it from the Findings drawer)', onclick: () => setFindingStatus(f.id, 'dismissed') }, 'Dismiss')),
+    h('div', { class: 'md card-body', html: md(f.body) }),
+    f.problem
+      ? h('div', { class: 'warn-line' }, `⚠ ${f.problem}`)
+      : fs && f.anchor_problem && h('div', { class: 'warn-line' }, '⚠ not on a line the diff shows: as a draft it goes into the review body'));
+}
+
+// Jump to where a finding sits (the diff, or the viewer for lines and files outside it).
+function jumpToFinding(f) {
+  if (f.problem && !S.allPaths.has(f.path) && /not a file/.test(f.problem)) return toast(f.problem, 'warn');
+  navPush();
+  return revealLine(f.path, f.side, f.start ?? f.line, f.start != null ? f.line : null);
+}
+
+function renderFindingsDrawer() {
+  if (S.drawer !== 'findings') return;
+  const st = S.findings;
+  const fileInput = h('input', {
+    type: 'file', accept: '.md,.markdown,.txt,text/markdown,text/plain', multiple: true, hidden: true,
+    onchange: () => importFindingFiles([...fileInput.files]).catch(() => {}),
+  });
+  const paste = h('textarea', { class: 'findings-paste', rows: '4', placeholder: 'Or paste an LLM review (Markdown) here…' });
+  paste.value = st.paste;
+  paste.addEventListener('input', () => { st.paste = paste.value; });
+  const importPasted = async () => {
+    if (!paste.value.trim()) return paste.focus();
+    await importFindings('pasted.md', paste.value);
+    st.paste = '';
+    renderFindingsDrawer();
+  };
+  onCtrlEnter(paste, importPasted);
+  const notice = st.notice && h('div', { class: 'banner info findings-notice' },
+    `${st.notice.source}: ${plural(st.notice.added, 'finding')}`,
+    st.notice.skipped.length ? ` · not imported (no file:line, or overview): ${st.notice.skipped.join(', ')}` : '');
+  const counts = new Map();
+  for (const f of st.list) counts.set(f.source, (counts.get(f.source) || 0) + 1);
+  const sources = st.sources.length && h('ul', { class: 'findings-sources' }, st.sources.map(s => h('li', {},
+    h('span', { class: 'scope-label', title: s }, `${s} (${counts.get(s) || 0})`),
+    h('button', {
+      class: 'icon-btn', title: 'Remove these findings', 'aria-label': `Remove the findings from ${s}`,
+      onclick: async () => {
+        if (!confirm(`Remove the findings imported from ${s}?`)) return;
+        setFindings(await api('DELETE', `/api/findings?source=${encodeURIComponent(s)}`));
+      },
+    }, '×'))));
+  const order = f => (S.files.get(f.path) ? S.files.get(f.path).idx : 1e9);
+  const shown = st.list.filter(f => st.showAll || f.status === 'open')
+    .sort((a, b) => order(a) - order(b) || a.path.localeCompare(b.path) || a.line - b.line || SEV_RANK[a.severity] - SEV_RANK[b.severity]);
+  const rows = shown.map(f => h('li', { class: `review-draft finding-row st-${f.status}` },
+    h('div', { class: 'rd-head' },
+      sevPill(f.severity),
+      h('button', { class: 'link-btn rd-loc', title: 'Jump to the code', onclick: () => jumpToFinding(f) }, `${f.path}:${lineLabel(f)}`),
+      f.status !== 'open' && h('span', { class: 'tag' }, f.status),
+      S.excluded.has(f.path) && h('span', { class: 'tag tag-excluded' }, 'excluded'),
+      h('span', { class: 'spacer' }),
+      f.status === 'open'
+        ? h('button', { class: 'link-btn', onclick: () => setFindingStatus(f.id, 'dismissed') }, 'Dismiss')
+        : h('button', { class: 'link-btn', onclick: () => setFindingStatus(f.id, 'open') }, 'Reopen')),
+    h('div', { class: 'rd-first' }, f.title),
+    f.problem && h('div', { class: 'warn-line' }, `⚠ ${f.problem}`)));
+  const closed = st.list.length - st.list.filter(f => f.status === 'open').length;
+  $('#findings-body').replaceChildren(...[
+    h('div', { class: 'findings-import' },
+      h('button', { class: 'btn small primary', onclick: () => fileInput.click() }, 'Import Markdown…'), fileInput,
+      h('span', { class: 'hint' }, 'or drop a .md file on the page')),
+    paste,
+    h('div', { class: 'compose-row' },
+      h('span', { class: 'hint' }, 'Findings cite path:line; importing a file again replaces its findings'),
+      h('span', { class: 'spacer' }),
+      h('button', { class: 'btn small', onclick: () => importPasted().catch(() => {}) }, 'Import pasted')),
+    notice,
+    sources && h('div', { class: 'field-label' }, 'Imported'),
+    sources,
+    h('div', { class: 'field-label findings-list-head' }, `Findings (${shown.length})`,
+      closed > 0 && h('label', { class: 'pill-toggle' },
+        h('input', { type: 'checkbox', checked: st.showAll, onchange: e => { st.showAll = e.target.checked; renderFindingsDrawer(); } }),
+        ` dismissed & drafted · ${closed}`)),
+    shown.length
+      ? h('ul', { class: 'rd-list' }, rows)
+      : h('div', { class: 'empty' }, st.list.length ? 'Every finding is dismissed or drafted.' : 'No findings yet. Import another model\'s review: each finding that cites a file and line is shown on that line.'),
+  ].filter(Boolean));
+}
+
 async function openComposer(a) {
   if (!(await ensureInScope(a.path))) return;
   const fs = S.files.get(a.path);
@@ -1695,6 +1885,7 @@ function makeComposer(key, a) {
       if (r.problem) toast(`Draft saved, but it won't anchor: ${r.problem}. It will go into the review body.`, 'warn', 9000);
       closeComposer(c, false);
       await refreshDrafts();
+      if (a.onSaved) await a.onSaved(r);
     } finally {
       save.disabled = false;
     }
@@ -1772,9 +1963,9 @@ function onDocMouseDown(e) {
   if (S.sym && !e.target.closest('.sym-popup')) closeSym();
   if (S.scopePop && !e.target.closest('.scope-pop, .scope-link')) closeScopePop();
   if (S.viewer && S.viewer.outlineEl && !e.target.closest('.outline-pop, .outline-btn')) closeOutline();
-  const codeCell = (e.metaKey || e.ctrlKey) && e.target.closest('tr.ln-row td.code');
+  const codeCell = (e.metaKey || e.ctrlKey || e.altKey) && e.target.closest('tr.ln-row td.code');
   if (codeCell && paneOf(codeCell)) {
-    e.preventDefault(); // Cmd/Ctrl-click navigates (see click handler) instead of selecting text
+    e.preventDefault(); // modifier-clicks navigate (see click handler) instead of selecting text
     if (S.sel) clearSel();
     return;
   }
@@ -1894,8 +2085,11 @@ function hidePopover() {
 }
 
 // ───────────────────────────── code navigation (LSP) ─────────────────────────────
+// Language servers answer hover, definitions and references in the file viewer and the
+// diffs (head lines only); without one, or while it fails, navigation is whole-word
+// text search. Jumps record where they came from: Alt+←/→ walk back and forth.
 
-const LSP_BUSY = new Set(['starting', 'indexing']);
+const LSP_BUSY = new Set(['idle', 'starting', 'indexing']);
 const IDENT_CHAR = /[\p{L}\p{N}_$]/u;
 const IDENT = /^[\p{L}_$][\p{L}\p{N}_$]*$/u;
 const lspStatusUrl = (path, start) => `/api/lsp/status?path=${qpath(path)}${start ? '&start=true' : ''}`;
@@ -1907,7 +2101,34 @@ function warmLsp(path) {
   api('GET', lspStatusUrl(path, true), undefined, true).catch(() => {});
 }
 
-// Viewer header chip while the language server is starting/indexing, or failed.
+// The server's executable, not wrapper words (`npx -y -p pyright@1 pyright-langserver --stdio`, `cs launch metals`).
+function serverName(cmd) {
+  const words = String(cmd || '').split(/\s+/).filter(w => w && !w.startsWith('-'));
+  const exe = words.find(w => /langserver|language-server|analyzer|pylsp|gopls|clangd|metals/.test(w)) || words[0] || 'language server';
+  return exe.split('/').pop();
+}
+
+function renderLspChip(v) {
+  const st = v.lsp;
+  v.lspChip.hidden = !st;
+  if (!st) return;
+  const server = serverName(st.server);
+  v.lspChip.className = `chip lsp-chip lsp-${st.state}`;
+  v.lspChip.textContent = {
+    none: 'text search',
+    idle: `${server}: starting…`,
+    starting: `${server}: starting…`,
+    indexing: `${server}: indexing…`,
+    ready: server,
+    failed: `${server}: unavailable`,
+  }[st.state] || st.state;
+  v.lspChip.title = st.state === 'none'
+    ? 'No language server for this file type: navigation uses whole-word text search'
+    : st.error || st.server || '';
+}
+
+// Viewer header chip: the file's language server and its state, polled while it starts
+// or indexes. Once it answers, its outline replaces the pattern one.
 async function watchViewerLsp(v) {
   S.lspWarm.add(v.path);
   for (let first = true; ; first = false) {
@@ -1915,18 +2136,73 @@ async function watchViewerLsp(v) {
     try {
       st = await api('GET', lspStatusUrl(v.path, first), undefined, true);
     } catch {
-      return;
+      st = { state: 'none' };
     }
     if (S.viewer !== v) return;
-    const busy = LSP_BUSY.has(st.state);
-    v.lspChip.hidden = !(busy || st.state === 'failed');
-    v.outlineBtn.hidden = st.state === 'none' || st.state === 'failed';
-    v.lspChip.className = `chip lsp-chip lsp-${st.state}`;
-    v.lspChip.textContent = `${st.server || st.language || 'LSP'} ${st.state}${busy ? '…' : ''}`;
-    v.lspChip.title = st.error || '';
-    if (!busy) return;
-    await sleep(2000);
+    v.lsp = st;
+    renderLspChip(v);
+    if ((st.state === 'ready' || st.state === 'indexing') && !v.lspOutline) loadLspOutline(v);
+    if (!LSP_BUSY.has(st.state)) return;
+    await sleep(1500);
   }
+}
+
+// ───────────── navigation history ─────────────
+// A place is the file viewer's file and scroll position, or the diff column's first
+// visible line (diffs above it can still load and grow, so its scroll offset alone drifts).
+
+const NAV = { back: [], fwd: [] };
+const NAV_MAX = 50;
+
+function navHere() {
+  const v = S.viewer;
+  if (v && v.pane) return { viewer: v.path, top: $('#viewer-scroll').scrollTop };
+  const main = $('#main');
+  const r = main.getBoundingClientRect();
+  for (const dy of [40, 90, 160]) {
+    const tr = document.elementFromPoint(r.left + 160, r.top + dy)?.closest('tr.ln-row');
+    const pane = tr && paneOf(tr);
+    if (pane && pane.kind === 'diff') {
+      const a = rowAnchor(tr);
+      return { main: main.scrollTop, path: pane.path, key: anchorKey(a.side, a.line), offset: tr.getBoundingClientRect().top - r.top };
+    }
+  }
+  return { main: main.scrollTop };
+}
+
+// Called before a jump: the place being left becomes "back".
+function navPush() {
+  NAV.back.push(navHere());
+  if (NAV.back.length > NAV_MAX) NAV.back.shift();
+  NAV.fwd = [];
+  updateNavButtons();
+}
+
+async function navStep(dir) {
+  const from = dir < 0 ? NAV.back : NAV.fwd;
+  const to = dir < 0 ? NAV.fwd : NAV.back;
+  if (!from.length) return;
+  to.push(navHere());
+  const place = from.pop();
+  if (place.viewer) {
+    if (!S.viewer || S.viewer.path !== place.viewer) await openViewer(place.viewer);
+    if (S.viewer && S.viewer.path === place.viewer) $('#viewer-scroll').scrollTop = place.top;
+  } else {
+    closeViewer();
+    const main = $('#main');
+    const fs = place.path && S.files.get(place.path);
+    const tr = fs && fs.pane && fs.pane.rows.get(place.key);
+    if (tr && tr.offsetParent) main.scrollTop += tr.getBoundingClientRect().top - main.getBoundingClientRect().top - place.offset;
+    else main.scrollTop = place.main;
+  }
+  updateNavButtons();
+}
+
+function updateNavButtons() {
+  const v = S.viewer;
+  if (!v || !v.backBtn) return;
+  v.backBtn.disabled = !NAV.back.length;
+  v.fwdBtn.disabled = !NAV.fwd.length;
 }
 
 function caretAt(x, y) {
@@ -1962,64 +2238,199 @@ function tokenAt(td, x, y) {
 }
 
 // ───────────── viewer outline ("go to symbol") ─────────────
+// From the language server once it answers; until then, and for files without one,
+// from declaration patterns. The symbol the viewer is in is marked as you scroll.
+
+const MODIFIERS = '(?:(?:public|private|protected|internal|static|final|abstract|sealed|open|data|inner|partial|override|virtual|async|export|default|suspend|inline|mutating)\\s+)*';
+const SCALA_MODS = '(?:(?:private|protected)(?:\\[[\\w.]*\\])?\\s+|(?:final|sealed|abstract|implicit|case|lazy|override|inline|transparent|open|opaque)\\s+)*';
+// Declarations by language: [pattern, kind]; a `kind` group overrides the kind.
+const OUTLINE_RULES = {
+  rust: [
+    [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern(?:\s+"[^"]*")?)\s+)*fn\s+(?<name>[A-Za-z_]\w*)/, 'function'],
+    [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?<kind>struct|enum|trait|union|mod|type)\s+(?<name>[A-Za-z_]\w*)/],
+    [/^\s*(?:unsafe\s+)?impl\b(?:\s*<[^{]*?>)?\s+(?<name>[^{]+?)\s*(?:\{|\bwhere\b|$)/, 'impl'],
+    [/^\s*macro_rules!\s*(?<name>\w+)/, 'macro'],
+  ],
+  python: [
+    [/^\s*(?:async\s+)?def\s+(?<name>\w+)/, 'function'],
+    [/^\s*class\s+(?<name>\w+)/, 'class'],
+  ],
+  js: [
+    [/^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*(?<name>[\w$]+)/, 'function'],
+    [/^\s*(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?(?<kind>class|interface|enum|namespace)\s+(?<name>[\w$]+)/],
+    [/^\s*(?:export\s+)?(?:declare\s+)?type\s+(?<name>[\w$]+)\s*(?:<[^=]*>)?\s*=/, 'type'],
+    [/^\s*(?:export\s+)?(?:const|let|var)\s+(?<name>[\w$]+)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[\w$]+\s*=>)/, 'function'],
+    [/^\s+(?:(?:public|private|protected|static|async|readonly|override|abstract|get|set)\s+)*(?<name>#?[\w$]+)\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?::\s*[^{]+)?\{\s*$/, 'method'],
+  ],
+  go: [
+    [/^func\s+\([^)]*\)\s*(?<name>\w+)/, 'method'],
+    [/^func\s+(?<name>\w+)/, 'function'],
+    [/^type\s+(?<name>\w+)\s+(?<kind>struct|interface)\b/],
+    [/^type\s+(?<name>\w+)\b/, 'type'],
+  ],
+  jvm: [
+    [new RegExp(`^\\s*${MODIFIERS}(?<kind>class|interface|enum|struct|record|object|trait|protocol|extension)\\s+(?<name>\\w+)`)],
+    [new RegExp(`^\\s*${MODIFIERS}(?:fun|func|def)\\s+(?:<[^>]*>\\s*)?(?:[\\w.]+\\.)?(?<name>\\w+)`), 'function'],
+    [/^\s+(?:(?:public|private|protected|internal|static|final|abstract|synchronized|override|virtual|async|native|default)\s+)+[\w<>[\],.?\s]+?\s+(?<name>\w+)\s*\([^;]*$/, 'method'],
+  ],
+  scala: [
+    [new RegExp(`^\\s*${SCALA_MODS}(?<kind>class|trait|object|enum)\\s+(?<name>\\w+)`)],
+    [new RegExp(`^\\s*${SCALA_MODS}(?<kind>type|given)\\s+(?<name>\\w+)`)],
+    [new RegExp(`^\\s*${SCALA_MODS}def\\s+(?<name>[\\w$]+|\`[^\`]+\`|[^\\s\\w(\\[:]+)`), 'method'],
+    [/^\s*extension\s*(?:\[[^\]]*\])?\s*\((?<name>[^)]*)\)/, 'extension'],
+    [/^package\s+(?<name>[\w.]+)/, 'package'],
+  ],
+  c: [
+    [/^\s*(?:typedef\s+)?(?<kind>struct|class|enum|union|namespace)\s+(?<name>\w+)\s*(?:[:{]|$)/],
+    [/^[A-Za-z_][\w:<>,*&\s]*?[\s*&](?<name>[A-Za-z_][\w:~]*)\s*\([^;]*$/, 'function'],
+  ],
+  ruby: [
+    [/^\s*def\s+(?:self\.)?(?<name>[\w?!=]+)/, 'method'],
+    [/^\s*(?<kind>class|module)\s+(?<name>[\w:]+)/],
+  ],
+  php: [
+    [/^\s*(?:(?:public|private|protected|static|abstract|final)\s+)*function\s+(?<name>\w+)/, 'function'],
+    [/^\s*(?:abstract\s+|final\s+)?(?<kind>class|interface|trait|enum)\s+(?<name>\w+)/],
+  ],
+  shell: [
+    [/^\s*function\s+(?<name>[\w.:-]+)/, 'function'],
+    [/^\s*(?<name>[\w.:-]+)\s*\(\)\s*\{?/, 'function'],
+  ],
+};
+const OUTLINE_LANG = {
+  rs: 'rust', py: 'python', pyi: 'python', js: 'js', mjs: 'js', cjs: 'js', jsx: 'js', ts: 'js', tsx: 'js', mts: 'js', cts: 'js',
+  go: 'go', java: 'jvm', kt: 'jvm', kts: 'jvm', scala: 'scala', sc: 'scala', sbt: 'scala', cs: 'jvm', swift: 'jvm', dart: 'jvm',
+  c: 'c', h: 'c', cc: 'c', cpp: 'c', cxx: 'c', hpp: 'c', hh: 'c', rb: 'ruby', php: 'php',
+  sh: 'shell', bash: 'shell', zsh: 'shell', md: 'markdown', markdown: 'markdown',
+};
+const OUTLINE_KEYWORDS = new Set(['if', 'else', 'for', 'while', 'switch', 'catch', 'return', 'function', 'do', 'new', 'sizeof', 'typeof', 'delete', 'throw', 'case', 'match', 'with']);
+const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*(?:\s|$)|#)/;
+
+// Outline from name patterns; nesting follows indentation (Markdown: heading level).
+function guessOutline(lines, path) {
+  const lang = OUTLINE_LANG[splitPath(path)[1].split('.').pop().toLowerCase()];
+  const items = [];
+  if (lang === 'markdown') {
+    let fence = false;
+    lines.forEach((text, i) => {
+      if (/^\s*(```|~~~)/.test(text)) fence = !fence;
+      const m = !fence && text.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (m) items.push({ name: m[2], kind: 'heading', line: i + 1, depth: m[1].length - 1 });
+    });
+    return items;
+  }
+  const rules = OUTLINE_RULES[lang];
+  if (!rules) return items;
+  const indents = [];
+  lines.forEach((text, i) => {
+    if (COMMENT_LINE.test(text)) return;
+    for (const [re, kind] of rules) {
+      const m = text.match(re);
+      const name = m?.groups.name?.trim();
+      if (!name || OUTLINE_KEYWORDS.has(name)) continue;
+      const indent = text.match(/^[ \t]*/)[0].replace(/\t/g, '    ').length;
+      while (indents.length && indents[indents.length - 1] >= indent) indents.pop();
+      const k = m.groups.kind || kind;
+      items.push({ name, kind: k === 'mod' ? 'module' : k, line: i + 1, depth: indents.length });
+      indents.push(indent);
+      break;
+    }
+  });
+  return items;
+}
 
 // LSP SymbolKind numbers → short labels (servers may also send names).
 const SYMBOL_KINDS = ['', 'file', 'module', 'namespace', 'package', 'class', 'method', 'property', 'field',
   'constructor', 'enum', 'interface', 'fn', 'var', 'const', 'string', 'number', 'bool', 'array', 'object',
   'key', 'null', 'variant', 'struct', 'event', 'operator', 'type param'];
-const kindLabel = k => (typeof k === 'number' ? SYMBOL_KINDS[k] || 'symbol' : String(k || 'symbol').toLowerCase());
+const KIND_SHORT = { function: 'fn', method: 'fn', constructor: 'ctor', interface: 'iface', namespace: 'ns', variable: 'var', constant: 'const', heading: '#' };
+const kindLabel = k => (typeof k === 'number' ? SYMBOL_KINDS[k] || 'symbol' : KIND_SHORT[String(k || '').toLowerCase()] || String(k || 'symbol').toLowerCase());
+
+async function loadLspOutline(v) {
+  v.lspOutline = true;
+  let r;
+  try {
+    r = await api('GET', `/api/lsp/outline?path=${qpath(v.path)}`, undefined, true);
+  } catch {
+    return; // the pattern outline stays, labelled as such
+  }
+  const symbols = (r && r.symbols) || [];
+  if (S.viewer !== v || (!symbols.length && v.outline.length)) return;
+  v.outline = symbols;
+  v.outlineFrom = 'lsp';
+  if (v.renderOutline) v.renderOutline();
+}
 
 function closeOutline() {
   const v = S.viewer;
   if (!v || !v.outlineEl) return;
   v.outlineEl.remove();
   v.outlineEl = null;
+  v.renderOutline = null;
 }
 
 function gotoSymbol(v, s) {
   closeOutline();
   const tr = v.pane && v.pane.rows.get(`RIGHT:${s.line}`);
   if (!tr) return;
+  navPush();
   unfoldRow(v.pane, tr);
   tr.scrollIntoView({ block: 'center' });
   flash(tr);
 }
 
-// Filterable symbol list for the viewer's file; symbols are cached on the viewer.
-async function toggleOutline(v) {
+// The first line visible at the top of the viewer.
+function viewerTopLine() {
+  const r = $('#viewer-scroll').getBoundingClientRect();
+  const tr = document.elementFromPoint(r.left + 30, r.top + 12)?.closest('tr.ln-row');
+  return (tr && +tr.dataset.new) || 1;
+}
+
+// Marks the declaration the viewer is in: the last one starting at or above its top line.
+function markCurrentSymbol(v) {
+  if (!v.outlineEl) return;
+  const top = viewerTopLine();
+  let current = 0;
+  for (const s of v.outline) if (s.line <= top + 1) current = Math.max(current, s.line);
+  for (const b of v.outlineEl.querySelectorAll('.outline-item')) {
+    const on = +b.dataset.line === current;
+    if (on && !b.classList.contains('current')) b.scrollIntoView({ block: 'nearest' });
+    b.classList.toggle('current', on);
+  }
+}
+
+// Filterable symbol list for the viewer's file.
+function toggleOutline(v) {
   if (v.outlineEl) return closeOutline();
   const input = h('input', { class: 'outline-filter', type: 'search', placeholder: 'Filter symbols…', 'aria-label': 'Filter symbols' });
-  const list = h('ul', { class: 'outline-list' }, h('li', { class: 'hint' }, 'Loading outline…'));
-  const el = h('div', { class: 'outline-pop' }, input, list);
+  const list = h('ul', { class: 'outline-list' });
+  const foot = h('div', { class: 'outline-foot' });
+  const el = h('div', { class: 'outline-pop' }, input, list, foot);
   v.outlineEl = el;
   $('#viewer .viewer-box').append(el);
   input.focus();
-  if (!v.outline) {
-    try {
-      const r = await api('GET', `/api/lsp/outline?path=${qpath(v.path)}`, undefined, true);
-      v.outline = r.symbols || [];
-    } catch (e) {
-      if (v.outlineEl === el) list.replaceChildren(h('li', { class: 'hint' }, `outline unavailable: ${e.message}`));
-      return;
-    }
-  }
-  if (S.viewer !== v || v.outlineEl !== el) return;
   let shown = [];
-  const render = () => {
+  v.renderOutline = () => {
     const q = input.value.trim().toLowerCase();
     shown = q ? v.outline.filter(s => s.name.toLowerCase().includes(q)) : v.outline;
     list.replaceChildren(...(shown.length
-      ? shown.map(s => h('li', {}, h('button', { class: `outline-item d-${Math.min(s.depth || 0, 6)}`, title: `line ${s.line}`, onclick: () => gotoSymbol(v, s) },
-        h('span', { class: 'tag' }, kindLabel(s.kind)),
-        h('span', { class: 'outline-name' }, s.name),
-        s.detail && h('span', { class: 'outline-detail' }, s.detail))))
-      : [h('li', { class: 'hint' }, v.outline.length ? 'No matches.' : 'No symbols.')]));
+      ? shown.map(s => h('li', {}, h('button', {
+        class: `outline-item d-${Math.min(s.depth || 0, 6)}`, 'data-line': s.line,
+        title: `${s.kind}${s.detail ? ` · ${s.detail}` : ''} · line ${s.line}`, onclick: () => gotoSymbol(v, s),
+      },
+      h('span', { class: 'tag' }, kindLabel(s.kind)),
+      h('span', { class: 'outline-name' }, s.name),
+      s.detail && h('span', { class: 'outline-detail' }, s.detail))))
+      : [h('li', { class: 'hint' }, v.outline.length ? 'No matches.' : v.outlineFrom === 'lsp' ? 'No declarations in this file.' : 'No functions or classes recognised.')]));
+    const from = v.outlineFrom === 'lsp' ? 'language server' : 'name patterns';
+    foot.textContent = v.outline.length ? `${plural(v.outline.length, 'symbol')} · ${from}${q ? ` · ${shown.length} shown` : ''}` : from;
+    markCurrentSymbol(v);
   };
-  input.addEventListener('input', render);
+  input.addEventListener('input', v.renderOutline);
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && shown.length) gotoSymbol(v, shown[0]);
   });
-  render();
+  v.renderOutline();
 }
 
 function closeSym() {
@@ -2029,9 +2440,8 @@ function closeSym() {
 }
 
 // Clickable LSP/search location; `path: null` is outside the checkout and inert.
-function locationEl(loc) {
-  const label = loc.display || `${loc.path}:${loc.line}`;
-  const kids = [h('span', { class: 'loc-label' }, label), loc.preview && h('code', { class: 'loc-preview' }, loc.preview.trim())];
+function locationEl(loc, label = null) {
+  const kids = [h('span', { class: 'loc-label' }, label || loc.display || `${loc.path}:${loc.line}`), loc.preview && h('code', { class: 'loc-preview' }, loc.preview.trim())];
   if (!loc.path) return h('li', { class: 'loc inert', title: 'Outside the checkout' }, kids);
   return h('li', {}, h('button', {
     class: 'loc', title: `${loc.path}:${loc.line}`,
@@ -2042,11 +2452,24 @@ function locationEl(loc) {
   }, kids));
 }
 
-const locList = locs => h('ul', { class: 'loc-list' }, locs.map(locationEl));
+// Locations as a list, or grouped under their files (references, text matches).
+function locList(locs, { group = false } = {}) {
+  if (!group) return h('ul', { class: 'loc-list' }, locs.map(l => locationEl(l)));
+  const byFile = new Map();
+  for (const l of locs) {
+    const key = l.path ?? l.display;
+    if (!byFile.has(key)) byFile.set(key, []);
+    byFile.get(key).push(l);
+  }
+  return h('div', { class: 'loc-groups' }, [...byFile].flatMap(([file, ls]) => [
+    h('div', { class: 'loc-file' }, file, h('span', { class: 'dim' }, ` (${ls.length})`)),
+    h('ul', { class: 'loc-list' }, ls.map(l => locationEl(l, `${l.line}`)))]));
+}
 
-// Cmd/Ctrl-click on code: hover + definitions (+ references on demand) from the
-// language server; falls back to a whole-word text search for identifiers.
-async function openSymbol(pane, tr, td, x, y) {
+// Click with a modifier on code. ⌘/Ctrl (`jump`): straight to the definition when the
+// language server knows exactly one in the checkout, else the popup. Alt: the popup —
+// hover, definitions, references on request, whole-word text matches.
+async function openSymbol(pane, tr, td, x, y, jump = false) {
   const tok = tokenAt(td, x, y);
   if (!tok) return;
   closeSym();
@@ -2074,9 +2497,26 @@ async function openSymbol(pane, tr, td, x, y) {
     }
   }
   if (S.sym !== sym) return;
-  if (res && res.hover) parts.push(h('div', { class: 'md sym-hover', html: md(res.hover, { headings: false }) }));
   const defs = (res && res.definitions) || [];
+  const inRepo = defs.filter(d => d.path);
+  if (jump && inRepo.length === 1) {
+    closeSym();
+    return openCodeRef(inRepo[0].path, inRepo[0].line, null);
+  }
+  if (res && res.hover) parts.push(h('div', { class: 'md sym-hover', html: md(res.hover, { headings: false }) }));
   if (defs.length) parts.push(h('div', { class: 'sym-section' }, defs.length === 1 ? 'Definition' : `Definitions (${defs.length})`), locList(defs));
+  const textBox = h('div', {});
+  const searchText = async () => {
+    textBox.replaceChildren(h('div', { class: 'working' }, h('span', { class: 'spinner' }), 'Searching…'));
+    try {
+      const r = await get(`/api/search?q=${encodeURIComponent(tok.token)}&word=true&limit=300`);
+      const hits = r.hits || [];
+      textBox.replaceChildren(h('div', { class: 'sym-section' }, `Text matches (${hits.length}${r.truncated ? '+' : ''})`),
+        hits.length ? locList(hits.map(hit => ({ ...hit, display: hit.path })), { group: true }) : h('div', { class: 'hint' }, 'No matches.'));
+    } catch {
+      textBox.replaceChildren(); // toasted
+    }
+  };
   if (res) {
     const refsBox = h('div', {});
     const refsBtn = h('button', {
@@ -2087,31 +2527,23 @@ async function openSymbol(pane, tr, td, x, y) {
         try {
           const r = await api('POST', '/api/lsp/references', pos);
           const refs = r.references || [];
+          refsBtn.textContent = 'References';
           refsBox.replaceChildren(h('div', { class: 'sym-section' }, `References (${refs.length})`),
-            refs.length ? locList(refs) : h('div', { class: 'hint' }, 'No references found.'));
+            refs.length ? locList(refs, { group: true }) : h('div', { class: 'hint' }, 'No references found.'));
         } catch {
           refsBtn.disabled = false;
           refsBtn.textContent = 'References';
         }
       },
     }, 'References');
-    refsBox.append(refsBtn);
-    parts.push(refsBox);
+    const textBtn = h('button', { class: 'btn small', onclick: () => { textBtn.disabled = true; searchText(); } }, 'Text search');
+    parts.push(h('div', { class: 'sym-actions' }, refsBtn, textBtn), refsBox, textBox);
+  } else if (IDENT.test(tok.token)) {
+    parts.push(textBox);
   }
-  if (!defs.length && IDENT.test(tok.token)) {
-    try {
-      const r = await get(`/api/search?q=${encodeURIComponent(tok.token)}&word=true&limit=100`);
-      if (S.sym !== sym) return;
-      const hits = r.hits || [];
-      parts.push(h('div', { class: 'sym-section' }, `Text matches (${hits.length}${r.truncated ? '+' : ''})`),
-        hits.length ? locList(hits.map(hit => ({ ...hit, display: `${hit.path}:${hit.line}` }))) : h('div', { class: 'hint' }, 'No matches.'));
-    } catch {
-      /* toasted */
-    }
-  }
-  if (S.sym !== sym) return;
   if (!parts.length) parts.push(h('div', { class: 'hint' }, 'No symbol information.'));
   body.replaceChildren(...parts);
+  if (!defs.length && IDENT.test(tok.token)) await searchText();
 }
 
 function popComment() {
@@ -2136,13 +2568,16 @@ function openDrawer(name) {
   S.drawer = name;
   $('#chat-drawer').hidden = name !== 'chat';
   $('#review-drawer').hidden = name !== 'review';
+  $('#findings-drawer').hidden = name !== 'findings';
   document.body.classList.toggle('drawer-open', !!name);
   $('#btn-chat').classList.toggle('on', name === 'chat');
   $('#btn-review').classList.toggle('on', name === 'review');
+  $('#btn-findings').classList.toggle('on', name === 'findings');
   if (name === 'chat') {
     renderThreadList();
     renderConvo();
   } else if (name === 'review') renderReview();
+  else if (name === 'findings') renderFindingsDrawer();
 }
 
 const toggleDrawer = name => S.info && openDrawer(S.drawer === name ? null : name);
@@ -2533,6 +2968,276 @@ function renderSummary() {
   card.replaceChildren(head, body);
 }
 
+// ───────────────────────────── PR flows ─────────────────────────────
+// The paths through the code this change alters (requests, commands, jobs), each as
+// ordered steps over line ranges at the head, generated on request and cached per head
+// commit. Walking a flow shows each step where it is — the diff when the lines are in
+// it, else the file viewer — highlighted, with a note under it.
+
+const FLOWS_COLLAPSED_KEY = 'review-master:flows-collapsed';
+const WALK_SPEED_KEY = 'review-master:walk-speed';
+const WALK_SPEEDS = { slow: 9000, normal: 5000, fast: 2500 };
+
+async function loadFlows() {
+  const st = S.flows;
+  try {
+    const r = await api('GET', '/api/flows', undefined, true);
+    st.list = r.flows || null;
+    renderFlows();
+    if (r.job != null) await runFlowsJob(r.job);
+  } catch (e) {
+    st.error = e.message;
+    renderFlows();
+  }
+}
+
+async function generateFlows() {
+  const st = S.flows;
+  if (st.running) return;
+  let r;
+  try {
+    r = await api('POST', '/api/flows', undefined, true);
+  } catch (e) {
+    st.error = e.message;
+    renderFlows();
+    return;
+  }
+  await runFlowsJob(r.job);
+}
+
+async function runFlowsJob(job) {
+  const st = S.flows;
+  Object.assign(st, { act: makeActivity(), running: true, error: null, jobId: job });
+  renderFlows();
+  try {
+    const res = await pollJob(job, lines => {
+      st.act.lines.push(...lines);
+      updateActivity(st.act);
+    }, true);
+    if (S.walk) exitWalk();
+    st.list = res.flows || [];
+  } catch (e) {
+    st.error = e.message === 'cancelled' ? null : e.message;
+  }
+  st.running = false;
+  st.act.running = false;
+  renderFlows();
+}
+
+function toggleFlowsCard() {
+  S.flows.collapsed = !S.flows.collapsed;
+  savePref(FLOWS_COLLAPSED_KEY, S.flows.collapsed);
+  renderFlows();
+}
+
+const stepLoc = s => `${s.path}:${s.end_line > s.line ? `${s.line}-${s.end_line}` : s.line}`;
+
+function renderFlows() {
+  const st = S.flows;
+  const card = $('#flows-card');
+  card.hidden = false;
+  card.classList.toggle('collapsed', st.collapsed);
+  const n = st.list ? st.list.length : 0;
+  const head = h('div', { class: 'summary-head' },
+    h('button', { class: 'summary-toggle', 'aria-expanded': String(!st.collapsed), onclick: toggleFlowsCard },
+      h('span', { class: 'chevron' }, '▾'), h('strong', {}, 'Flows'), st.list && h('span', { class: 'dim' }, ` · ${n}`)),
+    st.running && h('span', { class: 'dim summary-status' }, h('span', { class: 'spinner' }), ' mapping…'),
+    h('span', { class: 'spacer' }),
+    st.running
+      ? h('button', { class: 'btn small', title: 'Stop generating', onclick: () => stopJob(st.jobId) }, 'Stop')
+      : st.list && h('button', { class: 'icon-btn', title: 'Regenerate', 'aria-label': 'Regenerate flows', onclick: generateFlows }, '↻'));
+  const body = h('div', { class: 'summary-body' });
+  if (st.error) {
+    body.append(h('div', { class: 'msg error' }, `Flows failed: ${st.error} `, h('button', { class: 'btn small', onclick: generateFlows }, 'Retry')));
+  }
+  if (st.running) body.append(h('div', { class: 'hint' }, 'Following the change through the code — browsing works meanwhile.'), updateActivity(st.act));
+  if (!st.list && !st.running && !st.error) {
+    body.append(h('div', { class: 'hint' },
+      'Read the change in execution order: the requests, commands or jobs it alters, step by step through the code. ',
+      h('button', { class: 'btn small', onclick: generateFlows }, 'Map flows')));
+  } else if (st.list && !st.list.length && !st.running) {
+    body.append(h('div', { class: 'hint' }, 'No runtime flow goes through this change.'));
+  }
+  (st.list || []).forEach((flow, fi) => {
+    const changed = flow.steps.filter(s => s.changed).length;
+    const walking = S.walk && S.walk.fi === fi;
+    body.append(h('div', { class: `flow${walking ? ' walking' : ''}` },
+      h('div', { class: 'flow-head' },
+        h('button', { class: 'btn small primary', title: 'Walk through this flow (] next, [ back)', onclick: () => startWalk(fi, 0) }, '▶ Walk'),
+        h('strong', { class: 'flow-name' }, flow.name),
+        h('span', { class: 'dim' }, `${plural(flow.steps.length, 'step')} · ${changed} on changed lines`)),
+      flow.description && h('div', { class: 'md flow-desc', html: md(flow.description) }),
+      h('details', { class: 'flow-steps', open: walking },
+        h('summary', {}, 'Steps'),
+        h('ol', {}, flow.steps.map((s, si) => h('li', { class: `${walking && S.walk.index === si ? 'current' : ''}${s.verified ? '' : ' unverified'}` },
+          h('button', { class: 'flow-step', title: s.problem || stepLoc(s), onclick: () => startWalk(fi, si) },
+            h('span', { class: 'tag' }, s.kind),
+            h('span', { class: 'flow-step-title' }, s.title),
+            s.changed && h('span', { class: 'changed-dot', title: 'touches changed lines' }, '●'),
+            h('code', { class: 'dim' }, stepLoc(s)))))))));
+  });
+  card.replaceChildren(head, body);
+}
+
+// ───────────── walking a flow ─────────────
+
+function startWalk(fi, index) {
+  const flow = S.flows.list && S.flows.list[fi];
+  if (!flow || !flow.steps.length) return;
+  if (!S.walk) navPush(); // Alt+← after the walk returns to where it started
+  if (S.walk) stopWalkPlay();
+  S.walk = { fi, flow, index: -1, playing: false, timer: null, marks: [], note: null };
+  showWalkStep(index);
+}
+
+function clearWalkMarks() {
+  const w = S.walk;
+  if (!w) return;
+  for (const tr of w.marks) tr.classList.remove('walk-hl', 'walk-first');
+  w.marks = [];
+  if (w.note) w.note.remove();
+  w.note = null;
+}
+
+function stopWalkPlay() {
+  const w = S.walk;
+  if (!w) return;
+  clearTimeout(w.timer);
+  w.playing = false;
+}
+
+function exitWalk() {
+  stopWalkPlay();
+  clearWalkMarks();
+  S.walk = null;
+  renderWalkBar();
+  renderFlows();
+}
+
+// The pane that shows a step: the file's diff when it has the step's first line, else the viewer.
+async function walkPane(step) {
+  const fs = S.files.get(step.path);
+  if (fs && fs.file.status !== 'deleted') {
+    if (fs.collapsed) setCollapsed(fs, false);
+    try {
+      await ensureLoaded(fs);
+    } catch {
+      return null;
+    }
+    if (fs.pane.rows.has(`RIGHT:${step.line}`)) {
+      closeViewer();
+      return fs.pane;
+    }
+  }
+  if (!S.viewer || S.viewer.path !== step.path) await openViewer(step.path);
+  return S.viewer && S.viewer.path === step.path ? S.viewer.pane : null;
+}
+
+function walkNote(w, step) {
+  return h('div', { class: 'walk-note-box' },
+    h('div', { class: 'walk-note-head' },
+      h('span', { class: 'tag' }, step.kind),
+      h('strong', {}, `${w.index + 1}/${w.flow.steps.length} · ${step.title}`),
+      step.changed && h('span', { class: 'changed-dot', title: 'touches changed lines' }, '● changed'),
+      h('span', { class: 'spacer' }),
+      h('button', { class: 'icon-btn', title: 'Previous step ([)', 'aria-label': 'Previous step', disabled: w.index === 0, onclick: () => walkStep(-1) }, '◀'),
+      h('button', { class: 'icon-btn', title: 'Next step (])', 'aria-label': 'Next step', disabled: w.index >= w.flow.steps.length - 1, onclick: () => walkStep(1) }, '▶')),
+    step.detail && h('div', { class: 'md', html: md(step.detail) }),
+    step.change && h('div', { class: 'md walk-change', html: md(`**Changed here:** ${step.change}`) }));
+}
+
+async function showWalkStep(i) {
+  const w = S.walk;
+  if (!w) return;
+  w.index = Math.max(0, Math.min(w.flow.steps.length - 1, i));
+  const index = w.index;
+  clearWalkMarks();
+  renderWalkBar();
+  renderFlows();
+  const step = w.flow.steps[index];
+  if (!step.verified) return; // the bar says why
+  const pane = await walkPane(step);
+  if (S.walk !== w || w.index !== index || !pane) return;
+  let first = null;
+  let last = null;
+  for (let l = step.line; l <= step.end_line; l++) {
+    const tr = pane.rows.get(`RIGHT:${l}`);
+    if (!tr) continue;
+    if (!first) {
+      first = tr;
+      unfoldRow(pane, tr);
+      tr.classList.add('walk-first');
+    }
+    tr.classList.add('walk-hl');
+    w.marks.push(tr);
+    last = tr;
+  }
+  if (!first) return;
+  w.note = h('tr', { class: 'walk-note' }, h('td', { colspan: String(pane.cols) }, walkNote(w, step)));
+  last.after(w.note);
+  const span = last.getBoundingClientRect().bottom - first.getBoundingClientRect().top;
+  first.scrollIntoView({ block: span > window.innerHeight * 0.6 ? 'start' : 'center' });
+  if (w.playing) scheduleWalkNext();
+}
+
+function walkStep(dir) {
+  const w = S.walk;
+  if (!w) return;
+  stopWalkPlay();
+  const next = w.index + dir;
+  if (next < 0 || next >= w.flow.steps.length) return renderWalkBar();
+  showWalkStep(next);
+}
+
+function scheduleWalkNext() {
+  const w = S.walk;
+  clearTimeout(w.timer);
+  w.timer = setTimeout(() => {
+    if (S.walk !== w || !w.playing) return;
+    if (w.index >= w.flow.steps.length - 1) {
+      stopWalkPlay();
+      return renderWalkBar();
+    }
+    showWalkStep(w.index + 1);
+  }, WALK_SPEEDS[loadPref(WALK_SPEED_KEY, 'normal')] || WALK_SPEEDS.normal);
+}
+
+function toggleWalkPlay() {
+  const w = S.walk;
+  if (!w) return;
+  if (w.playing) stopWalkPlay();
+  else {
+    w.playing = true;
+    if (w.index >= w.flow.steps.length - 1) showWalkStep(0);
+    else scheduleWalkNext();
+  }
+  renderWalkBar();
+}
+
+function renderWalkBar() {
+  const bar = $('#walk-bar');
+  const w = S.walk;
+  bar.hidden = !w;
+  if (!w) return bar.replaceChildren();
+  const step = w.flow.steps[w.index];
+  const speed = h('select', { class: 'walk-speed', title: 'Autoplay speed', 'aria-label': 'Autoplay speed', onchange: e => savePref(WALK_SPEED_KEY, e.target.value) },
+    Object.keys(WALK_SPEEDS).map(s => h('option', { value: s }, s)));
+  speed.value = loadPref(WALK_SPEED_KEY, 'normal');
+  bar.replaceChildren(
+    h('strong', { class: 'walk-flow', title: w.flow.description }, w.flow.name),
+    h('span', { class: 'walk-count' }, `${w.index + 1}/${w.flow.steps.length}`),
+    h('span', { class: 'tag' }, step.kind),
+    h('span', { class: 'walk-title', title: step.title }, step.title),
+    h('code', { class: 'dim' }, stepLoc(step)),
+    step.verified ? '' : h('span', { class: 'warn-text' }, `⚠ ${step.problem || 'not found'}`),
+    h('span', { class: 'spacer' }),
+    h('button', { class: 'icon-btn', title: 'Previous step ([)', 'aria-label': 'Previous step', disabled: w.index === 0, onclick: () => walkStep(-1) }, '◀'),
+    h('button', { class: 'icon-btn', title: w.playing ? 'Pause (Space)' : 'Play (Space)', 'aria-label': w.playing ? 'Pause' : 'Play', onclick: toggleWalkPlay }, w.playing ? '⏸' : '⏵'),
+    h('button', { class: 'icon-btn', title: 'Next step (])', 'aria-label': 'Next step', disabled: w.index >= w.flow.steps.length - 1, onclick: () => walkStep(1) }, '▶'),
+    speed,
+    h('button', { class: 'icon-btn', title: 'Leave the walkthrough (Esc)', 'aria-label': 'Leave the walkthrough', onclick: exitWalk }, '×'));
+}
+
 // ───────────────────────────── keyboard navigation & help ─────────────────────────────
 
 function stepFile(dir) {
@@ -2583,19 +3288,24 @@ function toggleHelp() {
           row(['n', 'p'], 'Next / previous change'),
           row(['/'], 'Filter the file list (Enter jumps to the first match)'),
           row(['o'], 'Open the whole file'),
+          row([']', '['], 'While walking a flow: next / previous step'),
+          row(['Space'], 'While walking a flow: play / pause'),
         ]),
         group('Review', [
           row(['v'], 'Mark the current file viewed (collapses it)'),
           row(['x'], 'Collapse or expand the current file'),
           row(['c'], 'Chat'),
           row(['r'], 'Review drawer: summary, drafts, submit'),
+          row(['f'], 'LLM findings: import a review, list, restore'),
           row([`${MOD}+Enter`], 'Save the comment / send the question'),
           row(['Esc'], 'Close whatever is open'),
         ]),
         group('In the code', [
           row(['click', 'drag'], 'Line numbers select lines (Shift-click extends) → Comment or Ask'),
           row(['select'], 'Selecting code text asks or comments about exactly that text'),
-          row([`${MOD}+click`], 'An identifier: hover, definition, references'),
+          row([`${MOD}+click`], 'An identifier: jump to its definition (the symbol popup when there is not exactly one)'),
+          row(['Alt+click'], 'An identifier: hover, definitions, references, text matches'),
+          row(['Alt+←', 'Alt+→'], 'Back / forward through jumps'),
         ])))));
   document.body.append(S.help);
 }
@@ -2609,9 +3319,15 @@ function onKeyDown(e) {
     else if (S.sym) closeSym();
     else if (S.scopePop) closeScopePop();
     else if (S.viewer && S.viewer.outlineEl) closeOutline();
+    else if (S.walk) exitWalk();
     else if (S.viewer) closeViewer();
     else if (S.sel) clearSel();
     else if (S.drawer) openDrawer(null);
+    return;
+  }
+  if (e.altKey && !e.metaKey && !e.ctrlKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !typing(e.target) && S.info) {
+    e.preventDefault();
+    navStep(e.key === 'ArrowLeft' ? -1 : 1);
     return;
   }
   if (e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || !S.info) return;
@@ -2625,6 +3341,9 @@ function onKeyDown(e) {
   else if (e.key === 'o' && inDiff && cur && cur.file.status !== 'deleted') openViewer(cur.path);
   else if (e.key === 'c') toggleDrawer('chat');
   else if (e.key === 'r') toggleDrawer('review');
+  else if (e.key === 'f') toggleDrawer('findings');
+  else if ((e.key === ']' || e.key === '[') && S.walk) walkStep(e.key === ']' ? 1 : -1);
+  else if (e.key === ' ' && S.walk) toggleWalkPlay();
   else if (e.key === '/') $('#file-filter').focus();
   else if (e.key === '?') toggleHelp();
   else return;
@@ -2685,11 +3404,11 @@ function wire() {
   });
   document.addEventListener('click', e => {
     if (!(e.target instanceof Element)) return;
-    const codeCell = (e.metaKey || e.ctrlKey) && e.target.closest('tr.ln-row td.code');
+    const codeCell = (e.metaKey || e.ctrlKey || e.altKey) && e.target.closest('tr.ln-row td.code');
     const codePane = codeCell && paneOf(codeCell);
     if (codePane) {
       e.preventDefault();
-      openSymbol(codePane, codeCell.parentElement, codeCell, e.clientX, e.clientY);
+      openSymbol(codePane, codeCell.parentElement, codeCell, e.clientX, e.clientY, !e.altKey);
       return;
     }
     const ref = e.target.closest('a.code-ref');
@@ -2718,6 +3437,11 @@ function wire() {
   $('#viewer').addEventListener('click', e => {
     if (e.target.id === 'viewer') closeViewer(); // backdrop
   });
+  let outlineFrame = 0;
+  $('#viewer-scroll').addEventListener('scroll', () => {
+    cancelAnimationFrame(outlineFrame);
+    outlineFrame = requestAnimationFrame(() => S.viewer && markCurrentSymbol(S.viewer));
+  }, { passive: true });
   document.addEventListener('keydown', onKeyDown);
   wireResizers();
   $('#btn-help').addEventListener('click', toggleHelp);
@@ -2749,6 +3473,23 @@ function wire() {
     renderAllAnnotations();
   });
   $('#remote-retry').addEventListener('click', () => loadRemote(true));
+  $('#show-findings').addEventListener('change', e => {
+    S.findings.show = e.target.checked;
+    savePref(FINDINGS_SHOW_KEY, S.findings.show);
+    renderFindingControls();
+    renderAllAnnotations();
+  });
+  // A Markdown review dropped anywhere on the page is imported as findings.
+  const mdFiles = e => [...((e.dataTransfer && e.dataTransfer.files) || [])].filter(f => /\.(md|markdown|txt)$/i.test(f.name));
+  document.addEventListener('dragover', e => {
+    if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault();
+  });
+  document.addEventListener('drop', e => {
+    const files = mdFiles(e);
+    if (!files.length || !S.info) return;
+    e.preventDefault();
+    importFindingFiles(files).catch(() => {});
+  });
 
   // Leaving with a comment still being written would lose it.
   window.addEventListener('beforeunload', e => {
@@ -2769,6 +3510,7 @@ function wire() {
 
   $('#btn-chat').addEventListener('click', () => toggleDrawer('chat'));
   $('#btn-review').addEventListener('click', () => toggleDrawer('review'));
+  $('#btn-findings').addEventListener('click', () => toggleDrawer('findings'));
   for (const b of document.querySelectorAll('[data-close]')) b.addEventListener('click', () => openDrawer(null));
   $('#chat-new').addEventListener('click', () => openChatNew(null));
   $('#chat-send').addEventListener('click', () => (S.chat.stopId != null ? stopJob(S.chat.stopId) : sendChat()));
@@ -2831,6 +3573,10 @@ async function boot() {
   }
   loadSummary(); // runs in the background
   loadRemote(); // too
+  S.flows.collapsed = loadPref(FLOWS_COLLAPSED_KEY, false) === true;
+  S.findings.show = loadPref(FINDINGS_SHOW_KEY, true) !== false;
+  loadFlows();
+  loadFindings();
   const [drafts, threads] = await Promise.all([get('/api/drafts'), get('/api/threads')]);
   S.drafts = drafts || [];
   S.threads = threads || [];

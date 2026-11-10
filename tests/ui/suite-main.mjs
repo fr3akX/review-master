@@ -157,6 +157,96 @@ export default async page => {
   await page.waitFor(() => window.cacheSec.querySelectorAll('.card.remote .remote-comment').length === 3, 5000);
   check('reply posted and listed', await q(() => !window.cacheSec.querySelector('.reply-box') && window.cacheSec.querySelectorAll('.card.remote .remote-comment')[2].textContent.includes('AtomicU64 sounds right.')));
 
+  // ── imported LLM findings: pasted Markdown lands on the cited lines
+  await q(() => document.activeElement.blur());
+  await page.key('f');
+  await page.waitFor(() => document.querySelector('.findings-paste'));
+  await q(() => {
+    const ta = document.querySelector('.findings-paste');
+    ta.value = '# Review\n## [major] Hit counter is not thread-safe (src/store/cache.rs:17)\n`hits` is a plain u64.\n\n' +
+      '## Nits\n- `handler.py:7` — Prefer a constant for 422.\n- src/long.txt:30 — Odd wording.\n- nowhere.rs:3 — Ghost.\n\n' +
+      '## Summary\nLooks fine overall, see src/store/ttl.rs:1.\n';
+    ta.dispatchEvent(new Event('input'));
+    [...document.querySelectorAll('#findings-body .btn')].find(b => b.textContent === 'Import pasted').click();
+  });
+  await page.waitFor(() => document.querySelectorAll('section.file .card.finding').length === 3);
+  const fnd = await q(() => ({
+    notice: document.querySelector('.findings-notice').textContent,
+    rows: document.querySelectorAll('#findings-body .finding-row').length,
+    ghost: [...document.querySelectorAll('#findings-body .finding-row')].some(r => r.textContent.includes('nowhere.rs') && r.querySelector('.warn-line')),
+    cacheRow: (() => { const c = window.cacheSec.querySelector('.card.finding'); return c && [c.closest('tr').previousElementSibling.dataset.new, c.querySelector('.sev').textContent, c.querySelector('.card-title').textContent]; })(),
+    badge: document.querySelector('#findings-badge').textContent,
+    nav: document.querySelector('#file-list .file-item[title="src/store/cache.rs"] .nav-findings').textContent,
+  }));
+  check('findings import notice', fnd.notice.includes('4 findings') && fnd.notice.includes('Summary'), fnd.notice);
+  check('findings listed, unplaced one flagged', fnd.rows === 4 && fnd.ghost, JSON.stringify(fnd));
+  check('finding card on its line', JSON.stringify(fnd.cacheRow) === JSON.stringify(['17', 'major', 'Hit counter is not thread-safe']), JSON.stringify(fnd.cacheRow));
+  check('finding counts', fnd.badge === '4' && fnd.nav === '⚑1', JSON.stringify(fnd));
+  await page.shot('findings');
+  await q(() => [...window.cacheSec.querySelectorAll('.card.finding .link-btn')].find(b => b.textContent === 'Draft').click());
+  await page.waitFor(() => window.cacheSec.querySelector('.composer textarea'));
+  check('draft prefilled from the finding', await q(() => window.cacheSec.querySelector('.composer textarea').value.startsWith('**Hit counter is not thread-safe**') && window.cacheSec.querySelector('.composer select').value === 'major'));
+  await q(() => window.cacheSec.querySelector('.composer .btn.primary').click());
+  await page.waitFor(() => !window.cacheSec.querySelector('.card.finding') && document.querySelector('#draft-count').textContent === '2');
+  check('drafted finding leaves the code', await q(() => document.querySelectorAll('section.file .card.finding').length === 2 && document.querySelector('#findings-badge').textContent === '3'));
+  await q(() => [...document.querySelectorAll('section.file .card.finding .link-btn')].find(b => b.textContent === 'Dismiss').click());
+  await page.waitFor(() => document.querySelectorAll('section.file .card.finding').length === 1);
+  check('dismissed finding leaves the code', true);
+  await q(() => document.querySelector('#findings-drawer [data-close]').click());
+
+  // ── flows: generate, walk through diff and viewer steps, leave
+  await q(() => [...document.querySelectorAll('#flows-card .btn')].find(b => b.textContent === 'Map flows').click());
+  await page.waitFor(() => document.querySelector('#flows-card .flow'), 8000);
+  const flow = await q(() => ({ name: document.querySelector('.flow-name').textContent, meta: document.querySelector('.flow-head .dim').textContent, dots: document.querySelectorAll('.flow-steps .changed-dot').length }));
+  check('flow listed with changed steps', flow.name === 'Handle a key request' && flow.meta === '5 steps · 2 on changed lines' && flow.dots === 2, JSON.stringify(flow));
+  await q(() => [...document.querySelectorAll('#flows-card .btn')].find(b => b.textContent.includes('Walk')).click());
+  const walkAt = () => q(() => ({
+    bar: document.querySelector('#walk-bar').hidden ? null : document.querySelector('.walk-count').textContent,
+    hl: [...document.querySelectorAll('tr.walk-hl')].map(tr => `${tr.closest('section.file') ? 'diff' : 'viewer'}:${tr.dataset.new}`),
+    note: !!document.querySelector('tr.walk-note .walk-note-box'),
+    warn: document.querySelector('#walk-bar .warn-text') ? document.querySelector('#walk-bar .warn-text').textContent : null,
+  }));
+  await page.waitFor(() => document.querySelector('tr.walk-hl'));
+  let w = await walkAt();
+  check('walk step 1 in the diff', w.bar === '1/5' && JSON.stringify(w.hl) === '["diff:4","diff:5"]' && w.note, JSON.stringify(w));
+  await page.key(']', { code: 'BracketRight', vk: 221 });
+  await page.waitFor(() => document.querySelector('.walk-count').textContent === '2/5' && document.querySelector('tr.walk-hl[data-new="7"]'));
+  await page.key(']', { code: 'BracketRight', vk: 221 });
+  await page.waitFor(() => document.querySelector('.walk-count').textContent === '3/5' && document.querySelector('tr.walk-hl'));
+  w = await walkAt();
+  check('walk step 3 in cache.rs', JSON.stringify(w.hl) === '["diff:16","diff:17","diff:18"]' && !!(await q(() => document.querySelector('tr.walk-note .walk-change'))), JSON.stringify(w));
+  await page.key(']', { code: 'BracketRight', vk: 221 });
+  await page.waitFor(() => document.querySelector('.walk-count').textContent === '4/5' && !document.querySelector('#viewer').hidden && document.querySelector('#viewer tr.walk-hl'));
+  w = await walkAt();
+  check('lines outside the diff walk in the viewer', JSON.stringify(w.hl) === '["viewer:1","viewer:2","viewer:3"]', JSON.stringify(w));
+  await page.shot('walk');
+  await page.key(']', { code: 'BracketRight', vk: 221 });
+  await page.waitFor(() => document.querySelector('.walk-count').textContent === '5/5');
+  w = await walkAt();
+  check('unverified step says why', w.warn && w.warn.includes('does not exist') && !w.hl.length, JSON.stringify(w));
+  await page.key('Escape', { vk: 27 });
+  check('Esc leaves the walk, keeps the viewer', await q(() => document.querySelector('#walk-bar').hidden && !document.querySelector('tr.walk-hl') && !document.querySelector('#viewer').hidden));
+
+  // ── viewer navigation: pattern outline, symbol popup without a server, history
+  await q(() => document.querySelector('#viewer .outline-btn').click());
+  await page.waitFor(() => document.querySelector('.outline-pop .outline-item'));
+  const ol = await q(() => ({ names: [...document.querySelectorAll('.outline-pop .outline-name')].map(e => e.textContent), foot: document.querySelector('.outline-foot').textContent, chip: document.querySelector('#viewer .lsp-chip').textContent }));
+  check('pattern outline', JSON.stringify(ol.names) === '["clamp","sum"]' && ol.foot === '2 symbols · name patterns' && ol.chip === 'text search', JSON.stringify(ol));
+  await q(() => [...document.querySelectorAll('.outline-pop .outline-item')][1].click());
+  check('outline jump is recorded', await q(() => !document.querySelector('#viewer .nav-btn[aria-label="Back"]').disabled));
+  const sym = await q(() => { const td = document.querySelector('#viewer tr[data-new="5"] td.code'); const n = [...td.querySelectorAll('*'), td].flatMap(e => [...e.childNodes]).find(x => x.nodeType === 3 && x.textContent.includes('sum')); const r = document.createRange(); r.setStart(n, n.textContent.indexOf('sum') + 1); r.setEnd(n, n.textContent.indexOf('sum') + 2); const b = r.getBoundingClientRect(); return { x: b.x + 1, y: b.y + b.height / 2 }; });
+  await page.click(sym.x, sym.y, { modifiers: 1 });
+  await page.waitFor(() => document.querySelector('.sym-popup .loc-file')).catch(async e => { console.log('DEBUG', JSON.stringify(sym), await q(() => (document.querySelector('.sym-popup') || {}).outerHTML || 'no popup')); throw e; });
+  check('Alt-click: grouped text matches', await q(() => document.querySelector('.sym-popup .sym-section').textContent.startsWith('Text matches') && document.querySelector('.sym-popup .loc-file').textContent.includes('src/math.js')));
+  await page.key('Escape', { vk: 27 });
+  await page.key('ArrowLeft', { modifiers: 1, vk: 37 });
+  await page.sleep(200);
+  check('Alt+← steps back, forward becomes possible', await q(() => !document.querySelector('#viewer').hidden && !document.querySelector('#viewer .nav-btn[aria-label="Forward"]').disabled));
+  await page.key('ArrowLeft', { modifiers: 1, vk: 37 });
+  await page.sleep(200);
+  check('Alt+← again returns to the diff where the walk started', await q(() => document.querySelector('#viewer').hidden));
+  await page.key('Escape', { vk: 27 });
+
   // ── review drawer: body persists across reload
   await q(() => document.activeElement.blur());
   await page.key('r');

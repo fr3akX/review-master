@@ -7,6 +7,15 @@ branch, its upstream, or the head commit — and it opens a local web UI:
 - a generated **PR summary** (why the change, things to note, change outline
   with clickable citations) appears at the top while you browse — cached per
   head commit, regenerate on demand;
+- **PR flows**: on request, the LLM maps the requests, commands or jobs the change
+  alters and you **walk each flow step by step** in execution order — every step
+  highlights its lines in the diff (or the file viewer for code outside it) with a
+  note on what happens there and what the PR changes; steps on changed lines are
+  marked (see [Flows](#flows));
+- **import another LLM's review** (a Markdown file, `--findings` or drag-and-drop):
+  every finding that cites `path:line` is shown **on that line**, with its severity;
+  turn the ones you agree with into draft comments, ask the chat about them, or
+  dismiss them (see [LLM findings](#llm-findings));
 - browse the changed files in a collapsible, filterable **directory tree**;
   per-file **diff view** with word-level highlights inside changed lines and
   expandable context between hunks, and a **file viewer** for the whole file
@@ -17,7 +26,7 @@ branch, its upstream, or the head commit — and it opens a local web UI:
   outdated ones flagged — reply in a thread (posted right away), or ask the
   LLM whether a comment has a point;
 - **keyboard-driven**: `j`/`k` files, `n`/`p` changes, `v` viewed, `/` filter,
-  `?` for the full list;
+  `]`/`[` flow steps, `Alt+←`/`→` back and forward through jumps, `?` for the full list;
 - **fold `#[cfg(test)]` modules** in diffs and the file viewer — boundaries come
   from rust-analyzer's symbol tree (text scanning only as fallback); test-only
   hunks collapse to one bar, folds remember their state per PR;
@@ -26,8 +35,11 @@ branch, its upstream, or the head commit — and it opens a local web UI:
   leave the diff, the counts, and what the LLM is told about, and the set
   persists per PR (restore any of it from the `· N excluded` chip);
 - **code navigation through language servers** (rust-analyzer, pyright,
-  tsserver, gopls, clangd, Metals): Cmd/Ctrl-click an identifier for hover,
-  definitions and references, with whole-word text search as the fallback;
+  tsserver, gopls, clangd, Metals for Scala): ⌘/Ctrl-click an identifier to jump to
+  its definition, Alt-click for hover, definitions and references grouped by file;
+  whole-word text search as the fallback; an outline of the viewed file (from the
+  server, or declaration patterns until it answers) that follows your scroll (see
+  [Code navigation](#code-navigation));
 - select code (lines or exact text) and **chat with an LLM about it**: it
   answers from a read-only checkout of the PR head, gets your exact selection,
   and its `path:line` citations are clickable jumps; a running answer can be
@@ -141,6 +153,7 @@ settings.
 | `--lsp LANG=COMMAND` | auto-detected on PATH | language server override; empty command disables one language |
 | `--no-lsp` | | disable language servers (navigation falls back to text search) |
 | `--lsp-import-build` | | let Metals import the build (runs the build tool) |
+| `--findings FILE` | | Markdown review whose `path:line` findings annotate the code (repeatable) |
 | `--exclude GLOB` | | drop files from the reviewed diff (repeatable, e.g. `--exclude '*.lock'`) |
 | `--timeout-mins` | 20 | time limit per chat turn |
 | `--cache-dir` | `.review-master` in the checkout | chat sessions and drafts |
@@ -149,6 +162,98 @@ settings.
 | `--anthropic-login` | | Claude subscription OAuth sign-in, then exit |
 | `--update` | | install the latest release now (installer installs), then exit |
 | `--no-update` | | skip the check for a newer release (also `REVIEW_MASTER_NO_UPDATE=1`) |
+
+## Code navigation
+
+- ⌘/Ctrl-click an identifier (diff or file viewer): jump to its definition when the
+  language server knows exactly one in the checkout, else the symbol popup.
+- Alt-click: the popup — hover text, definitions, **References** (grouped by file) and
+  **Text search** (whole-word matches across the checkout). Deleted lines are not in the
+  head checkout, so they only get text search.
+- Jumps (definitions, references, outline entries, `path:line` links in chat and
+  summaries) are recorded: `Alt+←` / `Alt+→` or **‹ ›** in the viewer go back and forth,
+  back to the scroll position you left.
+- **Outline** in the file viewer: the file's functions, classes and other declarations,
+  filterable, with the one you are reading marked as you scroll. It comes from the
+  language server once it answers; until then, and for files without one, declaration
+  patterns cover Rust, Python, JS/TS, Go, Java/Kotlin/C#/Swift, Scala, C/C++, Ruby, PHP,
+  shell and Markdown headings. The footer says which.
+- The viewer chip shows the server and its state (`starting…`, `indexing…`, ready,
+  `unavailable`, or `text search` for files no server handles).
+
+Servers are found on `PATH` and started on first use, one per language, in the
+reviewed checkout:
+
+| Language | Servers tried |
+| --- | --- |
+| Rust | `rust-analyzer` (falls back to the default rustup toolchain when the pinned one lacks the component) |
+| Python | `pyright-langserver --stdio`, `basedpyright-langserver --stdio`, `pylsp`, `jedi-language-server` |
+| TypeScript / JavaScript | `typescript-language-server --stdio` |
+| Go | `gopls` |
+| C / C++ | `clangd` |
+| Scala (`.scala`, `.sc`, `.sbt`) | `metals` |
+
+`--lsp LANG=COMMAND` overrides one (`--lsp scala="cs launch metals"`), an empty command
+disables it, `--no-lsp` disables all. Language servers can run project tooling; use
+`--no-lsp` on repositories you do not trust.
+
+### Scala
+
+Install Metals with [coursier](https://get-coursier.io) (needs a JDK): `cs install metals`.
+By default review-master declines Metals' build import, so nothing in the project runs:
+the outline and hover within a file work, while definitions and references across files
+fall back to text search. `--lsp-import-build` imports the build (sbt, Mill, Gradle, …
+through Bloop), which runs the build definition, downloads dependencies and compiles —
+minutes the first time. In PR mode the checkout is a temporary worktree that is removed
+on exit, so the import (`.bloop/`, `.metals/`) is redone on every run; review from a
+checkout that is already on the PR head (or pass its path) to keep it. Metals' and
+Bloop's directories stay out of searches and the LLM's tools. Test files by JVM naming
+(`FooSpec.scala`, `FooSuite.scala`, `FooTest.java`, `src/it/…`) count as tests for
+**Exclude tests**.
+
+## Flows
+
+The **Flows** card under the summary maps the change in execution order. **Map flows**
+asks the engine (read-only, a minute or so) for the 1–4 end-to-end paths — a request,
+command, event or job — whose behavior the change adds or alters, each as 3–25 steps
+from the entry point to the outcome. Every step is a line range at the PR head with
+what the code does there and what the PR changes at that step; ranges are checked
+against the files (made-up ones are flagged), and steps that touch added or removed
+lines are marked ●. The result is cached per head commit; ↻ regenerates it.
+
+**▶ Walk** (or a step in the list) starts the walkthrough: the step's lines are
+highlighted in the file's diff, or in the file viewer when they are outside it, with a
+note below them. `]` / `[` (or ◀ ▶) step, `Space` plays with the chosen speed, `Esc`
+leaves; `Alt+←` then returns to where the walk started.
+
+## LLM findings
+
+Have another model review the change, then import its Markdown: `--findings
+review.md` (repeatable), **Import Markdown…** or paste in the **Findings** drawer (`f`),
+or drop the file on the page. Importing the same file name again replaces its
+findings and keeps what you dismissed.
+
+The review can take most shapes models produce: a heading per finding, bullets under
+severity headings (`## Critical`, `## Nits`), or fields (`**Location:** …`,
+`**Severity:** High`). A finding is a section or bullet that cites a location —
+`src/a.rs:12`, `a.rs:12-18`, `path#L12-L18`, `path (lines 12-18)`, GitHub blob URLs.
+Paths are matched to the checkout through diff prefixes (`a/`, `b/`), longer paths
+and bare names of changed files. Severities map to blocker / major / minor / nit
+(`critical`, `high`, `low`, `P1`, 🔴 … are understood); sections without a location
+and overview sections (Summary, Verdict, …) are listed as not imported.
+
+Each finding sits on its line in the diff (or the viewer), and in the sidebar count
+(`⚑`). **Draft** opens a comment prefilled with it — you edit and save it like any
+draft; **Ask** opens a chat about it; **Dismiss** hides it. The drawer lists them all,
+flags locations that could not be placed, and restores dismissed ones. Nothing from an
+imported review is posted unless you save it as a draft.
+
+A prompt that works well with any model:
+
+```
+Review this PR. For each finding write a "### [severity] title (path:line)" heading,
+severity one of blocker/major/minor/nit, then the explanation.
+```
 
 ## Tests
 
@@ -170,4 +275,5 @@ overrides the macOS default path, `--keep` leaves screenshots behind).
   conversation list itself is kept in the cache dir, so it is back after a
   restart; delete a conversation from the chat drawer.
 - Viewed marks, panel widths and fold choices live in the browser's
-  localStorage; drafts, conversations, scope and the summary in the cache dir.
+  localStorage; drafts, conversations, scope, the summary, flows and imported
+  findings in the cache dir.

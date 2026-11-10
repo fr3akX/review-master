@@ -351,6 +351,7 @@ li.active .file-item { border-left-color: var(--accent); background: var(--accen
 li.viewed .nav-check { display: inline; }
 li.viewed .file-item .base { color: var(--fg-dim); font-weight: 400; }
 .nav-remote { color: var(--fg-dim); font-size: 10px; white-space: nowrap; }
+.nav-findings { color: var(--orange); font-size: 10px; white-space: nowrap; }
 .nav-drafts {
   padding: 0 5px;
   border-radius: 999px;
@@ -483,6 +484,33 @@ li.viewed .file-item .base { color: var(--fg-dim); font-weight: 400; }
 .summary-status { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
 .summary-body { display: flex; flex-direction: column; gap: 8px; padding: 10px 14px; }
 .summary-text { font-size: 13px; }
+.flows-card { margin-top: 12px; }
+.flow { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius); }
+.flow.walking { border-color: var(--accent); }
+.flow-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.flow-name { font-size: 13px; }
+.flow-head .dim { font-size: 12px; }
+.flow-desc { font-size: 13px; }
+.flow-steps > summary { color: var(--fg-dim); font-size: 12px; cursor: pointer; user-select: none; }
+.flow-steps ol { margin: 4px 0 0; padding-left: 24px; font-size: 12px; }
+.flow-steps li.current { background: var(--accent-soft); border-radius: 4px; }
+.flow-steps li.unverified { opacity: 0.6; }
+.flow-step {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 4px;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.flow-step:hover { background: var(--bg-soft); }
+.flow-step .tag { flex: none; }
+.flow-step-title { min-width: 0; }
+.flow-step code { margin-left: auto; font-size: 11px; white-space: nowrap; }
+.changed-dot { color: var(--orange); font-size: 11px; white-space: nowrap; }
 
 section.file {
   position: relative;
@@ -595,6 +623,10 @@ body.drawer-open .viewer { right: var(--drawer-w); }
 .outline-item .tag { flex: none; }
 .outline-name { font-family: var(--mono); }
 .outline-detail { min-width: 0; overflow: hidden; color: var(--fg-faint); font-family: var(--mono); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
+.outline-item.current { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.outline-foot { flex: none; padding: 4px 12px 6px; border-top: 1px solid var(--border-soft); color: var(--fg-faint); font-size: 11px; }
+.nav-btn { flex: none; font-size: 16px; }
+.nav-btn:disabled { opacity: 0.35; cursor: default; }
 .viewer-head {
   display: flex;
   flex: none;
@@ -784,6 +816,50 @@ button.loc:hover { background: var(--accent-soft); }
 
 .lsp-chip { font-family: var(--mono); }
 .lsp-chip.lsp-failed { border-color: var(--red); color: var(--red); }
+.lsp-chip.lsp-none { color: var(--fg-faint); }
+.sym-actions { display: flex; gap: 6px; }
+.loc-file { margin-top: 4px; font-family: var(--mono); font-size: 11px; font-weight: 600; overflow-wrap: anywhere; }
+.loc-groups .loc-list { padding-left: 8px; }
+
+/* flow walkthrough: the step's lines, a note under them, the bar at the bottom */
+.ln-row.walk-hl td.code, .ln-row.walk-hl td.mk { background-image: linear-gradient(var(--accent-soft), var(--accent-soft)); }
+.ln-row.walk-hl td.ln { box-shadow: inset 3px 0 0 var(--accent); color: var(--fg); }
+tr.walk-note > td {
+  padding: 8px 16px 8px 82px;
+  border-top: 1px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+  background: var(--bg-soft);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.code-table.diff tr.walk-note > td { padding-left: 132px; }
+.walk-note-box { display: flex; flex-direction: column; gap: 6px; max-width: 860px; }
+.walk-note-head { display: flex; align-items: center; gap: 8px; }
+.walk-change { padding: 4px 8px; border-left: 3px solid var(--orange); background: var(--warn-bg); border-radius: 0 4px 4px 0; }
+.walk-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: min(980px, calc(100vw - 32px));
+  padding: 6px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  font-size: 13px;
+  transform: translateX(-50%);
+}
+.walk-flow { flex: none; max-width: 30%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.walk-count { flex: none; color: var(--fg-dim); font-family: var(--mono); font-size: 12px; }
+.walk-title { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.walk-bar code { flex: none; font-size: 11px; }
+.warn-text { color: var(--amber); font-size: 12px; white-space: nowrap; }
+.walk-speed { flex: none; }
 
 /* ───────── cards, composer, severity ───────── */
 
@@ -804,6 +880,19 @@ button.loc:hover { background: var(--accent-soft); }
 /* comment threads already on the PR */
 .card.remote { border-left: 3px solid var(--purple); }
 .card.remote.outdated { border-left-color: var(--fg-faint); }
+/* imported LLM findings */
+.card.finding { border-left: 3px solid var(--accent); border-style: solid dashed dashed solid; }
+.card.finding.edge-blocker { border-left-color: var(--red); }
+.card.finding.edge-major { border-left-color: var(--orange); }
+.card.finding.edge-nit { border-left-color: var(--fg-faint); }
+.tag-llm { border-color: var(--purple); color: var(--purple); }
+.findings-import { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.findings-paste { min-height: 60px; font-family: var(--mono); font-size: 12px; }
+.findings-notice { margin: 10px 0 0; font-size: 12px; }
+.findings-sources { margin: 0; padding: 0; list-style: none; font-size: 12px; }
+.findings-sources li { display: flex; align-items: center; gap: 6px; }
+.findings-list-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.finding-row.st-dismissed .rd-first, .finding-row.st-drafted .rd-first { text-decoration: line-through; }
 .remote-comment + .remote-comment { border-top: 1px solid var(--border-soft); }
 .remote-comment .card-head { border-bottom: 0; padding-bottom: 0; }
 .remote-comment .card-body { padding-top: 4px; }

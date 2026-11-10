@@ -2,6 +2,7 @@
 //! repository-relative paths resolved through here, so symlink escapes and
 //! `..` traversal never leave the reviewed checkout.
 
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 /// Resolve a repository-relative (or absolute, inside `root`) path. `root` must be
@@ -29,6 +30,22 @@ pub fn resolve(root: &Path, raw: &str) -> Result<(PathBuf, String), String> {
         .to_string_lossy()
         .into_owned();
     Ok((full, if shown.is_empty() { ".".into() } else { shown }))
+}
+
+/// Lines in a file as diffs number them: a final newline ends the last line.
+pub fn line_count(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    newlines + usize::from(bytes.last().is_some_and(|&b| b != b'\n'))
+}
+
+/// A confined, readable file's display path and line count.
+pub fn file_lines(root: &Path, raw: &str) -> Result<(String, usize), String> {
+    let (full, shown) = resolve(root, raw)?;
+    if !full.is_file() {
+        return Err("not a readable file".into());
+    }
+    let bytes = fs::read(&full).map_err(|_| "not a readable file".to_string())?;
+    Ok((shown, line_count(&bytes)))
 }
 
 #[cfg(test)]
@@ -75,5 +92,12 @@ mod tests {
         // The target must exist for canonicalize to succeed; the temp dir always does.
         std::os::unix::fs::symlink(std::env::temp_dir(), repo.0.join("escape")).unwrap();
         assert_eq!(resolve(&repo.0, "escape").unwrap_err(), "outside the repository");
+    }
+
+    #[test]
+    fn lines_are_counted_like_diff_line_numbers() {
+        for (text, want) in [("", 0), ("a", 1), ("a\n", 1), ("a\nb", 2), ("a\nb\n", 2), ("\n", 1), ("a\n\n", 2)] {
+            assert_eq!(line_count(text.as_bytes()), want, "{text:?}");
+        }
     }
 }

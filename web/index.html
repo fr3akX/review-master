@@ -19,6 +19,7 @@
       <span id="engine-chip" class="chip engine" title="Review engine"></span>
       <button id="btn-help" class="btn" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
       <button id="btn-chat" class="btn" type="button" title="Chat (c)">Chat</button>
+      <button id="btn-findings" class="btn" type="button" title="LLM findings (f)">Findings <span id="findings-badge" class="count-badge" hidden>0</span></button>
       <button id="btn-review" class="btn primary" type="button" title="Review drawer (r)">Review <span id="draft-count" class="count-badge" hidden>0</span></button>
     </div>
   </header>
@@ -38,6 +39,9 @@
           <input id="show-remote" type="checkbox"> <span id="remote-count"></span>
         </label>
         <button id="remote-retry" class="link-btn" type="button" hidden>PR comments failed · retry</button>
+        <label id="findings-toggle" class="pill-toggle" title="Show the imported LLM findings on the code" hidden>
+          <input id="show-findings" type="checkbox"> <span id="findings-count"></span>
+        </label>
         <span class="spacer"></span>
         <span id="viewed-count" class="dim" title="Files marked viewed (v)"></span>
         <div id="viewed-progress" class="viewed-progress" aria-hidden="true"><div id="viewed-bar"></div></div>
@@ -48,6 +52,7 @@
 
     <main id="main">
       <section id="summary-card" class="summary-card" aria-label="PR summary" hidden></section>
+      <section id="flows-card" class="summary-card flows-card" aria-label="Flows" hidden></section>
       <div id="sections"></div>
     </main>
 
@@ -83,6 +88,16 @@
       </div>
       <div id="review-body" class="drawer-body"></div>
     </aside>
+
+    <aside id="findings-drawer" class="drawer" aria-label="LLM findings" hidden>
+      <div class="resizer" data-resize="drawer" title="Drag to resize, double-click to reset"></div>
+      <div class="drawer-head">
+        <h2>LLM findings</h2>
+        <span class="spacer"></span>
+        <button class="icon-btn" type="button" data-close aria-label="Close">×</button>
+      </div>
+      <div id="findings-body" class="drawer-body"></div>
+    </aside>
   </div>
 
   <div id="viewer" class="viewer" hidden>
@@ -91,6 +106,8 @@
       <div id="viewer-scroll" class="viewer-scroll"></div>
     </div>
   </div>
+
+  <div id="walk-bar" class="walk-bar" role="toolbar" aria-label="Flow walkthrough" hidden></div>
 
   <div id="toasts" aria-live="polite"></div>
 

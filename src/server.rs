@@ -7,7 +7,7 @@ use crate::engine::Engine;
 use crate::lsp::Lsp;
 use crate::pr::{PrMeta, PrRef};
 use crate::review::{self, Finding};
-use crate::{post, search, verify};
+use crate::{findings, flows, post, search, verify};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -44,6 +44,9 @@ pub struct AppState {
     scope_file: PathBuf,
     summary: Mutex<SummaryState>,
     summary_file: PathBuf,
+    flows: Mutex<FlowsState>,
+    flows_file: PathBuf,
+    findings: Mutex<findings::Store>,
     pub engine: Engine,
     /// The `gh` login, for own-PR hints in the UI.
     pub viewer: Option<String>,
@@ -91,6 +94,8 @@ impl AppState {
         scope_file: PathBuf,
         summary_file: PathBuf,
         threads_file: PathBuf,
+        findings_file: PathBuf,
+        flows_file: PathBuf,
         lsp: Lsp,
     ) -> Arc<AppState> {
         let stored: StoredScope = fs::read(&scope_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -101,6 +106,11 @@ impl AppState {
             .and_then(|b| serde_json::from_slice::<StoredSummary>(&b).ok())
             .filter(|s| s.head == head_sha)
             .map(|s| s.summary);
+        let stored_flows = fs::read(&flows_file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<StoredFlows>(&b).ok())
+            .filter(|s| s.head == head_sha && s.version == flows::VERSION)
+            .map(|s| s.flows);
         Arc::new(AppState {
             root,
             pr,
@@ -113,6 +123,9 @@ impl AppState {
             scope_file,
             summary: Mutex::new(SummaryState { text: summary_text, job: None }),
             summary_file,
+            flows: Mutex::new(FlowsState { flows: stored_flows, job: None }),
+            flows_file,
+            findings: Mutex::new(findings::Store::load(findings_file)),
             engine,
             viewer,
             lsp,
@@ -129,6 +142,14 @@ impl AppState {
             Some((r, m)) => review::Subject::pr(r, m, &self.head_sha),
             None => review::Subject::local(&self.branch, &self.head_sha, self.dirty),
         }
+    }
+
+    /// Import an LLM review (Markdown) as findings, replacing an earlier import of the same name.
+    pub fn import_findings(&self, name: &str, text: &str) -> findings::Imported {
+        let mut store = self.findings.lock().unwrap();
+        let imported = store.import(name, text, &self.root, &self.full);
+        store.save();
+        imported
     }
 
     /// Everything not in this review, for the chat prompt.
@@ -324,6 +345,9 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/submit", post_to(submit))
         .route("/api/scope", post_to(set_scope))
         .route("/api/summary", get(get_summary).post(regenerate_summary))
+        .route("/api/flows", get(get_flows).post(generate_flows))
+        .route("/api/findings", get(list_findings).post(import_findings).delete(remove_findings))
+        .route("/api/findings/{id}", post_to(set_finding_status))
         .route("/api/folds", get(folds))
         .route("/api/search", get(text_search))
         .route("/api/lsp/status", get(lsp_status))
@@ -425,14 +449,8 @@ async fn file_diff(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) 
         .flatten()
         .filter(|(full, _)| fs::metadata(full).is_ok_and(|m| m.is_file() && m.len() <= MAX_SOURCE_BYTES))
         .and_then(|(full, _)| fs::read(full).ok())
-        .map(|bytes| line_count(&bytes));
+        .map(|bytes| verify::line_count(&bytes));
     Ok(Json(json!({ "path": file.path, "hunks": hunks, "new_lines": new_lines })))
-}
-
-/// Lines in a file as diffs number them: a final newline ends the last line.
-fn line_count(bytes: &[u8]) -> usize {
-    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
-    newlines + usize::from(bytes.last().is_some_and(|&b| b != b'\n'))
 }
 
 /// Language hint for the UI: the lowercased file extension.
@@ -1043,8 +1061,8 @@ struct StoredSummary {
     summary: String,
 }
 
-/// Diff budget for the summary prompt; files beyond it are listed instead.
-const MAX_SUMMARY_DIFF_BYTES: usize = 384 * 1024;
+/// Diff budget for whole-change prompts (summary, flows); files beyond it are listed instead.
+const MAX_PROMPT_DIFF_BYTES: usize = 384 * 1024;
 
 fn summary_schema() -> Value {
     json!({
@@ -1060,13 +1078,37 @@ struct SummaryAnswer {
     summary: String,
 }
 
-fn summary_prompt(st: &AppState) -> String {
+/// What is being reviewed, with the PR description: the opening of whole-change prompts.
+fn subject_block(st: &AppState) -> String {
     let subject = st.subject();
     let mut p = subject.heading;
     let description: String = subject.description.trim().chars().take(4000).collect();
     if !description.is_empty() {
         p.push_str(&format!("\n<description>\n{description}\n</description>\n"));
     }
+    p
+}
+
+/// The whole change's diff for a prompt, within the budget.
+fn diff_block(model: &Model) -> String {
+    let mut diff_text = String::new();
+    let mut deferred: Vec<&str> = Vec::new();
+    for file in &model.files {
+        if diff_text.len() < MAX_PROMPT_DIFF_BYTES {
+            Model::render_file(file, &mut diff_text);
+        } else {
+            deferred.push(&file.path);
+        }
+    }
+    let mut p = format!("\n<diff>\n{diff_text}</diff>\n");
+    if !deferred.is_empty() {
+        p.push_str(&format!("\nAlso changed, diff omitted for size (read them if relevant): {}\n", deferred.join(", ")));
+    }
+    p
+}
+
+fn summary_prompt(st: &AppState) -> String {
+    let mut p = subject_block(st);
     p.push_str(
         "\nWrite the summary a reviewer should read before the diff. Markdown, exactly these sections:\n\
 ## Why the change\nExactly one sentence: the problem this solves and what becomes possible.\n\
@@ -1080,19 +1122,7 @@ written as one human explaining to another.\n\
 Investigate with the repository tools when the diff alone is not enough; verify cited line numbers by \
 reading the files.\n",
     );
-    let mut diff_text = String::new();
-    let mut deferred: Vec<&str> = Vec::new();
-    for file in &st.full.files {
-        if diff_text.len() < MAX_SUMMARY_DIFF_BYTES {
-            Model::render_file(file, &mut diff_text);
-        } else {
-            deferred.push(&file.path);
-        }
-    }
-    p.push_str(&format!("\n<diff>\n{diff_text}</diff>\n"));
-    if !deferred.is_empty() {
-        p.push_str(&format!("\nAlso changed, diff omitted for size (read them if relevant): {}\n", deferred.join(", ")));
-    }
+    p.push_str(&diff_block(&st.full));
     p
 }
 
@@ -1156,6 +1186,159 @@ fn spawn_summary(st: Arc<AppState>) -> ApiResult {
         }
     });
     Ok(Json(json!({ "summary": null, "job": job_id })))
+}
+
+// ---- flows ------------------------------------------------------------------
+
+#[derive(Default)]
+struct FlowsState {
+    flows: Option<flows::Flows>,
+    job: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredFlows {
+    head: String,
+    version: u32,
+    flows: flows::Flows,
+}
+
+fn job_running(st: &AppState, id: u64) -> bool {
+    st.jobs.lock().unwrap().by_id.get(&id).is_some_and(|j| !j.inner.lock().unwrap().done)
+}
+
+/// The flows of this change, cached per head commit; generated only on request.
+async fn get_flows(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let f = st.flows.lock().unwrap();
+    let job = f.job.filter(|&id| job_running(&st, id));
+    Json(json!({ "flows": f.flows.as_ref().map(|x| &x.flows), "job": job }))
+}
+
+/// Generate the flows afresh; a generation already running is returned instead.
+async fn generate_flows(State(st): State<Arc<AppState>>) -> ApiResult {
+    if let Some(job) = st.flows.lock().unwrap().job.filter(|&id| job_running(&st, id)) {
+        return Ok(Json(json!({ "job": job })));
+    }
+    let job = new_job(&mut st.jobs.lock().unwrap());
+    st.flows.lock().unwrap().job = Some(job.id);
+    let job_id = job.id;
+    let name = match &st.pr {
+        Some((r, _)) => format!("review-master: flows {}#{}", r.slug(), r.number),
+        None => format!("review-master: flows {}", st.branch),
+    };
+    let st2 = st.clone();
+    tokio::spawn(async move {
+        let prompt = flows::prompt(&subject_block(&st2), &diff_block(&st2.full));
+        let result = async {
+            let session = st2.engine.start_session(&name).await?;
+            let progress = |line: String| job.push(line);
+            let out = st2.engine.turn::<flows::Flows>(&session, &prompt, &flows::schema(), &job.cancel, progress).await?;
+            Ok::<flows::Flows, String>(out.answer)
+        }
+        .await;
+        match result {
+            Ok(mut found) => {
+                flows::verify(&st2.root, &st2.full, &mut found);
+                let stored = StoredFlows { head: st2.head_sha.clone(), version: flows::VERSION, flows: found.clone() };
+                if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+                    let _ = fs::write(&st2.flows_file, bytes);
+                }
+                let response = json!({ "flows": found.flows });
+                {
+                    let mut f = st2.flows.lock().unwrap();
+                    f.flows = Some(found);
+                    f.job = None;
+                }
+                job.finish(Ok(response));
+            }
+            Err(e) => {
+                st2.flows.lock().unwrap().job = None;
+                job.finish(Err(e));
+            }
+        }
+    });
+    Ok(Json(json!({ "job": job_id })))
+}
+
+// ---- imported findings ------------------------------------------------------
+
+/// Every finding, with why it could not become an inline comment (`anchor_problem`),
+/// plus the imported documents in import order.
+fn findings_json(st: &AppState) -> Value {
+    let store = st.findings.lock().unwrap();
+    let scope = st.scope.lock().unwrap();
+    let items: Vec<Value> = store
+        .items
+        .iter()
+        .map(|f| {
+            let side = if f.side == "LEFT" { Side::Left } else { Side::Right };
+            let mut v = json!(f);
+            v["anchor_problem"] = json!(scope.anchors.check(&f.path, side, f.start, f.line).err());
+            v
+        })
+        .collect();
+    let mut sources: Vec<&str> = Vec::new();
+    for f in &store.items {
+        if !sources.contains(&f.source.as_str()) {
+            sources.push(&f.source);
+        }
+    }
+    json!({ "findings": items, "sources": sources })
+}
+
+async fn list_findings(State(st): State<Arc<AppState>>) -> Json<Value> {
+    Json(findings_json(&st))
+}
+
+#[derive(Deserialize)]
+struct ImportRequest {
+    /// File name of the document; an import of the same name replaces the earlier one.
+    #[serde(default)]
+    name: String,
+    text: String,
+}
+
+async fn import_findings(State(st): State<Arc<AppState>>, Json(req): Json<ImportRequest>) -> ApiResult {
+    if req.text.trim().is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "the document is empty"));
+    }
+    let base = req.name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let name: String = if base.is_empty() { "pasted.md".to_owned() } else { base.chars().take(120).collect() };
+    let imported = st.import_findings(&name, &req.text);
+    let mut out = findings_json(&st);
+    out["imported"] = json!({ "source": name, "added": imported.added, "skipped": imported.skipped });
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct FindingStatusRequest {
+    status: String,
+}
+
+/// Dismiss a finding, mark it as turned into a draft, or reopen it.
+async fn set_finding_status(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>, Json(req): Json<FindingStatusRequest>) -> ApiResult {
+    {
+        let mut store = st.findings.lock().unwrap();
+        store.set_status(id, &req.status).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        store.save();
+    }
+    Ok(Json(findings_json(&st)))
+}
+
+#[derive(Deserialize)]
+struct SourceQuery {
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Forget one imported document's findings, or all of them.
+async fn remove_findings(State(st): State<Arc<AppState>>, Query(q): Query<SourceQuery>) -> Json<Value> {
+    {
+        let mut store = st.findings.lock().unwrap();
+        store.remove(q.source.as_deref());
+        store.save();
+    }
+    Json(findings_json(&st))
 }
 
 // ---- test folds -------------------------------------------------------------
@@ -1286,16 +1469,4 @@ async fn folds(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> A
     ranges.sort_unstable();
     let test_folds: Vec<Value> = ranges.iter().map(|(s, e)| json!([s, e])).collect();
     Ok(Json(json!({ "test_folds": test_folds, "source": source })))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lines_are_counted_like_diff_line_numbers() {
-        for (text, want) in [("", 0), ("a", 1), ("a\n", 1), ("a\nb", 2), ("a\nb\n", 2), ("\n", 1), ("a\n\n", 2)] {
-            assert_eq!(line_count(text.as_bytes()), want, "{text:?}");
-        }
-    }
 }

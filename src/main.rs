@@ -13,6 +13,8 @@ mod config;
 mod configure;
 mod diff;
 mod engine;
+mod findings;
+mod flows;
 mod lsp;
 mod native;
 mod openai;
@@ -97,6 +99,10 @@ struct Args {
     /// Exclude files matching this glob from the reviewed diff (repeatable)
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
+    /// LLM review notes to annotate the code with: a Markdown file whose findings cite
+    /// `path:line` (repeatable; also importable from the UI)
+    #[arg(long, value_name = "FILE")]
+    findings: Vec<PathBuf>,
     /// Set up the global configuration interactively (engine, model, OpenAI server)
     /// and exit; also offered on the first interactive launch without one
     #[arg(long)]
@@ -296,6 +302,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if change.model.files.is_empty() {
         return Err("nothing to review: the diff is empty after exclusions".into());
     }
+    let reviews: Vec<(String, String)> = args
+        .findings
+        .iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(p).map_err(|e| format!("--findings {}: {e}", p.display()))?;
+            let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+            Ok((name, text))
+        })
+        .collect::<Result<_, String>>()?;
 
     let cache_dir = args.cache_dir.clone().unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
@@ -344,8 +359,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache_dir.join(format!("scope-{draft_key}.json")),
         cache_dir.join(format!("summary-{draft_key}.json")),
         cache_dir.join(format!("threads-{draft_key}.json")),
+        cache_dir.join(format!("findings-{draft_key}.json")),
+        cache_dir.join(format!("flows-{draft_key}.json")),
         lsp,
     );
+    for (name, text) in &reviews {
+        let imported = state.import_findings(name, text);
+        let skipped = if imported.skipped.is_empty() { String::new() } else { format!("; {} section(s) without a file:line left out", imported.skipped.len()) };
+        println!("  findings: {} from {name}{skipped}", imported.added);
+    }
     let listener = match tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await {
         Ok(l) => l,
         Err(e) => {
