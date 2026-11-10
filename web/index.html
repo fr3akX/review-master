@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>review-master</title>
+  <link rel="stylesheet" href="/vendor/highlight.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">review-master</div>
+    <div class="pr-info">
+      <div id="pr-title" class="pr-title">Loading…</div>
+      <div id="pr-meta" class="pr-meta"></div>
+    </div>
+    <div class="top-actions">
+      <span id="engine-chip" class="chip engine" title="Review engine"></span>
+      <button id="btn-chat" class="btn" type="button">Chat</button>
+      <button id="btn-review" class="btn primary" type="button">Review <span id="draft-count" class="count-badge" hidden>0</span></button>
+    </div>
+  </header>
+
+  <div id="banner" hidden></div>
+
+  <div id="layout">
+    <nav id="sidebar" aria-label="Changed files">
+      <div class="side-head">
+        <span class="side-title">Files changed</span>
+        <span id="file-summary" class="dim"></span>
+      </div>
+      <ul id="file-list"></ul>
+    </nav>
+
+    <main id="main">
+      <div id="sections"></div>
+    </main>
+
+    <aside id="chat-drawer" class="drawer" aria-label="Chat" hidden>
+      <div class="drawer-head">
+        <h2>Chat</h2>
+        <span class="spacer"></span>
+        <button id="chat-new" class="btn small" type="button" title="Ask about the whole pull request">New question</button>
+        <button class="icon-btn" type="button" data-close aria-label="Close">×</button>
+      </div>
+      <div id="thread-list" class="thread-list"></div>
+      <div class="convo">
+        <div id="convo-head" class="convo-head"></div>
+        <div id="messages" class="messages"></div>
+        <div class="chat-compose">
+          <textarea id="chat-input" rows="3" placeholder="Ask about this code… (Ctrl+Enter to send)"></textarea>
+          <div class="compose-row">
+            <span class="hint">Ctrl+Enter to send</span>
+            <span class="spacer"></span>
+            <button id="chat-send" class="btn primary small" type="button">Send</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <aside id="review-drawer" class="drawer" aria-label="Submit review" hidden>
+      <div class="drawer-head">
+        <h2>Submit review</h2>
+        <span class="spacer"></span>
+        <button class="icon-btn" type="button" data-close aria-label="Close">×</button>
+      </div>
+      <div id="review-body" class="drawer-body"></div>
+    </aside>
+  </div>
+
+  <div id="toasts" aria-live="polite"></div>
+
+  <script src="/vendor/highlight.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

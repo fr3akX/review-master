@@ -5,6 +5,7 @@ edition = "2021"
 description = "review-master: agent pull-request reviews posted as line-anchored inline comments"
 
 [dependencies]
+axum = "0.8"
 base64 = "0.23.1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3.34"

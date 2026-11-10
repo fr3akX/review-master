@@ -1,8 +1,8 @@
-//! review-master: agent pull-request reviews posted as line-anchored inline
-//! comments. The review runs like cxplr's explorations — Codex app-server,
-//! Claude Code, native Anthropic Messages or any OpenAI-compatible model over a
-//! read-only checkout — but the subject is a PR head and the answer is one
-//! GitHub review whose findings sit on the exact diff lines.
+//! review-master: review a pull request (or a local worktree) in a browser UI —
+//! diffs, full files with highlighted changes, line-anchored LLM chat, draft
+//! comments — and submit one GitHub review with inline comments. The LLM side
+//! runs like cxplr: Codex app-server, Claude Code, native Anthropic Messages or
+//! any OpenAI-compatible model over a read-only checkout.
 
 mod anthropic;
 mod anthropic_auth;
@@ -20,6 +20,7 @@ mod pr;
 mod repo;
 mod repo_tools;
 mod review;
+mod server;
 mod term;
 mod verify;
 
@@ -28,13 +29,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Review a GitHub pull request with an agent and post the findings as
-/// line-anchored inline comments.
+/// Review a GitHub pull request (or a local worktree) in a local web UI and
+/// post the findings as line-anchored inline comments.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Pull request: URL, <owner>/<repo>#<number>, or a bare number
-    /// (resolved against the checkout's GitHub origin)
+    /// Pull request: URL, <owner>/<repo>#<number>, or a bare number (resolved
+    /// against the checkout's GitHub origin). Omitted: review the worktree's
+    /// change against the default branch (browse and chat; no submitting)
     pr: Option<String>,
     /// Local checkout of the repository; the PR head is fetched into a
     /// temporary worktree when the checkout is not already on it
@@ -62,18 +64,21 @@ struct Args {
     /// Sign into native Anthropic with Claude subscription OAuth and exit
     #[arg(long)]
     anthropic_login: bool,
-    /// Time limit for the review, in minutes
+    /// Time limit for one agent turn (review or chat), in minutes
     #[arg(long, default_value_t = 20)]
     timeout_mins: u64,
-    /// Cache directory for agent sessions (default: `.review-master` in the checkout)
+    /// Cache directory for agent sessions and drafts (default: `.review-master`
+    /// in the checkout)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// Review event to submit; auto follows the model's verdict
-    #[arg(long, value_enum, default_value_t = EventArg::Auto)]
-    event: EventArg,
-    /// Print the review and the exact API payload instead of posting
+    /// Address to serve the UI on; keep it on loopback
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(long, default_value_t = 7979)]
+    port: u16,
+    /// Do not open the browser
     #[arg(long)]
-    dry_run: bool,
+    no_open: bool,
     /// Exclude files matching this glob from the reviewed diff (repeatable)
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
@@ -81,14 +86,6 @@ struct Args {
     /// and exit; also offered on the first interactive launch without one
     #[arg(long)]
     configure: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum EventArg {
-    Auto,
-    Comment,
-    Approve,
-    RequestChanges,
 }
 
 /// Engine settings resolved from flags, the environment and the configuration.
@@ -122,38 +119,100 @@ async fn start_engine(kind: engine::Kind, model: Option<String>, o: &EngineOpts,
     })
 }
 
-/// Drop `--exclude`d files from the diff; then, over the budget, defer whole
-/// files to the excluded note rather than cutting a file mid-hunk.
-fn filter_diff(text: String, exclude: &[String]) -> Result<(String, Vec<String>), String> {
+/// Drop `--exclude`d files from the model, in place.
+fn apply_excludes(model: &mut diff::Model, exclude: &[String]) -> Result<Vec<String>, String> {
     let mut set = globset::GlobSetBuilder::new();
     for glob in exclude {
         set.add(globset::Glob::new(glob).map_err(|e| format!("--exclude {glob}: {e}"))?);
     }
     let set = set.build().map_err(|e| e.to_string())?;
-    if exclude.is_empty() && text.len() <= review::MAX_DIFF_BYTES {
-        return Ok((text, Vec::new()));
-    }
-    let mut kept = String::new();
-    let mut skipped = Vec::new();
-    for (path, segment) in diff::split_files(&text) {
-        if set.is_match(&path) || kept.len() + segment.len() > review::MAX_DIFF_BYTES {
-            skipped.push(path);
-        } else {
-            kept.push_str(&segment);
+    Ok(model.retain(|f| !set.is_match(&f.path)))
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// What a run reviews, however it was acquired.
+struct Change {
+    /// `Some` in PR mode.
+    pr: Option<(pr::PrRef, pr::PrMeta)>,
+    /// Directory the agent works in (worktree or the repo itself).
+    root: PathBuf,
+    head_sha: String,
+    branch: String,
+    dirty: bool,
+    model: diff::Model,
+    skipped: Vec<String>,
+    /// Keeps a temporary worktree alive (and removes it on drop).
+    _checkout: Option<pr::Checkout>,
+}
+
+fn acquire(args: &Args, repo: &repo::Repo) -> Result<Change, String> {
+    let origin = pr::origin_slug(&repo.root);
+    let Some(raw) = args.pr.as_deref() else {
+        // Local mode: the worktree's change against the default branch.
+        let local = pr::local_change(&repo.root)?;
+        let mut model = diff::Model::parse(&local.diff_text);
+        let skipped = apply_excludes(&mut model, &args.exclude)?;
+        if let Some((owner, name)) = &origin {
+            if let Some(n) = pr::pr_for_branch(&format!("{owner}/{name}"), &local.branch) {
+                eprintln!("note: open PR #{n} matches branch `{}`; run `review-master {n}` to submit from the UI", local.branch);
+            }
+        }
+        return Ok(Change {
+            pr: None,
+            root: repo.root.clone(),
+            head_sha: local.head,
+            branch: local.branch,
+            dirty: local.dirty,
+            model,
+            skipped,
+            _checkout: None,
+        });
+    };
+    let pref = pr::parse_ref(raw, origin.as_ref())?;
+    if let Some((owner, name)) = &origin {
+        if !owner.eq_ignore_ascii_case(&pref.owner) || !name.eq_ignore_ascii_case(&pref.repo) {
+            eprintln!("note: the checkout's origin is {owner}/{name}, not {}; fetching the PR head may fail", pref.slug());
         }
     }
-    Ok((kept, skipped))
-}
-
-fn location(path: &str, start: Option<u64>, line: u64) -> String {
-    match start {
-        Some(start) => format!("{path}:{start}-{line}"),
-        None => format!("{path}:{line}"),
+    let meta = pr::meta(&pref)?;
+    let mut state = if meta.merged { "merged".to_owned() } else { meta.state.clone() };
+    if meta.draft {
+        state.push_str(", draft");
     }
-}
-
-fn headline(f: &review::Finding) -> String {
-    engine::one_line(f.title.as_deref().unwrap_or(&f.body), 80)
+    println!("review-master: {}#{} — {}", pref.slug(), pref.number, meta.title);
+    println!("  {} wants `{}` ← `{}`; {state}; head {}", meta.author, meta.base_ref, meta.head_ref, &meta.head_sha[..meta.head_sha.len().min(12)]);
+    println!("  {}", meta.url);
+    if meta.state != "open" {
+        eprintln!("note: this pull request is {state}; reviews can still be posted");
+    }
+    let mut model = diff::Model::parse(&pr::diff(&pref)?);
+    let skipped = apply_excludes(&mut model, &args.exclude)?;
+    if !skipped.is_empty() {
+        eprintln!("  excluded from the reviewed diff: {}", skipped.join(", "));
+    }
+    let (checkout, sha) = pr::checkout(repo, &pref, &meta.head_sha)?;
+    let branch = meta.head_ref.clone();
+    Ok(Change {
+        pr: Some((pref, meta)),
+        root: checkout.root.clone(),
+        head_sha: sha,
+        branch,
+        dirty: false,
+        model,
+        skipped,
+        _checkout: Some(checkout),
+    })
 }
 
 #[tokio::main]
@@ -184,40 +243,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if choice.engine == engine::Kind::OpenAi && args.model.is_none() {
         choice.model = env("OPENAI_MODEL").or(choice.model);
     }
-    let Some(raw) = args.pr.as_deref() else {
-        return Err("give a pull request to review: a URL, <owner>/<repo>#<number>, or a number".into());
-    };
 
     let repo = repo::Repo::open(&args.repo)?;
-    let origin = pr::origin_slug(&repo.root);
-    let pref = pr::parse_ref(raw, origin.as_ref())?;
-    if let Some((owner, name)) = &origin {
-        if !owner.eq_ignore_ascii_case(&pref.owner) || !name.eq_ignore_ascii_case(&pref.repo) {
-            eprintln!("note: the checkout's origin is {owner}/{name}, not {}; fetching the PR head may fail", pref.slug());
-        }
-    }
-    let meta = pr::meta(&pref)?;
-    let mut state = if meta.merged { "merged".to_owned() } else { meta.state.clone() };
-    if meta.draft {
-        state.push_str(", draft");
-    }
-    println!("review-master: {}#{} — {}", pref.slug(), pref.number, meta.title);
-    println!("  {} wants `{}` ← `{}`; {state}; head {}", meta.author, meta.base_ref, meta.head_ref, &meta.head_sha[..meta.head_sha.len().min(12)]);
-    println!("  {}", meta.url);
-    if meta.state != "open" {
-        eprintln!("note: this pull request is {state}; the review will still be posted");
-    }
-
-    let (kept, skipped) = filter_diff(pr::diff(&pref)?, &args.exclude)?;
-    if !skipped.is_empty() {
-        eprintln!("  excluded from the reviewed diff: {}", skipped.join(", "));
-    }
-    let dmap = diff::Diff::parse(&kept);
-    if dmap.is_empty() {
+    let change = acquire(&args, &repo)?;
+    if change.model.files.is_empty() {
         return Err("nothing to review: the diff is empty after exclusions".into());
     }
 
-    let (checkout, sha) = pr::checkout(&repo, &pref, &meta.head_sha)?;
     let cache_dir = args.cache_dir.clone().unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
     let ignore = cache_dir.join(".gitignore");
@@ -226,54 +258,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let opts = EngineOpts {
-        codex: args.codex,
-        claude: args.claude,
-        openai_base_url: args.openai_base_url.or_else(|| env("OPENAI_BASE_URL")).or(cfg.openai_base_url).unwrap_or_else(|| openai::DEFAULT_BASE_URL.to_owned()),
+        codex: args.codex.clone(),
+        claude: args.claude.clone(),
+        openai_base_url: args.openai_base_url.clone().or_else(|| env("OPENAI_BASE_URL")).or(cfg.openai_base_url).unwrap_or_else(|| openai::DEFAULT_BASE_URL.to_owned()),
         openai_api_key: env("OPENAI_API_KEY").or(cfg.openai_api_key),
         timeout: Duration::from_secs(args.timeout_mins.max(1) * 60),
     };
-    let engine = start_engine(choice.engine, choice.model, &opts, &checkout.root, &cache_dir).await?;
-    let model = engine.model().map_or(String::new(), |m| format!(" ({m})"));
-    println!("  engine {}{model}, checkout {}", engine.kind().id(), checkout.root.display());
+    let engine = start_engine(choice.engine, choice.model, &opts, &change.root, &cache_dir).await?;
+    let model_note = engine.model().map_or(String::new(), |m| format!(" ({m})"));
+    println!("  engine {}{model_note}, checkout {}", engine.kind().id(), change.root.display());
 
-    let cancel = Arc::new(tokio::sync::Notify::new());
-    {
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("\ncancelling…");
-                cancel.notify_waiters();
-            }
-        });
-    }
-    let prompt = review::prompt(&pref, &meta, &sha, &kept, &skipped);
-    let name = format!("review-master: {}#{}", pref.slug(), pref.number);
-    let reviewed = review::run(&engine, &name, &prompt, &dmap, &cancel, |m| println!("  {m}")).await?;
-
-    let event = match args.event {
-        EventArg::Auto => post::Event::from_verdict(&reviewed.verdict),
-        EventArg::Comment => post::Event::Comment,
-        EventArg::Approve => post::Event::Approve,
-        EventArg::RequestChanges => post::Event::RequestChanges,
+    let draft_key = match &change.pr {
+        Some((r, _)) => format!("pr-{}", r.number),
+        None => change.branch.replace(['/', '\\'], "-"),
     };
-    println!("\nverdict {} → {}; {} inline, {} in the review body", reviewed.verdict, event.api(), reviewed.inline.len(), reviewed.fallback.len());
-    for a in &reviewed.inline {
-        println!("  inline  {}  [{}] {}", location(&a.finding.path, a.start, a.line), a.finding.severity, headline(&a.finding));
+    let viewer = pr::viewer();
+    let state = server::AppState::new(
+        change.root.clone(),
+        change.pr.as_ref().map(|(r, m)| {
+            (pr::PrRef { owner: r.owner.clone(), repo: r.repo.clone(), number: r.number }, clone_meta(m))
+        }),
+        change.head_sha.clone(),
+        change.branch.clone(),
+        change.dirty,
+        change.model,
+        change.skipped,
+        engine,
+        viewer,
+        cache_dir.join(format!("drafts-{draft_key}.json")),
+    );
+    let listener = match tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("note: {}:{} is busy ({e}); using a free port", args.host, args.port);
+            tokio::net::TcpListener::bind((args.host.as_str(), 0)).await?
+        }
+    };
+    let url = format!("http://{}", listener.local_addr()?);
+    println!("open {url}");
+    if !args.no_open {
+        open_browser(&url);
     }
-    for (f, why) in &reviewed.fallback {
-        println!("  body    {}  [{}] {} ({why})", f.location(), f.severity, headline(f));
-    }
-    println!("  {} tool calls, {} in / {} cached / {} out tokens", reviewed.commands, reviewed.input_tokens, reviewed.cached_input_tokens, reviewed.output_tokens);
-
-    let payload = post::payload(&sha, event, &reviewed.summary, &reviewed.inline, &reviewed.fallback);
-    if args.dry_run {
-        println!("\ndry run — would POST repos/{}/pulls/{}/reviews:", pref.slug(), pref.number);
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        let url = post::submit(&pref, &payload)?;
-        println!("\nposted {url}");
-    }
-    drop(checkout); // removes the temporary worktree
-    drop(engine); // stops codex app-server before exiting
+    server::serve(listener, state).await?;
+    drop(change._checkout); // removes the temporary worktree
     Ok(())
+}
+
+/// `PrMeta` is plain data; the server keeps its own copy.
+fn clone_meta(m: &pr::PrMeta) -> pr::PrMeta {
+    pr::PrMeta {
+        title: m.title.clone(),
+        body: m.body.clone(),
+        author: m.author.clone(),
+        state: m.state.clone(),
+        draft: m.draft,
+        merged: m.merged,
+        base_ref: m.base_ref.clone(),
+        head_ref: m.head_ref.clone(),
+        head_sha: m.head_sha.clone(),
+        url: m.url.clone(),
+    }
 }

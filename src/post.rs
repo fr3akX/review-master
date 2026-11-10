@@ -21,14 +21,6 @@ impl Event {
             Event::RequestChanges => "REQUEST_CHANGES",
         }
     }
-
-    pub fn from_verdict(verdict: &str) -> Event {
-        match verdict {
-            "approve" => Event::Approve,
-            "request_changes" => Event::RequestChanges,
-            _ => Event::Comment,
-        }
-    }
 }
 
 /// `**severity: title**` then the comment body.
@@ -128,11 +120,4 @@ mod tests {
         assert!(body.contains("> off-by-one in the loop bound"));
     }
 
-    #[test]
-    fn verdicts_map_to_api_events() {
-        assert_eq!(Event::from_verdict("approve"), Event::Approve);
-        assert_eq!(Event::from_verdict("request_changes"), Event::RequestChanges);
-        assert_eq!(Event::from_verdict("comment"), Event::Comment);
-        assert_eq!(Event::from_verdict("anything"), Event::Comment);
-    }
 }
