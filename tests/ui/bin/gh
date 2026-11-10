@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+// Fake GitHub CLI for the UI tests: serves one pull request (acme/demo#1) from the demo
+// repository in $FAKE_GH_REPO and records what gets posted next to $FAKE_GH_OUT.
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const repo = process.env.FAKE_GH_REPO;
+const out = process.env.FAKE_GH_OUT || '/dev/null';
+const a = process.argv.slice(2);
+const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', maxBuffer: 1 << 26 });
+const say = v => process.stdout.write(typeof v === 'string' ? v : JSON.stringify(v));
+fs.appendFileSync(path.join(path.dirname(out), 'gh-calls.log'), a.join(' ') + '\n');
+if (a[0] === 'pr' && a[1] === 'list') { say('1\n'); process.exit(0); }
+if (a[0] !== 'api') { console.error('fake gh: unsupported ' + a.join(' ')); process.exit(1); }
+const p = a[1];
+const repliesFile = path.join(path.dirname(out), 'replies.json');
+const replies = () => (fs.existsSync(repliesFile) ? JSON.parse(fs.readFileSync(repliesFile, 'utf8')) : []);
+if (p === 'user') say({ login: process.env.FAKE_GH_USER || 'reviewer' });
+else if (/\/pulls\/1\/comments\/(\d+)\/replies$/.test(p)) {
+  const to = +/comments\/(\d+)\/replies/.exec(p)[1];
+  const list = replies();
+  list.push({ id: 100 + list.length, in_reply_to_id: to, path: 'src/store/cache.rs', line: 16, original_line: 16, side: 'RIGHT', start_line: null, user: { login: 'reviewer' }, body: JSON.parse(fs.readFileSync(0, 'utf8')).body, created_at: new Date().toISOString(), html_url: 'https://github.com/acme/demo/pull/1#discussion_r100' });
+  fs.writeFileSync(repliesFile, JSON.stringify(list));
+  say(list[list.length - 1]);
+}
+else if (/\/pulls\/1\/reviews$/.test(p)) {
+  const body = fs.readFileSync(0, 'utf8');
+  fs.writeFileSync(out, body);
+  say({ id: 99, html_url: 'https://github.com/acme/demo/pull/1#pullrequestreview-99' });
+} else if (/\/pulls\/1\/comments/.test(p)) {
+  if (process.env.FAKE_GH_COMMENTS_FAIL) { console.error('HTTP 502: bad gateway'); process.exit(1); }
+  const u = login => ({ login });
+  const list = [
+    { id: 1, in_reply_to_id: null, path: 'src/store/cache.rs', line: 16, original_line: 16, side: 'RIGHT', start_line: null, user: u('alice'), body: 'Why does `get` need `&mut self` now? This breaks shared readers.\n\nSee `src/store/ttl.rs:13`.', created_at: '2026-11-08T10:00:00Z', html_url: 'https://github.com/acme/demo/pull/1#discussion_r1' },
+    { id: 2, in_reply_to_id: 1, path: 'src/store/cache.rs', line: 16, original_line: 16, side: 'RIGHT', start_line: null, user: u('bob'), body: 'Hit counting. I can switch to an `AtomicU64`.', created_at: '2026-11-08T11:30:00Z', html_url: 'https://github.com/acme/demo/pull/1#discussion_r2' },
+    { id: 3, in_reply_to_id: null, path: 'src/api/handler.py', line: 7, original_line: 7, side: 'LEFT', start_line: null, user: u('alice'), body: '400 was fine here.', created_at: '2026-11-09T09:00:00Z', html_url: 'https://github.com/acme/demo/pull/1#discussion_r3' },
+    { id: 4, in_reply_to_id: null, path: 'src/store/ttl.rs', line: null, original_line: 9, side: 'RIGHT', start_line: null, user: u('carol'), body: 'Outdated: this was on an earlier commit.', created_at: '2026-11-07T09:00:00Z', html_url: 'https://github.com/acme/demo/pull/1#discussion_r4' },
+  ];
+  say([...list, ...replies()].map(c => JSON.stringify(c)).join('\n') + '\n');
+} else if (/\/pulls\/1$/.test(p)) {
+  if (a.includes('Accept: application/vnd.github.v3.diff')) say(git('diff', '-M', 'main', 'feature/ttl-cache'));
+  else say({
+    title: 'Add TTL and hit counting to the cache', body: 'Adds a TTL type and counts cache hits.', user: { login: 'bob' },
+    state: 'open', draft: false, merged: false, base: { ref: 'main' },
+    head: { ref: 'feature/ttl-cache', sha: git('rev-parse', 'feature/ttl-cache').trim() },
+    html_url: 'https://github.com/acme/demo/pull/1',
+  });
+} else { console.error('fake gh: unsupported api ' + p); process.exit(1); }
