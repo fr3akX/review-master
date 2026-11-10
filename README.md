@@ -3,11 +3,15 @@
 Code review for humans, with an LLM to help you understand the change. Point it
 at a pull request (or a bare worktree) and it opens a local web UI:
 
-- browse the changed files — per-file **diff view** and **full-file view** with
-  highlighted changes and syntax highlighting;
-- select a line or range and **chat with an LLM about exactly that code**: it
-  answers from a read-only checkout of the PR head, so it can read the
-  surrounding code, and cites `path:line`;
+- browse the changed files in a collapsible **directory tree**; per-file
+  **diff view**, and a **file viewer** for the whole file with highlighted
+  changes and syntax highlighting;
+- **code navigation through language servers** (rust-analyzer, pyright,
+  tsserver, gopls, clangd, Metals): Cmd/Ctrl-click an identifier for hover,
+  definitions and references, with whole-word text search as the fallback;
+- select code (lines or exact text) and **chat with an LLM about it**: it
+  answers from a read-only checkout of the PR head, gets your exact selection,
+  and its `path:line` citations are clickable jumps;
 - write **draft inline comments** (severity + markdown) as you go; drafts
   persist across restarts;
 - submit everything as **one GitHub review** — comment / approve /
@@ -67,6 +71,9 @@ settings.
 | `--model` | engine default | model for the chat engine |
 | `--host` / `--port` | `127.0.0.1` / `7979` | where the UI is served (busy port → a free one) |
 | `--no-open` | | do not open the browser |
+| `--lsp LANG=COMMAND` | auto-detected on PATH | language server override; empty command disables one language |
+| `--no-lsp` | | disable language servers (navigation falls back to text search) |
+| `--lsp-import-build` | | let Metals import the build (runs the build tool) |
 | `--exclude GLOB` | | drop files from the reviewed diff (repeatable, e.g. `--exclude '*.lock'`) |
 | `--timeout-mins` | 20 | time limit per chat turn |
 | `--cache-dir` | `.review-master` in the checkout | chat sessions and drafts |
