@@ -4,9 +4,10 @@
 
 use crate::diff::{Diff, Kind, Model, Side, Status};
 use crate::engine::Engine;
+use crate::lsp::Lsp;
 use crate::pr::{PrMeta, PrRef};
 use crate::review::{self, Finding};
-use crate::{post, verify};
+use crate::{post, search, verify};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -41,6 +42,7 @@ pub struct AppState {
     pub engine: Engine,
     /// The `gh` login, for own-PR hints in the UI.
     pub viewer: Option<String>,
+    pub lsp: Lsp,
     drafts: Mutex<DraftStore>,
     threads: Mutex<Threads>,
     jobs: Mutex<Jobs>,
@@ -60,6 +62,7 @@ impl AppState {
         engine: Engine,
         viewer: Option<String>,
         drafts_file: PathBuf,
+        lsp: Lsp,
     ) -> Arc<AppState> {
         let anchors = model.anchors();
         Arc::new(AppState {
@@ -73,6 +76,7 @@ impl AppState {
             skipped,
             engine,
             viewer,
+            lsp,
             drafts: Mutex::new(DraftStore::load(drafts_file)),
             threads: Mutex::default(),
             jobs: Mutex::default(),
@@ -239,6 +243,11 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/draft/{id}", delete(delete_draft))
         .route("/api/drafts", get(drafts))
         .route("/api/submit", post_to(submit))
+        .route("/api/search", get(text_search))
+        .route("/api/lsp/status", get(lsp_status))
+        .route("/api/lsp/symbol", post_to(lsp_symbol))
+        .route("/api/lsp/references", post_to(lsp_references))
+        .route("/api/lsp/outline", get(lsp_outline))
         .with_state(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -322,6 +331,83 @@ async fn file_diff(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) 
 /// Language hint for the UI: the lowercased file extension.
 fn lang(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path).rsplit_once('.').map_or("", |(_, ext)| ext)
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    /// Whole identifiers only (case-sensitive) instead of smart-case substrings.
+    #[serde(default)]
+    word: bool,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    300
+}
+
+async fn text_search(State(st): State<Arc<AppState>>, Query(q): Query<SearchQuery>) -> ApiResult {
+    let text = if q.word { q.q.trim() } else { q.q.as_str() }.to_owned();
+    if text.trim().is_empty() || text.len() > 200 {
+        return Err(fail(StatusCode::BAD_REQUEST, "search for 1 to 200 characters"));
+    }
+    if q.word && text.contains(char::is_whitespace) {
+        return Err(fail(StatusCode::BAD_REQUEST, "search for a single word"));
+    }
+    let query = if q.word { search::Query::Word(text) } else { search::Query::Text(text) };
+    let root = st.root.clone();
+    let limit = q.limit.clamp(1, 1000);
+    let results = tokio::task::spawn_blocking(move || search::search(&root, &query, limit))
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!(results)))
+}
+
+#[derive(Deserialize)]
+struct StatusQuery {
+    path: String,
+    /// Start the server (and open the file) in the background if it is not running.
+    #[serde(default)]
+    start: bool,
+}
+
+async fn lsp_status(State(st): State<Arc<AppState>>, Query(q): Query<StatusQuery>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.root, &q.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let status = st.lsp.status(&shown).await;
+    if q.start && status.state == "idle" {
+        let st = st.clone();
+        tokio::spawn(async move { st.lsp.warm(&full, &shown).await });
+    }
+    Ok(Json(json!(status)))
+}
+
+#[derive(Deserialize)]
+struct PositionRequest {
+    path: String,
+    /// 1-based line.
+    line: u64,
+    /// 0-based UTF-16 column.
+    character: u64,
+}
+
+async fn lsp_symbol(State(st): State<Arc<AppState>>, Json(req): Json<PositionRequest>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.root, &req.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let info = st.lsp.symbol(&full, &shown, req.line, req.character).await;
+    info.map(|i| Json(json!(i))).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
+}
+
+async fn lsp_references(State(st): State<Arc<AppState>>, Json(req): Json<PositionRequest>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.root, &req.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let refs = st.lsp.references(&full, &shown, req.line, req.character).await;
+    refs.map(|r| Json(json!({ "references": r }))).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
+}
+
+/// Functions, classes and other declarations in a file, from its language server.
+async fn lsp_outline(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.root, &q.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let items = st.lsp.outline(&full, &shown).await;
+    items.map(|i| Json(json!({ "symbols": i }))).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
 }
 
 async fn source(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> ApiResult {

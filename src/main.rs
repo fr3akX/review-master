@@ -13,6 +13,7 @@ mod config;
 mod configure;
 mod diff;
 mod engine;
+mod lsp;
 mod native;
 mod openai;
 mod post;
@@ -20,6 +21,7 @@ mod pr;
 mod repo;
 mod repo_tools;
 mod review;
+mod search;
 mod server;
 mod term;
 mod verify;
@@ -79,6 +81,17 @@ struct Args {
     /// Do not open the browser
     #[arg(long)]
     no_open: bool,
+    /// Language server for a language, e.g. `python=pyright-langserver --stdio`;
+    /// an empty command disables it. Languages: rust, python, typescript, go, c, scala
+    #[arg(long = "lsp", value_name = "LANG=COMMAND", value_parser = parse_lsp)]
+    lsp: Vec<(String, String)>,
+    /// Disable language servers; navigation falls back to text search
+    #[arg(long)]
+    no_lsp: bool,
+    /// Let language servers import the project build for full navigation (Metals:
+    /// runs the build tool, e.g. sbt, on the repository). Off: Scala stays read-only
+    #[arg(long)]
+    lsp_import_build: bool,
     /// Exclude files matching this glob from the reviewed diff (repeatable)
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
@@ -86,6 +99,15 @@ struct Args {
     /// and exit; also offered on the first interactive launch without one
     #[arg(long)]
     configure: bool,
+}
+
+fn parse_lsp(raw: &str) -> Result<(String, String), String> {
+    let (lang, cmd) = raw.split_once('=').ok_or("expected LANG=COMMAND")?;
+    let lang = lang.trim().to_ascii_lowercase();
+    if !lsp::LANGUAGES.contains(&lang.as_str()) {
+        return Err(format!("unknown language `{lang}`; expected one of {}", lsp::LANGUAGES.join(", ")));
+    }
+    Ok((lang, cmd.trim().to_owned()))
 }
 
 /// Engine settings resolved from flags, the environment and the configuration.
@@ -273,6 +295,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => change.branch.replace(['/', '\\'], "-"),
     };
     let viewer = pr::viewer();
+    let lsp = lsp::Lsp::new(&change.root, !args.no_lsp, &args.lsp, args.lsp_import_build);
+    let servers = lsp.configured();
+    if servers.is_empty() {
+        println!("  language servers: none (navigation uses text search)");
+    }
+    for (lang, cmd) in servers {
+        println!("  language server: {lang} = {cmd}");
+    }
     let state = server::AppState::new(
         change.root.clone(),
         change.pr.as_ref().map(|(r, m)| {
@@ -286,6 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine,
         viewer,
         cache_dir.join(format!("drafts-{draft_key}.json")),
+        lsp,
     );
     let listener = match tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await {
         Ok(l) => l,

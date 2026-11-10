@@ -36,12 +36,17 @@ const S = {
   drafts: [],
   threads: [],
   current: null, // FileState highlighted in the sidebar
-  sel: null, // { fs, side, from, start, line, view, marked }
+  collapsed: new Set(), // sidebar directory paths that are folded
+  sources: new Map(), // path → /api/source response (file viewer cache)
+  viewer: null, // { path, fs, pane } while the file viewer is open
+  sel: null, // { pane, side, from, start, line, marked, snippet }
   dragging: false,
-  pop: null, // { el, label }
-  composers: new Map(), // key → { key, path, akey, el, ta }
+  pop: null, // { el, label, comment }
+  sym: null, // { el } — open symbol (LSP) popup
+  lspWarm: new Set(), // paths whose language server was asked to start
+  composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
   drawer: null, // 'chat' | 'review' | null
-  chat: { threadId: null, anchor: null, thread: null, jobs: new Map() }, // jobs: threadId → ChatJob
+  chat: { threadId: null, anchor: null, snippet: null, thread: null, jobs: new Map() }, // jobs: threadId → ChatJob
   review: { body: '', event: 'comment', submitting: false, list: null },
 };
 
@@ -80,7 +85,8 @@ function toast(msg, kind = 'info', ms = 6000) {
 
 // Every API failure is toasted once here; the thrown error is marked so the
 // global unhandledrejection handler does not toast it again.
-async function api(method, url, body) {
+// quiet: no toast (callers that show the failure themselves, e.g. LSP lookups).
+async function api(method, url, body, quiet = false) {
   const init = { method, headers: {} };
   if (body !== undefined) {
     init.headers['Content-Type'] = 'application/json';
@@ -90,7 +96,7 @@ async function api(method, url, body) {
   try {
     res = await fetch(url, init);
   } catch (e) {
-    throw failed(`Network error (${method} ${url}): ${e.message}`);
+    throw failed(`Network error (${method} ${url}): ${e.message}`, quiet);
   }
   const text = await res.text();
   let data = null;
@@ -99,11 +105,11 @@ async function api(method, url, body) {
   } catch {
     data = null;
   }
-  if (!res.ok) throw failed((data && data.error) || `${method} ${url} failed: HTTP ${res.status}`);
+  if (!res.ok) throw failed((data && data.error) || `${method} ${url} failed: HTTP ${res.status}`, quiet);
   return data;
 }
-function failed(msg) {
-  toast(msg, 'error');
+function failed(msg, quiet = false) {
+  if (!quiet) toast(msg, 'error');
   const e = new Error(msg);
   e.toasted = true;
   return e;
@@ -238,7 +244,8 @@ function splitHighlighted(html) {
 const BLOCK_START = /^\s*(```|~~~|>|#{1,6}\s|[-*+]\s|\d+[.)]\s)/;
 const LIST_ITEM = /^\s*([-*+]|\d+[.)])\s+(.*)$/;
 
-function md(src) {
+// headings: false renders "# x" lines as plain paragraphs (LSP hover text).
+function md(src, { headings = true } = {}) {
   const lines = String(src ?? '').replace(/\r\n?/g, '\n').split('\n');
   const out = [];
   let i = 0;
@@ -256,12 +263,12 @@ function md(src) {
       i++;
     } else if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
       const lvl = Math.min(m[1].length, 3) + 2; // # → h3 … keeps headings modest inside cards
-      out.push(`<h${lvl}>${inline(m[2])}</h${lvl}>`);
+      out.push(headings ? `<h${lvl}>${inline(m[2])}</h${lvl}>` : `<p>${inline(m[2])}</p>`);
       i++;
     } else if (/^\s*>/.test(line)) {
       const quote = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) quote.push(lines[i++].replace(/^\s*> ?/, ''));
-      out.push(`<blockquote>${md(quote.join('\n'))}</blockquote>`);
+      out.push(`<blockquote>${md(quote.join('\n'), { headings })}</blockquote>`);
     } else if ((m = line.match(LIST_ITEM))) {
       const ordered = /\d/.test(m[1]);
       const items = [];
@@ -284,13 +291,19 @@ function md(src) {
   return out.join('');
 }
 
+// Code references like `src/a.rs:12` or `main.go:3-9`: a path with a directory or an
+// extension, then :N or :N-M. Matched on already-escaped text.
+const CODE_REF = /(?<![\w/.-])((?:[\w.-]+\/)+[\w.-]+|[\w.-]*\w\.[A-Za-z]\w*):(\d+)(?:[-–](\d+))?(?!\w)/g;
+const linkRefs = (html, wrap = x => x) => html.replace(CODE_REF, (m, path, a, b) =>
+  wrap(`<a class="code-ref" href="#" data-path="${path}" data-line="${a}"${b ? ` data-end="${b}"` : ''} title="Open ${path}">${m}</a>`));
+
 function inline(text) {
   const slots = [];
   const keep = html => `\u0000${slots.push(html) - 1}\u0000`;
-  let s = String(text).replace(/`([^`]+)`/g, (_, code) => keep(`<code>${esc(code)}</code>`));
-  s = esc(s)
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, url) =>
-      keep(`<a href="${url}" target="_blank" rel="noopener noreferrer">${t}</a>`))
+  let s = String(text).replace(/`([^`]+)`/g, (_, code) => keep(`<code>${linkRefs(esc(code))}</code>`));
+  s = esc(s).replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, url) =>
+    keep(`<a href="${url}" target="_blank" rel="noopener noreferrer">${t}</a>`));
+  s = linkRefs(s, keep)
     .replace(/\*\*(?=\S)(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^\w*])\*(?=[^\s*])([^*]*?[^\s*])?\*(?![\w*])/g, (all, pre, body) =>
       (body === undefined ? all : `${pre}<em>${body}</em>`));
@@ -359,14 +372,52 @@ function buildSidebar() {
   const add = files.reduce((n, f) => n + f.additions, 0);
   const del = files.reduce((n, f) => n + f.deletions, 0);
   $('#file-summary').replaceChildren(plural(files.length, 'file'), ' ', counts({ additions: add, deletions: del }));
-  const list = $('#file-list');
+  const root = { dirs: new Map(), files: [] };
   for (const fs of S.order) {
+    let node = root;
+    for (const part of fs.path.split('/').slice(0, -1)) {
+      if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
+      node = node.dirs.get(part);
+    }
+    node.files.push(fs);
+  }
+  $('#file-list').replaceChildren(...treeItems(root, ''));
+}
+
+// Sidebar tree items: directories first (single-child chains compressed into one
+// row, e.g. "src/block_meta/"), then files; folding state lives in S.collapsed.
+function treeItems(node, prefix) {
+  const items = [];
+  for (const [name, child] of [...node.dirs].sort((a, b) => a[0].localeCompare(b[0]))) {
+    let label = `${name}/`;
+    let dir = child;
+    while (dir.dirs.size === 1 && !dir.files.length) {
+      const [[next, sub]] = dir.dirs;
+      label += `${next}/`;
+      dir = sub;
+    }
+    const path = prefix + label;
+    const li = h('li', { class: `tree-dir${S.collapsed.has(path) ? ' collapsed' : ''}` });
+    const toggle = () => {
+      const closed = !S.collapsed.delete(path);
+      if (closed) S.collapsed.add(path);
+      li.classList.toggle('collapsed', closed);
+    };
+    li.append(
+      h('button', { class: 'dir-row', title: path, onclick: toggle }, h('span', { class: 'chevron' }, '▾'), h('span', { class: 'dir-name' }, label)),
+      h('ul', { class: 'tree' }, treeItems(dir, path)));
+    items.push(li);
+  }
+  for (const fs of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
     fs.navBadge = h('span', { class: 'nav-drafts', title: 'drafts', hidden: true });
     fs.nav = h('li', {},
       h('button', { class: 'file-item', title: fs.path, onclick: () => jumpToFile(fs) },
-        statusBadge(fs.file.status), pathLabel(fs.path), fs.navBadge, counts(fs.file)));
-    list.append(fs.nav);
+        statusBadge(fs.file.status),
+        h('span', { class: 'path' }, h('span', { class: 'base' }, splitPath(fs.path)[1])),
+        fs.navBadge, counts(fs.file)));
+    items.push(fs.nav);
   }
+  return items;
 }
 
 function setCurrent(fs) {
@@ -389,6 +440,7 @@ function trackCurrent() {
 }
 
 function jumpToFile(fs) {
+  closeViewer();
   fs.section.scrollIntoView({ block: 'start' });
   setCurrent(fs);
   ensureLoaded(fs).catch(() => {});
@@ -404,6 +456,19 @@ function makeBox() {
 }
 const boxEmpty = b => !b.drafts.childElementCount && !b.chips.childElementCount && !b.composers.childElementCount;
 
+// Box for comments whose anchor row is not part of the rendered table.
+function makeNotes() {
+  const b = makeBox();
+  b.root.classList.add('file-notes');
+  b.root.prepend(h('div', { class: 'notes-title' }, 'Comments on lines not shown in this view'));
+  b.root.hidden = true;
+  return b;
+}
+
+const fileTitle = f => (f.status === 'renamed' && f.old_path
+  ? h('span', { class: 'rename' }, pathLabel(f.old_path), h('span', { class: 'arrow' }, ' → '), pathLabel(f.path))
+  : pathLabel(f.path));
+
 function buildSections() {
   const wrap = $('#sections');
   if (!S.info.files.length) {
@@ -411,26 +476,15 @@ function buildSections() {
     return;
   }
   S.info.files.forEach((f, idx) => {
-    const fs = {
-      file: f, path: f.path, idx, view: 'diff', rendered: null, loading: null,
-      diff: null, source: null, rows: new Map(), boxes: new Map(), cols: 4,
-    };
+    const fs = { file: f, path: f.path, idx, diff: null, pane: null, loading: null };
     const deleted = f.status === 'deleted';
-    fs.btnDiff = h('button', { class: 'seg on', onclick: () => setView(fs, 'diff') }, 'Diff');
-    fs.btnFull = h('button', {
-      class: 'seg', disabled: deleted, title: deleted ? 'File was deleted; only the diff is available' : 'Whole file at HEAD',
-      onclick: () => setView(fs, 'full'),
-    }, 'Full');
-    const name = f.status === 'renamed' && f.old_path
-      ? h('span', { class: 'rename' }, pathLabel(f.old_path), h('span', { class: 'arrow' }, ' → '), pathLabel(f.path))
-      : pathLabel(f.path);
-    fs.head = h('div', { class: 'file-head' },
-      statusBadge(f.status), name, counts(f), h('span', { class: 'spacer' }),
-      h('div', { class: 'seg-group' }, fs.btnDiff, fs.btnFull));
-    fs.notes = makeBox();
-    fs.notes.root.classList.add('file-notes');
-    fs.notes.root.prepend(h('div', { class: 'notes-title' }, 'Comments on lines not shown in this view'));
-    fs.notes.root.hidden = true;
+    const full = h('button', {
+      class: 'btn small', disabled: deleted,
+      title: deleted ? 'File was deleted; only the diff is available' : 'Open the whole file at HEAD',
+      onclick: () => openViewer(f.path),
+    }, 'Full file');
+    fs.head = h('div', { class: 'file-head' }, statusBadge(f.status), fileTitle(f), counts(f), h('span', { class: 'spacer' }), full);
+    fs.notes = makeNotes();
     fs.body = h('div', { class: 'file-body' }, h('div', { class: 'placeholder' }, 'Loading…'));
     fs.section = h('section', { class: 'file', 'data-idx': idx }, fs.head, fs.notes.root, fs.body);
     S.files.set(f.path, fs);
@@ -453,60 +507,51 @@ const fileOf = el => {
   return sec ? S.order[+sec.dataset.idx] : null;
 };
 
-function syncToggle(fs) {
-  fs.btnDiff.classList.toggle('on', fs.view === 'diff');
-  fs.btnFull.classList.toggle('on', fs.view === 'full');
-}
+// A pane is one rendered code table — a section's diff or the file viewer — with
+// its anchor-row index ("SIDE:line" → tr) and the annotation boxes inserted into it.
+// `host` is the positioned element the selection popover is placed in.
+const PANES = new WeakMap(); // table element → pane
 
-async function setView(fs, view) {
-  if (view === 'full' && fs.file.status === 'deleted') return;
-  fs.view = view;
-  syncToggle(fs);
-  await ensureLoaded(fs);
-}
-
-// Loads and renders whichever view is current; loops if the view changed mid-load.
-async function ensureLoaded(fs) {
-  while (fs.rendered !== fs.view) {
-    if (!fs.loading) fs.loading = loadView(fs, fs.view).finally(() => { fs.loading = null; });
-    await fs.loading;
+function makePane(path, kind, table, notes, host) {
+  const pane = {
+    path, fs: S.files.get(path) || null, kind, table, notes, host,
+    cols: kind === 'diff' ? 4 : 3, rows: new Map(), boxes: new Map(),
+  };
+  for (const tr of table.tBodies[0].rows) {
+    const d = tr.dataset;
+    if (d.old) pane.rows.set(`LEFT:${d.old}`, tr);
+    if (d.new) pane.rows.set(`RIGHT:${d.new}`, tr);
   }
+  PANES.set(table, pane);
+  return pane;
 }
 
-async function loadView(fs, view) {
+const paneOf = el => {
+  const table = el.closest('table.code-table');
+  return table ? PANES.get(table) : null;
+};
+
+function ensureLoaded(fs) {
+  if (fs.pane) return Promise.resolve();
+  if (!fs.loading) fs.loading = loadDiff(fs).finally(() => { fs.loading = null; });
+  return fs.loading;
+}
+
+async function loadDiff(fs) {
   fs.body.classList.add('loading');
   try {
-    if (view === 'diff') fs.diff ??= await get(`/api/diff?path=${qpath(fs.path)}`);
-    else fs.source ??= await get(`/api/source?path=${qpath(fs.path)}`);
+    fs.diff ??= await get(`/api/diff?path=${qpath(fs.path)}`);
   } catch (e) {
-    if (view === 'full') {
-      fs.view = 'diff'; // fall back to the diff; ensureLoaded continues with it
-      syncToggle(fs);
-      return;
-    }
     fs.body.replaceChildren(h('div', { class: 'load-error' }, `Could not load diff: ${e.message} `,
       h('button', { class: 'btn small', onclick: () => ensureLoaded(fs).catch(() => {}) }, 'Retry')));
     throw e;
   } finally {
     fs.body.classList.remove('loading');
   }
-  if (fs.view === view) renderView(fs, view);
-}
-
-function renderView(fs, view) {
-  if (S.sel && S.sel.fs === fs) clearSel();
-  const table = view === 'diff' ? diffTable(fs) : fullTable(fs);
-  fs.rows = new Map();
-  fs.boxes = new Map();
-  fs.cols = view === 'diff' ? 4 : 3;
-  for (const tr of table.tBodies[0].rows) {
-    const d = tr.dataset;
-    if (d.old) fs.rows.set(`LEFT:${d.old}`, tr);
-    if (d.new) fs.rows.set(`RIGHT:${d.new}`, tr);
-  }
-  fs.body.replaceChildren(table);
-  fs.rendered = view;
-  renderAnnotations(fs);
+  fs.pane = makePane(fs.path, 'diff', diffTable(fs), fs.notes, fs.section);
+  if (fs.file.status !== 'deleted') warmLsp(fs.path);
+  fs.body.replaceChildren(fs.pane.table);
+  renderAnnotations(fs.pane);
 }
 
 function diffTable(fs) {
@@ -536,12 +581,11 @@ function diffTable(fs) {
   });
 }
 
-function fullTable(fs) {
-  const src = fs.source;
+function fullTable(path, src) {
   let text = src.text || '';
   if (text.endsWith('\n')) text = text.slice(0, -1);
   const lines = text ? text.split('\n') : [];
-  const lang = lines.length <= HL_LINE_LIMIT ? hlLang(src.lang) || langForPath(fs.path) : null;
+  const lang = lines.length <= HL_LINE_LIMIT ? hlLang(src.lang) || langForPath(path) : null;
   const html = hlLines(lines, lang);
   const added = new Set(src.added || []);
   const delAfter = src.deleted_after || {};
@@ -564,76 +608,178 @@ function fullTable(fs) {
   });
 }
 
-// Full-view "N deleted lines" marker → switch to the diff, scrolled to those deletions.
-async function jumpToDeleted(fs, after) {
-  await setView(fs, 'diff');
-  const tr = fs.body.querySelector(`tr.del[data-after="${after}"]`) ||
-    [...fs.rows.values()].find(r => r.dataset.new && +r.dataset.new > after);
-  if (!tr) return;
-  tr.scrollIntoView({ block: 'center' });
-  flash(tr);
+function flashRange(pane, side, from, to) {
+  for (let l = from; l <= (to ?? from); l++) {
+    const tr = pane.rows.get(anchorKey(side, l));
+    if (tr) flash(tr);
+  }
 }
 
-// Ensures the file is rendered and returns the row for an anchor, switching a
-// Full view to Diff when the anchor (e.g. a LEFT line) only exists there.
-async function anchorRow(fs, side, line) {
-  await ensureLoaded(fs);
-  const key = anchorKey(side, line);
-  if (!fs.rows.has(key) && fs.rendered === 'full') await setView(fs, 'diff');
-  return fs.rows.get(key) || null;
-}
+// ───────────────────────────── file viewer ─────────────────────────────
+// Overlay with a whole HEAD file: a changed file (added-line tints, deleted-line
+// markers) or any other file of the checkout, e.g. one referenced by a chat answer.
 
-async function revealLine(path, side, line) {
-  const fs = S.files.get(path);
-  if (!fs) {
-    toast(`${path} is not among the changed files`, 'warn');
+async function openViewer(path, target = null) {
+  const fs = S.files.get(path) || null;
+  if (fs && fs.file.status === 'deleted') return;
+  closeViewer();
+  clearSel();
+  const v = { path, fs, pane: null };
+  S.viewer = v;
+  const scroll = $('#viewer-scroll');
+  v.lspChip = h('span', { class: 'chip lsp-chip', hidden: true });
+  $('#viewer-head').replaceChildren(
+    fs ? statusBadge(fs.file.status) : null,
+    fs ? fileTitle(fs.file) : pathLabel(path),
+    fs ? counts(fs.file) : h('span', { class: 'chip' }, 'not changed in this PR'),
+    h('span', { class: 'spacer' }),
+    v.lspChip,
+    h('button', { class: 'btn small', onclick: closeViewer }, 'Close'));
+  scroll.replaceChildren(h('div', { class: 'placeholder' }, 'Loading…'));
+  $('#viewer').hidden = false;
+  let src = S.sources.get(path);
+  if (!src) {
+    try {
+      src = await get(`/api/source?path=${qpath(path)}`);
+    } catch {
+      if (S.viewer === v) closeViewer();
+      return;
+    }
+    S.sources.set(path, src);
+  }
+  if (S.viewer !== v) return;
+  v.pane = makePane(path, 'full', fullTable(path, src), makeNotes(), scroll);
+  scroll.replaceChildren(v.pane.notes.root, v.pane.table);
+  scroll.scrollTop = 0;
+  renderAnnotations(v.pane);
+  watchViewerLsp(v);
+  if (!target) return;
+  const tr = v.pane.rows.get(`RIGHT:${target.line}`);
+  if (!tr) {
+    toast(`${path} has no line ${target.line}`, 'warn');
     return;
   }
-  const tr = await anchorRow(fs, side, line);
+  tr.scrollIntoView({ block: 'center' });
+  flashRange(v.pane, 'RIGHT', target.line, target.end);
+}
+
+function closeViewer() {
+  const v = S.viewer;
+  if (!v) return;
+  if (S.sel && S.sel.pane === v.pane) clearSel();
+  closeSym();
+  S.viewer = null;
+  $('#viewer').hidden = true;
+  $('#viewer-scroll').replaceChildren();
+  // Composers opened in the viewer move back to their file's diff.
+  let moved = false;
+  for (const c of S.composers.values()) {
+    if (c.inViewer) {
+      c.inViewer = false;
+      moved = true;
+    }
+  }
+  if (moved && v.fs) renderAnnotations(v.fs.pane);
+}
+
+// Viewer "N deleted lines" marker → the file's inline diff, scrolled to those deletions.
+async function jumpToDeleted(fs, after) {
+  closeViewer();
+  await ensureLoaded(fs);
+  const p = fs.pane;
+  const tr = p.table.querySelector(`tr.del[data-after="${after}"]`) ||
+    [...p.rows.values()].find(r => r.dataset.new && +r.dataset.new > after);
   (tr || fs.section).scrollIntoView({ block: tr ? 'center' : 'start' });
   if (tr) flash(tr);
 }
 
+// Pane and row where an anchor of a changed file is shown: the open viewer when it
+// has the line, else the file's inline diff (closing the viewer).
+async function anchorRow(fs, side, line) {
+  const key = anchorKey(side, line);
+  const v = S.viewer;
+  if (v && v.fs === fs && v.pane && v.pane.rows.has(key)) return { pane: v.pane, tr: v.pane.rows.get(key) };
+  closeViewer();
+  await ensureLoaded(fs);
+  return { pane: fs.pane, tr: fs.pane.rows.get(key) || null };
+}
+
+// Scrolls to and flashes an anchor (lines line..end). New-side lines outside the
+// diff, and files that are not part of the change, open in the file viewer.
+async function revealLine(path, side, line, end = null) {
+  const fs = S.files.get(path);
+  if (!fs) return openViewer(path, { line, end });
+  const { pane, tr } = await anchorRow(fs, side, line);
+  if (tr) {
+    tr.scrollIntoView({ block: 'center' });
+    flashRange(pane, side, line, end);
+  } else if ((side || 'RIGHT') === 'RIGHT' && fs.file.status !== 'deleted') {
+    await openViewer(path, { line, end });
+  } else {
+    fs.section.scrollIntoView({ block: 'start' });
+  }
+}
+
+// Click on a code reference in rendered markdown (chat answers, draft bodies).
+function openCodeRef(rawPath, line, end) {
+  let path = rawPath.replace(/^\.\//, '');
+  if (!S.files.has(path) && /^[ab]\//.test(path) && S.files.has(path.slice(2))) path = path.slice(2); // diff prefixes
+  closeViewer(); // changed files prefer their diff
+  return revealLine(path, 'RIGHT', line, end != null && end > line ? end : null);
+}
+
 // ───────────────────────────── annotations (drafts, chat chips, composers) ─────────────────────────────
 
-// Annotation box right below an anchor row; null when the row is not in the current view.
-function boxAt(fs, akey) {
-  let b = fs.boxes.get(akey);
+// Annotation box right below an anchor row; null when the row is not in the pane.
+function boxAt(pane, akey) {
+  let b = pane.boxes.get(akey);
   if (b) return b;
-  const row = fs.rows.get(akey);
+  const row = pane.rows.get(akey);
   if (!row) return null;
   b = makeBox();
-  b.tr = h('tr', { class: 'annot' }, h('td', { colspan: String(fs.cols) }, b.root));
+  b.tr = h('tr', { class: 'annot' }, h('td', { colspan: String(pane.cols) }, b.root));
   row.after(b.tr);
-  fs.boxes.set(akey, b);
+  pane.boxes.set(akey, b);
   return b;
 }
 
-function renderAnnotations(fs) {
-  if (!fs.rendered) return;
-  for (const b of [...fs.boxes.values(), fs.notes]) {
+// Drafts and chat chips render in every pane showing their file; a composer lives
+// in exactly one place (the viewer when opened there, else the inline diff).
+function renderAnnotations(pane) {
+  if (!pane) return;
+  const inViewer = pane.kind === 'full';
+  for (const b of [...pane.boxes.values(), pane.notes]) {
     b.drafts.replaceChildren();
     b.chips.replaceChildren();
   }
-  const place = akey => boxAt(fs, akey) || fs.notes;
+  const place = akey => boxAt(pane, akey) || pane.notes;
   for (const d of S.drafts) {
-    if (d.path === fs.path && !S.composers.has(`d${d.id}`)) place(anchorKey(d.side, d.line)).drafts.append(draftCard(d));
+    if (d.path === pane.path && !S.composers.has(`d${d.id}`)) place(anchorKey(d.side, d.line)).drafts.append(draftCard(d));
   }
   for (const t of S.threads) {
-    if (t.anchor && t.anchor.path === fs.path) place(anchorKey(t.anchor.side, t.anchor.line)).chips.append(threadChip(t));
+    if (t.anchor && t.anchor.path === pane.path) place(anchorKey(t.anchor.side, t.anchor.line)).chips.append(threadChip(t));
   }
-  for (const c of S.composers.values()) if (c.path === fs.path) place(c.akey).composers.append(c.el);
-  for (const [k, b] of fs.boxes) {
+  for (const c of S.composers.values()) {
+    if (c.path === pane.path && !!c.inViewer === inViewer) place(c.akey).composers.append(c.el);
+  }
+  for (const [k, b] of pane.boxes) {
     if (boxEmpty(b)) {
       b.tr.remove();
-      fs.boxes.delete(k);
+      pane.boxes.delete(k);
     }
   }
-  fs.notes.root.hidden = boxEmpty(fs.notes);
+  pane.notes.root.hidden = boxEmpty(pane.notes);
 }
 
 function renderAllAnnotations() {
-  for (const fs of S.order) renderAnnotations(fs);
+  for (const fs of S.order) renderAnnotations(fs.pane);
+  if (S.viewer) renderAnnotations(S.viewer.pane);
+}
+
+function renderFileAnnotations(path) {
+  const fs = S.files.get(path);
+  if (fs) renderAnnotations(fs.pane);
+  if (S.viewer && S.viewer.path === path) renderAnnotations(S.viewer.pane);
 }
 
 function draftCard(d) {
@@ -656,7 +802,7 @@ function threadChip(t) {
 async function openComposer(a) {
   const fs = S.files.get(a.path);
   if (!fs) {
-    toast(`${a.path} is not among the changed files`, 'warn');
+    toast(`${a.path} is not among the changed files; comments can only go on changed files`, 'warn');
     return;
   }
   const key = a.draft ? `d${a.draft.id}` : `n:${a.side}:${a.start ?? ''}:${a.line}:${a.path}`;
@@ -668,8 +814,9 @@ async function openComposer(a) {
     c.ta.value = a.body;
     c.ta.dispatchEvent(new Event('input'));
   }
-  await anchorRow(fs, a.side, a.line);
-  renderAnnotations(fs);
+  const { pane } = await anchorRow(fs, a.side, a.line);
+  c.inViewer = pane.kind === 'full';
+  renderFileAnnotations(fs.path);
   c.el.scrollIntoView({ block: 'nearest' });
   c.ta.focus({ preventScroll: true });
 }
@@ -715,8 +862,7 @@ function makeComposer(key, a) {
 function closeComposer(c, rerender = true) {
   S.composers.delete(c.key);
   c.el.remove();
-  const fs = S.files.get(c.path);
-  if (rerender && fs) renderAnnotations(fs);
+  if (rerender) renderFileAnnotations(c.path);
 }
 
 function editDraft(d) {
@@ -748,19 +894,19 @@ async function refreshThreads() {
 
 const rowAnchor = tr => (tr.dataset.new ? { side: 'RIGHT', line: +tr.dataset.new } : { side: 'LEFT', line: +tr.dataset.old });
 
-function setSel(fs, side, from, to) {
+function setSel(pane, side, from, to) {
   unmarkSel();
   const lo = Math.min(from, to);
   const hi = Math.max(from, to);
   const marked = [];
   for (let l = lo; l <= hi; l++) {
-    const tr = fs.rows.get(`${side}:${l}`);
+    const tr = pane.rows.get(`${side}:${l}`);
     if (tr) {
       tr.classList.add('sel');
       marked.push(tr);
     }
   }
-  S.sel = { fs, side, from, start: lo === hi ? null : lo, line: hi, view: fs.rendered, marked };
+  S.sel = { pane, side, from, start: lo === hi ? null : lo, line: hi, marked, snippet: null };
 }
 
 function unmarkSel() {
@@ -774,67 +920,305 @@ function clearSel() {
   hidePopover();
 }
 
-function onGutterDown(e) {
+// Gutter press starts (or with Shift extends) a line selection; anything else
+// outside the popover drops the current selection.
+function onDocMouseDown(e) {
+  if (!(e.target instanceof Element)) return;
+  if (S.sym && !e.target.closest('.sym-popup')) closeSym();
+  const codeCell = (e.metaKey || e.ctrlKey) && e.target.closest('tr.ln-row td.code');
+  if (codeCell && paneOf(codeCell)) {
+    e.preventDefault(); // Cmd/Ctrl-click navigates (see click handler) instead of selecting text
+    if (S.sel) clearSel();
+    return;
+  }
   const td = e.target.closest('td.ln');
   const tr = td && td.closest('tr.ln-row');
-  if (!tr || e.button !== 0) return;
-  e.preventDefault(); // no text selection while picking lines
-  const fs = fileOf(tr);
-  const a = rowAnchor(tr);
-  const s = S.sel;
-  if (e.shiftKey && s && s.fs === fs && s.side === a.side && s.view === fs.rendered) setSel(fs, a.side, s.from, a.line);
-  else setSel(fs, a.side, a.line, a.line);
-  S.dragging = true;
-  hidePopover();
+  const pane = tr && paneOf(tr);
+  if (pane && e.button === 0) {
+    e.preventDefault(); // no text selection while picking lines
+    window.getSelection().removeAllRanges();
+    const a = rowAnchor(tr);
+    const s = S.sel;
+    if (e.shiftKey && s && s.pane === pane && s.side === a.side) setSel(pane, a.side, s.from, a.line);
+    else setSel(pane, a.side, a.line, a.line);
+    S.dragging = true;
+    hidePopover();
+  } else if (S.sel && !e.target.closest('.popover')) {
+    clearSel();
+  }
 }
 
 function onGutterOver(e) {
   if (!S.dragging || !S.sel) return;
   const tr = e.target.closest('tr.ln-row');
-  if (!tr || !e.target.closest('td.ln') || fileOf(tr) !== S.sel.fs) return;
+  if (!tr || !e.target.closest('td.ln') || paneOf(tr) !== S.sel.pane) return;
   const a = rowAnchor(tr);
-  if (a.side === S.sel.side) setSel(S.sel.fs, a.side, S.sel.from, a.line);
+  if (a.side === S.sel.side) setSel(S.sel.pane, a.side, S.sel.from, a.line);
+}
+
+function onDocMouseUp(e) {
+  if (e.target instanceof Element && e.target.closest('.popover')) return;
+  if (!S.dragging) {
+    setTimeout(selectFromText); // the text selection settles after mouseup
+    return;
+  }
+  S.dragging = false;
+  const s = S.sel;
+  const tr = s && s.pane.rows.get(`${s.side}:${s.line}`);
+  if (!tr) return;
+  const gutter = tr.cells[s.pane.kind === 'diff' ? 1 : 0].getBoundingClientRect();
+  showPopover(tr.getBoundingClientRect().bottom, gutter.right + 8);
+}
+
+// Code text selected with the mouse → anchor on the rows it spans: RIGHT (new
+// numbers) when any spanned row has one, else LEFT; single table only.
+function selectFromText() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return;
+  const range = sel.getRangeAt(0);
+  const rowOf = node => {
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    return el ? el.closest('tr') : null;
+  };
+  const first = rowOf(range.startContainer);
+  const last = rowOf(range.endContainer);
+  const pane = first && paneOf(first);
+  if (!pane || !last || paneOf(last) !== pane) return;
+  const body = pane.table.tBodies[0];
+  if (first.parentNode !== body || last.parentNode !== body) return;
+  if (first.classList.contains('annot') || last.classList.contains('annot')) return;
+  let end = last.sectionRowIndex;
+  if (end > first.sectionRowIndex && endsAtRowStart(range, last)) end--;
+  const spanned = [];
+  for (let k = first.sectionRowIndex; k <= end; k++) {
+    if (body.rows[k].classList.contains('ln-row')) spanned.push(body.rows[k]);
+  }
+  const side = spanned.some(r => r.dataset.new) ? 'RIGHT' : 'LEFT';
+  const nums = spanned.map(r => +(side === 'RIGHT' ? r.dataset.new : r.dataset.old)).filter(n => n > 0);
+  if (!nums.length) return;
+  const lo = nums.reduce((a, b) => Math.min(a, b));
+  const hi = nums.reduce((a, b) => Math.max(a, b));
+  unmarkSel();
+  S.sel = { pane, side, from: lo, start: lo === hi ? null : lo, line: hi, marked: [], snippet: sel.toString().slice(0, 2000) };
+  const rects = range.getClientRects();
+  const r = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+  showPopover(r.bottom, r.right);
+}
+
+// True when a range ends before any code text of `tr` (a triple-click ends at the next row's start).
+function endsAtRowStart(range, tr) {
+  const code = tr.querySelector('td.code');
+  if (!code) return true;
+  const r = document.createRange();
+  r.setStart(code, 0);
+  r.setEnd(range.endContainer, range.endOffset); // collapses when the end precedes the code cell
+  return r.toString() === '';
 }
 
 function buildPopover() {
   const label = h('span', { class: 'pop-label' });
-  const el = h('div', { class: 'popover', hidden: true },
-    label,
-    h('button', { class: 'btn small primary', onclick: popComment }, 'Comment'),
-    h('button', { class: 'btn small', onclick: popAsk }, 'Ask'));
-  S.pop = { el, label };
+  const comment = h('button', { class: 'btn small primary', onclick: popComment }, 'Comment');
+  // mousedown default would collapse a text selection before the click lands
+  const el = h('div', { class: 'popover', hidden: true, onmousedown: e => e.preventDefault() },
+    label, comment, h('button', { class: 'btn small', onclick: popAsk }, 'Ask'));
+  S.pop = { el, label, comment };
 }
 
-function showPopover() {
+// Places the popover at a viewport point, inside the selection pane's host so it scrolls along.
+function showPopover(y, x) {
   const s = S.sel;
-  const tr = s && s.fs.rows.get(`${s.side}:${s.line}`);
-  if (!tr) return;
-  const sec = s.fs.section.getBoundingClientRect();
-  const row = tr.getBoundingClientRect();
-  const gutter = tr.cells[s.view === 'diff' ? 1 : 0].getBoundingClientRect();
+  if (!s) return;
   S.pop.label.textContent = lineLabel(s);
-  S.pop.el.style.top = `${row.bottom - sec.top + 2}px`;
-  S.pop.el.style.left = `${gutter.right - sec.left + 8}px`;
-  s.fs.section.append(S.pop.el);
+  S.pop.comment.hidden = !s.pane.fs; // drafts only anchor on changed files
+  placeIn(S.pop.el, s.pane.host, x, y + 4, 240);
   S.pop.el.hidden = false;
+}
+
+// Absolutely positions `el` inside `host` at a viewport point, so it scrolls with the code.
+function placeIn(el, host, x, y, width) {
+  const hr = host.getBoundingClientRect();
+  el.style.top = `${y - hr.top + host.scrollTop}px`;
+  el.style.left = `${Math.max(0, Math.min(x - hr.left + host.scrollLeft, hr.width - width))}px`;
+  host.append(el);
 }
 
 function hidePopover() {
   if (S.pop) S.pop.el.hidden = true;
 }
 
+// ───────────────────────────── code navigation (LSP) ─────────────────────────────
+
+const LSP_BUSY = new Set(['starting', 'indexing']);
+const IDENT_CHAR = /[\p{L}\p{N}_$]/u;
+const IDENT = /^[\p{L}_$][\p{L}\p{N}_$]*$/u;
+const lspStatusUrl = (path, start) => `/api/lsp/status?path=${qpath(path)}${start ? '&start=true' : ''}`;
+
+// Starts the file's language server in the background, once per path.
+function warmLsp(path) {
+  if (S.lspWarm.has(path)) return;
+  S.lspWarm.add(path);
+  api('GET', lspStatusUrl(path, true), undefined, true).catch(() => {});
+}
+
+// Viewer header chip while the language server is starting/indexing, or failed.
+async function watchViewerLsp(v) {
+  S.lspWarm.add(v.path);
+  for (let first = true; ; first = false) {
+    let st;
+    try {
+      st = await api('GET', lspStatusUrl(v.path, first), undefined, true);
+    } catch {
+      return;
+    }
+    if (S.viewer !== v) return;
+    const busy = LSP_BUSY.has(st.state);
+    v.lspChip.hidden = !(busy || st.state === 'failed');
+    v.lspChip.className = `chip lsp-chip lsp-${st.state}`;
+    v.lspChip.textContent = `${st.server || st.language || 'LSP'} ${st.state}${busy ? '…' : ''}`;
+    v.lspChip.title = st.error || '';
+    if (!busy) return;
+    await sleep(2000);
+  }
+}
+
+function caretAt(x, y) {
+  if (document.caretPositionFromPoint) {
+    const p = document.caretPositionFromPoint(x, y);
+    return p && { node: p.offsetNode, offset: p.offset };
+  }
+  if (document.caretRangeFromPoint) {
+    const r = document.caretRangeFromPoint(x, y);
+    return r && { node: r.startContainer, offset: r.startOffset };
+  }
+  return null;
+}
+
+// Identifier-ish token under a viewport point in a code cell, with its 0-based
+// UTF-16 start column in the line (JS string indices are UTF-16 code units).
+function tokenAt(td, x, y) {
+  const c = caretAt(x, y);
+  if (!c || !td.contains(c.node)) return null;
+  const r = document.createRange();
+  r.setStart(td, 0);
+  r.setEnd(c.node, c.offset);
+  const text = td.textContent;
+  const isW = ch => !!ch && IDENT_CHAR.test(ch);
+  let i = r.toString().length;
+  if (!isW(text[i]) && isW(text[i - 1])) i--;
+  if (!isW(text[i])) return null;
+  let s = i;
+  let e = i + 1;
+  while (s > 0 && isW(text[s - 1])) s--;
+  while (e < text.length && isW(text[e])) e++;
+  return { token: text.slice(s, e), character: s };
+}
+
+function closeSym() {
+  if (!S.sym) return;
+  S.sym.el.remove();
+  S.sym = null;
+}
+
+// Clickable LSP/search location; `path: null` is outside the checkout and inert.
+function locationEl(loc) {
+  const label = loc.display || `${loc.path}:${loc.line}`;
+  const kids = [h('span', { class: 'loc-label' }, label), loc.preview && h('code', { class: 'loc-preview' }, loc.preview.trim())];
+  if (!loc.path) return h('li', { class: 'loc inert', title: 'Outside the checkout' }, kids);
+  return h('li', {}, h('button', {
+    class: 'loc', title: `${loc.path}:${loc.line}`,
+    onclick: () => {
+      closeSym();
+      openCodeRef(loc.path, loc.line, null);
+    },
+  }, kids));
+}
+
+const locList = locs => h('ul', { class: 'loc-list' }, locs.map(locationEl));
+
+// Cmd/Ctrl-click on code: hover + definitions (+ references on demand) from the
+// language server; falls back to a whole-word text search for identifiers.
+async function openSymbol(pane, tr, td, x, y) {
+  const tok = tokenAt(td, x, y);
+  if (!tok) return;
+  closeSym();
+  const line = tr.dataset.new ? +tr.dataset.new : null; // deleted lines are not in HEAD: search only
+  const body = h('div', { class: 'sym-body' }, h('div', { class: 'working' }, h('span', { class: 'spinner' }), 'Looking up…'));
+  const el = h('div', { class: 'sym-popup' },
+    h('div', { class: 'sym-head' },
+      h('code', {}, tok.token),
+      line != null && h('span', { class: 'dim' }, `${pane.path}:${line}:${tok.character + 1}`),
+      h('span', { class: 'spacer' }),
+      h('button', { class: 'icon-btn', title: 'Close', 'aria-label': 'Close', onclick: closeSym }, '×')),
+    body);
+  const sym = { el };
+  S.sym = sym;
+  placeIn(el, pane.host, x, y + 14, 560);
+
+  const pos = { path: pane.path, line, character: tok.character };
+  const parts = [];
+  let res = null;
+  if (line != null) {
+    try {
+      res = await api('POST', '/api/lsp/symbol', pos, true);
+    } catch (e) {
+      parts.push(h('div', { class: 'hint' }, `Language server: ${e.message}`));
+    }
+  }
+  if (S.sym !== sym) return;
+  if (res && res.hover) parts.push(h('div', { class: 'md sym-hover', html: md(res.hover, { headings: false }) }));
+  const defs = (res && res.definitions) || [];
+  if (defs.length) parts.push(h('div', { class: 'sym-section' }, defs.length === 1 ? 'Definition' : `Definitions (${defs.length})`), locList(defs));
+  if (res) {
+    const refsBox = h('div', {});
+    const refsBtn = h('button', {
+      class: 'btn small',
+      onclick: async () => {
+        refsBtn.disabled = true;
+        refsBtn.textContent = 'Finding references…';
+        try {
+          const r = await api('POST', '/api/lsp/references', pos);
+          const refs = r.references || [];
+          refsBox.replaceChildren(h('div', { class: 'sym-section' }, `References (${refs.length})`),
+            refs.length ? locList(refs) : h('div', { class: 'hint' }, 'No references found.'));
+        } catch {
+          refsBtn.disabled = false;
+          refsBtn.textContent = 'References';
+        }
+      },
+    }, 'References');
+    refsBox.append(refsBtn);
+    parts.push(refsBox);
+  }
+  if (!defs.length && IDENT.test(tok.token)) {
+    try {
+      const r = await get(`/api/search?q=${encodeURIComponent(tok.token)}&word=true&limit=100`);
+      if (S.sym !== sym) return;
+      const hits = r.hits || [];
+      parts.push(h('div', { class: 'sym-section' }, `Text matches (${hits.length}${r.truncated ? '+' : ''})`),
+        hits.length ? locList(hits.map(hit => ({ ...hit, display: `${hit.path}:${hit.line}` }))) : h('div', { class: 'hint' }, 'No matches.'));
+    } catch {
+      /* toasted */
+    }
+  }
+  if (S.sym !== sym) return;
+  if (!parts.length) parts.push(h('div', { class: 'hint' }, 'No symbol information.'));
+  body.replaceChildren(...parts);
+}
+
 function popComment() {
   const s = S.sel;
   if (!s) return;
   clearSel();
-  openComposer({ path: s.fs.path, side: s.side, line: s.line, start: s.start });
+  window.getSelection().removeAllRanges();
+  openComposer({ path: s.pane.path, side: s.side, line: s.line, start: s.start });
 }
 
 function popAsk() {
   const s = S.sel;
   if (!s) return;
   clearSel();
-  openChatNew({ path: s.fs.path, side: s.side, line: s.line, start: s.start });
+  window.getSelection().removeAllRanges();
+  openChatNew({ path: s.pane.path, side: s.side, line: s.line, start: s.start }, s.snippet);
 }
 
 // ───────────────────────────── drawers ─────────────────────────────
@@ -886,14 +1270,15 @@ function renderThreadList() {
       h('span', { class: 'thread-last' }, t.last))));
 }
 
-function openChatNew(anchor) {
-  Object.assign(S.chat, { threadId: null, anchor, thread: null });
+// New thread composer; `snippet` is selected code text sent along with the first question.
+function openChatNew(anchor, snippet = null) {
+  Object.assign(S.chat, { threadId: null, anchor, snippet, thread: null });
   openDrawer('chat');
   $('#chat-input').focus();
 }
 
 async function openThread(id) {
-  Object.assign(S.chat, { threadId: id, anchor: null });
+  Object.assign(S.chat, { threadId: id, anchor: null, snippet: null });
   if (!S.chat.thread || S.chat.thread.id !== id) S.chat.thread = null;
   openDrawer('chat');
   const t = await get(`/api/thread?id=${id}`);
@@ -940,7 +1325,10 @@ function renderConvo() {
   const msgs = t ? [...t.messages] : [];
   const lastAnswer = [...msgs].reverse().find(m => m.role === 'assistant');
   const chip = anchor
-    ? h('button', { class: 'anchor-chip', title: 'Jump to code', onclick: () => revealLine(anchor.path, anchor.side || 'RIGHT', anchor.line) }, anchorText(anchor))
+    ? h('button', {
+      class: 'anchor-chip', title: 'Jump to code',
+      onclick: () => revealLine(anchor.path, anchor.side || 'RIGHT', anchor.start ?? anchor.line, anchor.start != null ? anchor.line : null),
+    }, anchorText(anchor))
     : h('span', { class: 'anchor-chip whole' }, 'Whole PR');
   const draftBtn = c.threadId != null && h('button', {
     class: 'btn small', disabled: !(anchor && lastAnswer),
@@ -967,6 +1355,9 @@ function renderConvo() {
   if (!nodes.length) {
     nodes.push(h('div', { class: 'empty' }, anchor ? `Ask a question about ${anchorText(anchor)}.` : 'Ask a question about the whole pull request.'));
   }
+  if (c.threadId == null && c.snippet) {
+    nodes.unshift(h('div', { class: 'snippet' }, h('div', { class: 'snippet-label' }, 'Selected code'), h('pre', {}, c.snippet)));
+  }
   const box = $('#messages');
   box.replaceChildren(...nodes);
   box.scrollTop = box.scrollHeight;
@@ -979,9 +1370,10 @@ async function sendChat() {
   if (!question || $('#chat-send').disabled) return;
   const from = S.chat.threadId;
   const a = S.chat.anchor;
+  const snippet = from == null ? S.chat.snippet : null;
   const body = from != null
-    ? { thread: from, path: null, start: null, line: null, side: null, question }
-    : { thread: null, path: a ? a.path : null, start: a ? a.start ?? null : null, line: a ? a.line : null, side: a ? a.side : null, question };
+    ? { thread: from, path: null, start: null, line: null, side: null, snippet: null, question }
+    : { thread: null, path: a ? a.path : null, start: a ? a.start ?? null : null, line: a ? a.line : null, side: a ? a.side : null, snippet, question };
   $('#chat-send').disabled = true;
   let r;
   try {
@@ -999,6 +1391,7 @@ async function sendChat() {
     // still looking at the same conversation: it is now (or remains) r.thread
     S.chat.threadId = r.thread;
     S.chat.anchor = null;
+    S.chat.snippet = null;
     if (!S.chat.thread || S.chat.thread.id !== r.thread) S.chat.thread = { id: r.thread, anchor: a || null, messages: [], busy: true };
   }
   renderConvo();
@@ -1103,24 +1496,40 @@ async function submitReview() {
 // ───────────────────────────── wiring & boot ─────────────────────────────
 
 function wire() {
-  const sections = $('#sections');
-  sections.addEventListener('mousedown', onGutterDown);
-  sections.addEventListener('mouseover', onGutterOver);
-  sections.addEventListener('click', e => {
+  document.addEventListener('mousedown', onDocMouseDown);
+  document.addEventListener('mouseover', onGutterOver);
+  document.addEventListener('mouseup', onDocMouseUp);
+  document.addEventListener('selectionchange', () => {
+    // clearing a text selection dismisses its popover
+    if (S.sel && S.sel.snippet != null && window.getSelection().isCollapsed) clearSel();
+  });
+  document.addEventListener('click', e => {
+    if (!(e.target instanceof Element)) return;
+    const codeCell = (e.metaKey || e.ctrlKey) && e.target.closest('tr.ln-row td.code');
+    const codePane = codeCell && paneOf(codeCell);
+    if (codePane) {
+      e.preventDefault();
+      openSymbol(codePane, codeCell.parentElement, codeCell, e.clientX, e.clientY);
+      return;
+    }
+    const ref = e.target.closest('a.code-ref');
+    if (ref) {
+      e.preventDefault();
+      openCodeRef(ref.dataset.path, +ref.dataset.line, ref.dataset.end ? +ref.dataset.end : null);
+      return;
+    }
     const marker = e.target.closest('tr.del-marker');
-    if (marker) jumpToDeleted(fileOf(marker), +marker.dataset.after);
+    const pane = marker && paneOf(marker);
+    if (pane && pane.fs) jumpToDeleted(pane.fs, +marker.dataset.after);
   });
-  document.addEventListener('mouseup', () => {
-    if (!S.dragging) return;
-    S.dragging = false;
-    showPopover();
-  });
-  document.addEventListener('mousedown', e => {
-    if (S.sel && !e.target.closest('.popover') && !e.target.closest('tr.ln-row td.ln')) clearSel();
+  $('#viewer').addEventListener('click', e => {
+    if (e.target.id === 'viewer') closeViewer(); // backdrop
   });
   document.addEventListener('keydown', e => {
     if (e.key !== 'Escape') return;
-    if (S.sel) clearSel();
+    if (S.sym) closeSym();
+    else if (S.viewer) closeViewer();
+    else if (S.sel) clearSel();
     else if (S.drawer) openDrawer(null);
   });
 
