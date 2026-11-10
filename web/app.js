@@ -42,6 +42,13 @@ const S = {
   sel: null, // { pane, side, from, start, line, marked, snippet }
   dragging: false,
   pop: null, // { el, label, comment }
+  scope: { tests: false, dirs: new Set(), extra: new Set() }, // exclusion controls (see "review scope")
+  excluded: new Set(), // changed-file paths excluded from the review (server state)
+  allPaths: new Set(), // every changed path, in scope or excluded
+  fileCache: new Map(), // path → FileState, reused across scope changes
+  scopeChain: Promise.resolve(), // serializes POST /api/scope
+  scopePop: null, // open "N excluded" restore popover
+  io: null, // IntersectionObserver that lazily loads diffs
   sym: null, // { el } — open symbol (LSP) popup
   lspWarm: new Set(), // paths whose language server was asked to start
   composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
@@ -353,8 +360,9 @@ function renderBanner() {
   b.replaceChildren(S.info.submitted ? submittedNode() : '');
 }
 
+// Review badge counts drafts that will be submitted (not those on excluded files).
 function renderDraftCounts() {
-  const n = S.drafts.length;
+  const n = S.drafts.filter(d => !S.excluded.has(d.path)).length;
   const badge = $('#draft-count');
   badge.textContent = n;
   badge.hidden = n === 0;
@@ -367,11 +375,169 @@ function renderDraftCounts() {
   }
 }
 
+// ───────────── review scope: excluded files ─────────────
+// Excluding takes changed files out of the review on the server (POST /api/scope):
+// no sections or tree rows, not in chat context, drafts on them are not submitted.
+// The server owns the excluded set; locally we only remember which controls
+// (tests toggle, excluded directories) produced it, and re-derive them on load.
+
+const TEST_DIRS = new Set(['tests', 'test', '__tests__', 'testdata', 'testing', 'spec', 'fixtures']);
+const TEST_BASE = /(^test_.+\..+$)|(^.+_tests?\..+$)|(^.+_spec\..+$)|(^.+\.(test|spec)\..+$)|(^conftest\.py$)/;
+const EYE_OFF = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">' +
+  '<path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/><path d="M2.5 13.5l11-11"/></svg>';
+
+function isTestPath(path) {
+  const parts = path.toLowerCase().split('/');
+  const base = parts.pop();
+  return parts.some(p => TEST_DIRS.has(p)) || TEST_BASE.test(base);
+}
+
+const underDir = (path, dir) => path.startsWith(dir);
+const pathsUnder = dir => [...S.allPaths].filter(p => underDir(p, dir));
+const testPaths = () => [...S.allPaths].filter(isTestPath);
+const coveredByControls = p => (S.scope.tests && isTestPath(p)) || [...S.scope.dirs].some(d => underDir(p, d));
+
+function scopePrefKey() {
+  const { pr, branch } = S.info;
+  return `review-master:scope:${pr ? `${pr.owner}/${pr.repo}#${pr.number}` : `local:${branch}`}`;
+}
+
+function saveScopePrefs() {
+  try {
+    localStorage.setItem(scopePrefKey(), JSON.stringify({ tests: S.scope.tests, dirs: [...S.scope.dirs] }));
+  } catch {
+    /* storage unavailable: controls fall back to single-file entries on reload */
+  }
+}
+
+// Re-derives the controls from the server's excluded set: a remembered control
+// holds only while everything it covers is still excluded; the rest are single files.
+function reconcileScope() {
+  let prefs = {};
+  try {
+    prefs = JSON.parse(localStorage.getItem(scopePrefKey()) || '{}') || {};
+  } catch {
+    prefs = {};
+  }
+  const allOut = paths => paths.length > 0 && paths.every(p => S.excluded.has(p));
+  S.scope.tests = !!prefs.tests && allOut(testPaths());
+  const dirs = Array.isArray(prefs.dirs) ? prefs.dirs : [];
+  S.scope.dirs = new Set(dirs.filter(d => typeof d === 'string' && allOut(pathsUnder(d))));
+  S.scope.extra = new Set([...S.excluded].filter(p => !coveredByControls(p)));
+}
+
+function computeExcluded() {
+  const out = new Set(S.scope.extra);
+  if (S.scope.tests) for (const p of testPaths()) out.add(p);
+  for (const d of S.scope.dirs) for (const p of pathsUnder(d)) out.add(p);
+  return [...out].sort();
+}
+
+// Applies a control mutation on the server (one request at a time) and re-renders
+// from the returned file list; reverts the controls when the request fails.
+function changeScope(mutate, message = null) {
+  const run = S.scopeChain.then(async () => {
+    const prev = { tests: S.scope.tests, dirs: new Set(S.scope.dirs), extra: new Set(S.scope.extra) };
+    mutate();
+    let r;
+    try {
+      r = await post('/api/scope', { excluded: computeExcluded() });
+    } catch {
+      Object.assign(S.scope, prev);
+      renderScopeControls();
+      return false;
+    }
+    S.excluded = new Set(r.excluded || []);
+    for (const f of r.files || []) S.allPaths.add(f.path);
+    for (const p of S.excluded) S.allPaths.add(p);
+    S.scope.extra = new Set([...S.scope.extra].filter(p => S.excluded.has(p)));
+    saveScopePrefs();
+    renderScope(r.files || []);
+    if (message) toast(typeof message === 'function' ? message() : message, 'info');
+    return true;
+  });
+  S.scopeChain = run.catch(() => false);
+  return run;
+}
+
+const setExcludeTests = on => changeScope(() => { S.scope.tests = on; });
+const restoreBranch = dir => changeScope(() => S.scope.dirs.delete(dir), `Restored ${dir}`);
+const restoreFile = path => changeScope(() => S.scope.extra.delete(path), `Restored ${path}`);
+const restoreAll = () => changeScope(() => {
+  S.scope.tests = false;
+  S.scope.dirs.clear();
+  S.scope.extra.clear();
+}, 'Restored all excluded files');
+
+function excludeBranch(dir) {
+  return changeScope(() => {
+    for (const d of [...S.scope.dirs]) if (d.startsWith(dir)) S.scope.dirs.delete(d); // subsumed by the new one
+    S.scope.dirs.add(dir);
+  });
+}
+
+// A jump into an excluded file first brings it back: its excluded directory, the
+// tests toggle, or the file itself. Resolves false when the restore failed.
+function ensureInScope(path) {
+  if (!S.excluded.has(path)) return Promise.resolve(true);
+  const what = [];
+  return changeScope(() => {
+    for (const d of [...S.scope.dirs]) {
+      if (underDir(path, d)) {
+        S.scope.dirs.delete(d);
+        what.push(d);
+      }
+    }
+    if (S.scope.tests && isTestPath(path)) {
+      S.scope.tests = false;
+      what.push('test files');
+    }
+    if (S.scope.extra.delete(path) || !what.length) what.push(path);
+  }, () => `Restored ${what.join(', ')}`);
+}
+
+function renderScopeControls() {
+  const nTests = testPaths().length;
+  $('#hide-tests').checked = S.scope.tests;
+  $('#test-count').textContent = `Exclude tests · ${nTests}`;
+  $('#test-toggle').hidden = nTests === 0;
+  if (S.scopePop) renderScopePop();
+}
+
+function toggleScopePop() {
+  if (S.scopePop) return closeScopePop();
+  S.scopePop = h('div', { class: 'scope-pop' });
+  $('#sidebar .side-head').append(S.scopePop);
+  renderScopePop();
+}
+
+function closeScopePop() {
+  if (!S.scopePop) return;
+  S.scopePop.remove();
+  S.scopePop = null;
+}
+
+function renderScopePop() {
+  const row = (label, restore) => h('li', {},
+    h('span', { class: 'scope-label', title: label }, label),
+    h('button', { class: 'icon-btn', title: 'Restore to the review', 'aria-label': `Restore ${label}`, onclick: restore }, '✕'));
+  const rows = [];
+  if (S.scope.tests) rows.push(row(`Tests (${testPaths().length})`, () => setExcludeTests(false)));
+  for (const d of [...S.scope.dirs].sort()) rows.push(row(`${d} (${pathsUnder(d).length})`, () => restoreBranch(d)));
+  for (const p of [...S.scope.extra].sort()) rows.push(row(p, () => restoreFile(p)));
+  if (!rows.length) return closeScopePop();
+  S.scopePop.replaceChildren(
+    h('div', { class: 'scope-pop-title' }, 'Excluded from review'),
+    h('ul', {}, rows),
+    h('button', { class: 'btn small', onclick: restoreAll }, 'Show all'));
+}
+
 function buildSidebar() {
-  const files = S.info.files;
-  const add = files.reduce((n, f) => n + f.additions, 0);
-  const del = files.reduce((n, f) => n + f.deletions, 0);
-  $('#file-summary').replaceChildren(plural(files.length, 'file'), ' ', counts({ additions: add, deletions: del }));
+  const add = S.order.reduce((n, fs) => n + fs.file.additions, 0);
+  const del = S.order.reduce((n, fs) => n + fs.file.deletions, 0);
+  const out = S.excluded.size;
+  $('#file-summary').replaceChildren(plural(S.order.length, 'file'), ' ', counts({ additions: add, deletions: del }),
+    ...(out ? [' · ', h('button', { class: 'link-btn scope-link', title: 'Excluded files', onclick: toggleScopePop }, `${out} excluded`)] : []));
   const root = { dirs: new Map(), files: [] };
   for (const fs of S.order) {
     let node = root;
@@ -404,19 +570,13 @@ function treeItems(node, prefix) {
       li.classList.toggle('collapsed', closed);
     };
     li.append(
-      h('button', { class: 'dir-row', title: path, onclick: toggle }, h('span', { class: 'chevron' }, '▾'), h('span', { class: 'dir-name' }, label)),
+      h('div', { class: 'dir-line' },
+        h('button', { class: 'dir-row', title: path, onclick: toggle }, h('span', { class: 'chevron' }, '▾'), h('span', { class: 'dir-name' }, label)),
+        h('button', { class: 'dir-hide', title: 'Exclude from review', 'aria-label': `Exclude ${path} from the review`, onclick: () => excludeBranch(path), html: EYE_OFF })),
       h('ul', { class: 'tree' }, treeItems(dir, path)));
     items.push(li);
   }
-  for (const fs of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
-    fs.navBadge = h('span', { class: 'nav-drafts', title: 'drafts', hidden: true });
-    fs.nav = h('li', {},
-      h('button', { class: 'file-item', title: fs.path, onclick: () => jumpToFile(fs) },
-        statusBadge(fs.file.status),
-        h('span', { class: 'path' }, h('span', { class: 'base' }, splitPath(fs.path)[1])),
-        fs.navBadge, counts(fs.file)));
-    items.push(fs.nav);
-  }
+  for (const fs of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) items.push(fs.nav);
   return items;
 }
 
@@ -431,10 +591,10 @@ function setCurrent(fs) {
 // Highlights the last file section whose top has scrolled past the top of the main column.
 function trackCurrent() {
   const top = $('#main').getBoundingClientRect().top + 60;
-  let cur = S.order[0];
+  let cur = null;
   for (const fs of S.order) {
-    if (fs.section.getBoundingClientRect().top <= top) cur = fs;
-    else break;
+    if (cur && fs.section.getBoundingClientRect().top > top) break;
+    cur = fs;
   }
   setCurrent(cur);
 }
@@ -469,37 +629,58 @@ const fileTitle = f => (f.status === 'renamed' && f.old_path
   ? h('span', { class: 'rename' }, pathLabel(f.old_path), h('span', { class: 'arrow' }, ' → '), pathLabel(f.path))
   : pathLabel(f.path));
 
-function buildSections() {
-  const wrap = $('#sections');
-  if (!S.info.files.length) {
-    wrap.replaceChildren(h('div', { class: 'empty big' }, 'No changed files.'));
-    return;
-  }
-  S.info.files.forEach((f, idx) => {
-    const fs = { file: f, path: f.path, idx, diff: null, pane: null, loading: null };
-    const deleted = f.status === 'deleted';
-    const full = h('button', {
-      class: 'btn small', disabled: deleted,
-      title: deleted ? 'File was deleted; only the diff is available' : 'Open the whole file at HEAD',
-      onclick: () => openViewer(f.path),
-    }, 'Full file');
-    fs.head = h('div', { class: 'file-head' }, statusBadge(f.status), fileTitle(f), counts(f), h('span', { class: 'spacer' }), full);
-    fs.notes = makeNotes();
-    fs.body = h('div', { class: 'file-body' }, h('div', { class: 'placeholder' }, 'Loading…'));
-    fs.section = h('section', { class: 'file', 'data-idx': idx }, fs.head, fs.notes.root, fs.body);
-    S.files.set(f.path, fs);
-    S.order.push(fs);
-    wrap.append(fs.section);
-  });
+function makeFileState(f) {
+  const fs = { file: f, path: f.path, idx: 0, diff: null, pane: null, loading: null };
+  fs.navBadge = h('span', { class: 'nav-drafts', title: 'drafts', hidden: true });
+  fs.nav = h('li', {},
+    h('button', { class: 'file-item', title: f.path, onclick: () => jumpToFile(fs) },
+      statusBadge(f.status), h('span', { class: 'path' }, h('span', { class: 'base' }, splitPath(f.path)[1])),
+      fs.navBadge, counts(f)));
+  const deleted = f.status === 'deleted';
+  const full = h('button', {
+    class: 'btn small', disabled: deleted,
+    title: deleted ? 'File was deleted; only the diff is available' : 'Open the whole file at HEAD',
+    onclick: () => openViewer(f.path),
+  }, 'Full file');
+  fs.head = h('div', { class: 'file-head' }, statusBadge(f.status), fileTitle(f), counts(f), h('span', { class: 'spacer' }), full);
+  fs.notes = makeNotes();
+  fs.body = h('div', { class: 'file-body' }, h('div', { class: 'placeholder' }, 'Loading…'));
+  fs.section = h('section', { class: 'file' }, fs.head, fs.notes.root, fs.body);
+  return fs;
+}
 
-  const io = new IntersectionObserver(entries => {
-    for (const en of entries) {
-      if (!en.isIntersecting) continue;
-      io.unobserve(en.target);
-      ensureLoaded(fileOf(en.target)).catch(() => {});
+// (Re)builds sections and the tree for the files in review scope; file states
+// (loaded diffs, panes) are reused when a file comes back into scope.
+function renderScope(files) {
+  closeSym();
+  if (S.viewer && S.excluded.has(S.viewer.path)) closeViewer();
+  if (S.sel && S.excluded.has(S.sel.pane.path)) clearSel();
+  S.files = new Map();
+  S.order = files.map((f, idx) => {
+    let fs = S.fileCache.get(f.path);
+    if (!fs) {
+      fs = makeFileState(f);
+      S.fileCache.set(f.path, fs);
     }
-  }, { root: $('#main'), rootMargin: '600px 0px' });
-  for (const fs of S.order) io.observe(fs.section);
+    fs.idx = idx;
+    fs.section.dataset.idx = idx;
+    S.files.set(f.path, fs);
+    return fs;
+  });
+  const wrap = $('#sections');
+  if (S.order.length) wrap.replaceChildren(...S.order.map(fs => fs.section));
+  else wrap.replaceChildren(h('div', { class: 'empty big' }, S.excluded.size ? 'All changed files are excluded from the review.' : 'No changed files.'));
+  for (const fs of S.order) if (!fs.pane) S.io.observe(fs.section);
+  if (S.current && !S.files.has(S.current.path)) {
+    S.current.nav.classList.remove('active');
+    S.current = null;
+  }
+  buildSidebar();
+  renderScopeControls();
+  renderDraftCounts();
+  renderAllAnnotations();
+  renderReviewDrafts();
+  trackCurrent();
 }
 
 const fileOf = el => {
@@ -707,6 +888,7 @@ async function anchorRow(fs, side, line) {
 // Scrolls to and flashes an anchor (lines line..end). New-side lines outside the
 // diff, and files that are not part of the change, open in the file viewer.
 async function revealLine(path, side, line, end = null) {
+  if (!(await ensureInScope(path))) return;
   const fs = S.files.get(path);
   if (!fs) return openViewer(path, { line, end });
   const { pane, tr } = await anchorRow(fs, side, line);
@@ -723,7 +905,8 @@ async function revealLine(path, side, line, end = null) {
 // Click on a code reference in rendered markdown (chat answers, draft bodies).
 function openCodeRef(rawPath, line, end) {
   let path = rawPath.replace(/^\.\//, '');
-  if (!S.files.has(path) && /^[ab]\//.test(path) && S.files.has(path.slice(2))) path = path.slice(2); // diff prefixes
+  const known = p => S.files.has(p) || S.excluded.has(p);
+  if (!known(path) && /^[ab]\//.test(path) && known(path.slice(2))) path = path.slice(2); // diff prefixes
   closeViewer(); // changed files prefer their diff
   return revealLine(path, 'RIGHT', line, end != null && end > line ? end : null);
 }
@@ -800,6 +983,7 @@ function threadChip(t) {
 }
 
 async function openComposer(a) {
+  if (!(await ensureInScope(a.path))) return;
   const fs = S.files.get(a.path);
   if (!fs) {
     toast(`${a.path} is not among the changed files; comments can only go on changed files`, 'warn');
@@ -925,6 +1109,7 @@ function clearSel() {
 function onDocMouseDown(e) {
   if (!(e.target instanceof Element)) return;
   if (S.sym && !e.target.closest('.sym-popup')) closeSym();
+  if (S.scopePop && !e.target.closest('.scope-pop, .scope-link')) closeScopePop();
   const codeCell = (e.metaKey || e.ctrlKey) && e.target.closest('tr.ln-row td.code');
   if (codeCell && paneOf(codeCell)) {
     e.preventDefault(); // Cmd/Ctrl-click navigates (see click handler) instead of selecting text
@@ -1463,6 +1648,7 @@ function renderReviewDrafts() {
     return h('li', { class: 'review-draft' },
       h('div', { class: 'rd-head' },
         sevPill(d.severity),
+        S.excluded.has(d.path) && h('span', { class: 'tag tag-excluded' }, "excluded — won't be submitted"),
         h('button', { class: 'link-btn rd-loc', title: 'Jump to line', onclick: () => revealLine(d.path, d.side, d.line) }, `${d.path}:${lineLabel(d)}`),
         h('span', { class: 'spacer' }),
         h('button', { class: 'icon-btn', title: 'Delete draft', 'aria-label': 'Delete draft', onclick: () => deleteDraft(d) }, '×')),
@@ -1476,7 +1662,8 @@ function renderReviewDrafts() {
 
 async function submitReview() {
   const ev = EVENTS.find(e => e.value === S.review.event);
-  if (!confirm(`Submit review as "${ev.label}" with ${plural(S.drafts.length, 'draft comment')}?`)) return;
+  const n = S.drafts.filter(d => !S.excluded.has(d.path)).length;
+  if (!confirm(`Submit review as "${ev.label}" with ${plural(n, 'draft comment')}?`)) return;
   S.review.submitting = true;
   renderReview();
   try {
@@ -1528,6 +1715,7 @@ function wire() {
   document.addEventListener('keydown', e => {
     if (e.key !== 'Escape') return;
     if (S.sym) closeSym();
+    else if (S.scopePop) closeScopePop();
     else if (S.viewer) closeViewer();
     else if (S.sel) clearSel();
     else if (S.drawer) openDrawer(null);
@@ -1571,9 +1759,20 @@ async function boot() {
   }
   renderHeader();
   renderBanner();
-  buildSections();
-  buildSidebar();
-  setCurrent(S.order[0]);
+  S.excluded = new Set(S.info.excluded || []);
+  for (const f of S.info.files) S.allPaths.add(f.path);
+  for (const p of S.excluded) S.allPaths.add(p);
+  reconcileScope();
+  S.io = new IntersectionObserver(entries => {
+    for (const en of entries) {
+      if (!en.isIntersecting) continue;
+      S.io.unobserve(en.target);
+      const fs = fileOf(en.target);
+      if (fs) ensureLoaded(fs).catch(() => {});
+    }
+  }, { root: $('#main'), rootMargin: '600px 0px' });
+  $('#hide-tests').addEventListener('change', e => setExcludeTests(e.target.checked));
+  renderScope(S.info.files.filter(f => !S.excluded.has(f.path)));
   const [drafts, threads] = await Promise.all([get('/api/drafts'), get('/api/threads')]);
   S.drafts = drafts || [];
   S.threads = threads || [];

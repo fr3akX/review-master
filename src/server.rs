@@ -35,10 +35,13 @@ pub struct AppState {
     pub head_sha: String,
     pub branch: String,
     pub dirty: bool,
-    pub model: Model,
-    pub anchors: Diff,
-    /// Files dropped from the review (excluded or over budget).
-    pub skipped: Vec<String>,
+    /// The whole change (after command-line excludes); the scope filters it.
+    full: Model,
+    /// Files dropped on the command line, for the chat prompt note.
+    cli_skipped: Vec<String>,
+    /// What this review currently covers (runtime exclusions applied).
+    scope: Mutex<Scope>,
+    scope_file: PathBuf,
     pub engine: Engine,
     /// The `gh` login, for own-PR hints in the UI.
     pub viewer: Option<String>,
@@ -47,6 +50,25 @@ pub struct AppState {
     threads: Mutex<Threads>,
     jobs: Mutex<Jobs>,
     submitted: Mutex<Option<String>>,
+}
+
+/// The files this review currently covers.
+struct Scope {
+    model: Model,
+    anchors: Diff,
+    /// Runtime-excluded exact paths, persisted across restarts.
+    excluded: Vec<String>,
+}
+
+fn build_scope(full: &Model, excluded: Vec<String>) -> Scope {
+    let model = Model { files: full.files.iter().filter(|f| !excluded.contains(&f.path)).cloned().collect() };
+    let anchors = model.anchors();
+    Scope { model, anchors, excluded }
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct StoredScope {
+    excluded: Vec<String>,
 }
 
 impl AppState {
@@ -62,18 +84,22 @@ impl AppState {
         engine: Engine,
         viewer: Option<String>,
         drafts_file: PathBuf,
+        scope_file: PathBuf,
         lsp: Lsp,
     ) -> Arc<AppState> {
-        let anchors = model.anchors();
+        let stored: StoredScope = fs::read(&scope_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let excluded: Vec<String> = stored.excluded.into_iter().filter(|p| model.file(p).is_some()).collect();
+        let scope = build_scope(&model, excluded);
         Arc::new(AppState {
             root,
             pr,
             head_sha,
             branch,
             dirty,
-            model,
-            anchors,
-            skipped,
+            full: model,
+            cli_skipped: skipped,
+            scope: Mutex::new(scope),
+            scope_file,
             engine,
             viewer,
             lsp,
@@ -88,6 +114,18 @@ impl AppState {
         match &self.pr {
             Some((r, m)) => review::Subject::pr(r, m, &self.head_sha),
             None => review::Subject::local(&self.branch, &self.head_sha, self.dirty),
+        }
+    }
+
+    /// Everything not in this review, for the chat prompt.
+    fn out_of_scope(&self, scope: &Scope) -> Vec<String> {
+        self.cli_skipped.iter().chain(scope.excluded.iter()).cloned().collect()
+    }
+
+    fn save_scope(&self, excluded: &[String]) {
+        let stored = StoredScope { excluded: excluded.to_vec() };
+        if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+            let _ = fs::write(&self.scope_file, bytes);
         }
     }
 }
@@ -243,6 +281,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/draft/{id}", delete(delete_draft))
         .route("/api/drafts", get(drafts))
         .route("/api/submit", post_to(submit))
+        .route("/api/scope", post_to(set_scope))
         .route("/api/search", get(text_search))
         .route("/api/lsp/status", get(lsp_status))
         .route("/api/lsp/symbol", post_to(lsp_symbol))
@@ -262,9 +301,8 @@ async fn asset(content_type: &'static str, body: &'static str) -> Response {
 
 // ---- handlers ---------------------------------------------------------------
 
-async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
-    let files: Vec<Value> = st
-        .model
+fn files_json(model: &Model) -> Vec<Value> {
+    model
         .files
         .iter()
         .map(|f| {
@@ -276,7 +314,14 @@ async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
                 "deletions": f.deletions,
             })
         })
-        .collect();
+        .collect()
+}
+
+async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let (files, excluded) = {
+        let scope = st.scope.lock().unwrap();
+        (files_json(&scope.model), scope.excluded.clone())
+    };
     let pr = st.pr.as_ref().map(|(r, m)| {
         json!({
             "owner": r.owner, "repo": r.repo, "number": r.number,
@@ -294,7 +339,8 @@ async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "engine": { "kind": st.engine.kind().id(), "model": st.engine.model() },
         "viewer": st.viewer,
         "files": files,
-        "skipped": st.skipped,
+        "skipped": st.cli_skipped,
+        "excluded": excluded,
         "submitted": *st.submitted.lock().unwrap(),
     }))
 }
@@ -305,7 +351,8 @@ struct PathQuery {
 }
 
 async fn file_diff(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> ApiResult {
-    let file = st.model.file(&q.path).ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("`{}` is not part of the change", q.path)))?;
+    let scope = st.scope.lock().unwrap();
+    let file = scope.model.file(&q.path).ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("`{}` is not part of the review", q.path)))?;
     let hunks: Vec<Value> = file
         .hunks
         .iter()
@@ -411,7 +458,8 @@ async fn lsp_outline(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>
 }
 
 async fn source(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> ApiResult {
-    if st.model.file(&q.path).is_some_and(|f| f.status == Status::Deleted) {
+    let scope = st.scope.lock().unwrap();
+    if scope.model.file(&q.path).is_some_and(|f| f.status == Status::Deleted) {
         return Err(fail(StatusCode::GONE, format!("`{}` is deleted by this change; use the diff view", q.path)));
     }
     let (full, shown) = verify::resolve(&st.root, &q.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
@@ -428,7 +476,7 @@ async fn source(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> 
     }
     let mut added: Vec<u64> = Vec::new();
     let mut deleted_after: HashMap<String, u64> = HashMap::new();
-    if let Some(file) = st.model.file(&q.path) {
+    if let Some(file) = scope.model.file(&q.path) {
         for hunk in &file.hunks {
             // Anchor deletions to the preceding surviving (new-numbered) line.
             let mut last_new = hunk.lines.iter().find_map(|l| l.new).unwrap_or(1).saturating_sub(1);
@@ -486,8 +534,8 @@ struct ChatAnswer {
 }
 
 /// The rendered diff hunk(s) containing the anchor.
-fn anchored_hunks(st: &AppState, a: &Anchor) -> String {
-    let Some(file) = st.model.file(&a.path) else { return String::new() };
+fn anchored_hunks(model: &Model, a: &Anchor) -> String {
+    let Some(file) = model.file(&a.path) else { return String::new() };
     let mut out = String::new();
     for hunk in &file.hunks {
         let hit = hunk.lines.iter().any(|l| match a.side {
@@ -545,10 +593,11 @@ fn chat_prompt(st: &AppState, anchor: Option<&Anchor>, snippet: Option<&str>, qu
     if !description.is_empty() {
         p.push_str(&format!("\n<description>\n{description}\n</description>\n"));
     }
+    let scope = st.scope.lock().unwrap();
     match anchor {
         Some(a) => {
             p.push_str(&format!("\nThe reviewer selected {} ({} side of the diff).\n", a.location(), a.side.api()));
-            let hunks = anchored_hunks(st, a);
+            let hunks = anchored_hunks(&scope.model, a);
             if !hunks.is_empty() {
                 p.push_str(&format!("\n<diff-hunk>\n{hunks}</diff-hunk>\n"));
             }
@@ -558,9 +607,14 @@ fn chat_prompt(st: &AppState, anchor: Option<&Anchor>, snippet: Option<&str>, qu
             }
         }
         None => {
-            let list: Vec<String> = st.model.files.iter().map(|f| format!("{} ({})", f.path, f.status.api())).collect();
+            let list: Vec<String> = scope.model.files.iter().map(|f| format!("{} ({})", f.path, f.status.api())).collect();
             p.push_str(&format!("\nChanged files: {}\n", list.join(", ")));
         }
+    }
+    let out = st.out_of_scope(&scope);
+    drop(scope);
+    if !out.is_empty() {
+        p.push_str(&format!("\nExcluded from this review (the reviewer chose not to review them; ignore them): {}\n", out.join(", ")));
     }
     if let Some(snippet) = snippet.map(str::trim).filter(|s| !s.is_empty()) {
         let cut: String = snippet.chars().take(2000).collect();
@@ -719,7 +773,7 @@ async fn upsert_draft(State(st): State<Arc<AppState>>, Json(req): Json<DraftRequ
         Some(s) if s > req.line => (Some(req.line), s),
         other => (other, req.line),
     };
-    let problem = st.anchors.check(&req.path, side, start, line).err();
+    let problem = st.scope.lock().unwrap().anchors.check(&req.path, side, start, line).err();
     let mut drafts = st.drafts.lock().unwrap();
     let id = match req.id {
         Some(id) => {
@@ -779,20 +833,32 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
     }
     let mut inline = Vec::new();
     let mut fallback = Vec::new();
-    for d in items {
-        let finding = Finding {
-            path: d.path,
-            line: d.line,
-            start_line: d.start,
-            side: Some(d.side),
-            severity: d.severity,
-            title: None,
-            body: d.body,
-        };
-        match review::anchor(&st.anchors, &finding) {
-            Ok(a) => inline.push(a),
-            Err(bad) => fallback.push(bad),
+    let mut excluded_drafts = 0usize;
+    {
+        let scope = st.scope.lock().unwrap();
+        for d in items {
+            // Drafts on files excluded from this review are kept but never posted.
+            if scope.model.file(&d.path).is_none() {
+                excluded_drafts += 1;
+                continue;
+            }
+            let finding = Finding {
+                path: d.path,
+                line: d.line,
+                start_line: d.start,
+                side: Some(d.side),
+                severity: d.severity,
+                title: None,
+                body: d.body,
+            };
+            match review::anchor(&scope.anchors, &finding) {
+                Ok(a) => inline.push(a),
+                Err(bad) => fallback.push(bad),
+            }
         }
+    }
+    if inline.is_empty() && fallback.is_empty() && req.body.trim().is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, format!("nothing to submit: {excluded_drafts} draft(s) sit on files excluded from this review")));
     }
     let payload = post::payload(&st.head_sha, event, &req.body, &inline, &fallback);
     let pref = PrRef { owner: pref.owner.clone(), repo: pref.repo.clone(), number: pref.number };
@@ -801,11 +867,32 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
     *st.submitted.lock().unwrap() = Some(url.clone());
-    // Submitted drafts are done; clear them so a follow-up review starts clean.
+    // Submitted drafts are done; drafts on excluded files survive for a later review.
     {
         let mut drafts = st.drafts.lock().unwrap();
-        drafts.items.clear();
+        let scope = st.scope.lock().unwrap();
+        drafts.items.retain(|d| scope.model.file(&d.path).is_none());
         drafts.save();
     }
-    Ok(Json(json!({ "url": url })))
+    Ok(Json(json!({ "url": url, "not_submitted": excluded_drafts })))
+}
+
+#[derive(Deserialize)]
+struct ScopeRequest {
+    excluded: Vec<String>,
+}
+
+/// Replace the set of files excluded from this review; persisted across restarts.
+async fn set_scope(State(st): State<Arc<AppState>>, Json(req): Json<ScopeRequest>) -> ApiResult {
+    let mut excluded: Vec<String> = req.excluded.into_iter().filter(|p| st.full.file(p).is_some()).collect();
+    excluded.sort();
+    excluded.dedup();
+    if excluded.len() == st.full.files.len() {
+        return Err(fail(StatusCode::BAD_REQUEST, "cannot exclude every file in the review"));
+    }
+    let scope = build_scope(&st.full, excluded);
+    st.save_scope(&scope.excluded);
+    let response = json!({ "files": files_json(&scope.model), "skipped": st.cli_skipped, "excluded": scope.excluded });
+    *st.scope.lock().unwrap() = scope;
+    Ok(Json(response))
 }

@@ -6,6 +6,10 @@ at a pull request (or a bare worktree) and it opens a local web UI:
 - browse the changed files in a collapsible **directory tree**; per-file
   **diff view**, and a **file viewer** for the whole file with highlighted
   changes and syntax highlighting;
+- **exclude files from the review** right from the tree — a whole branch
+  (`docs/`, generated code) or all test files with one toggle; excluded files
+  leave the diff, the counts, and what the LLM is told about, and the set
+  persists per PR (restore any of it from the `· N excluded` chip);
 - **code navigation through language servers** (rust-analyzer, pyright,
   tsserver, gopls, clangd, Metals): Cmd/Ctrl-click an identifier for hover,
   definitions and references, with whole-word text search as the fallback;

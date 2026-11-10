@@ -55,6 +55,7 @@ pub enum Kind {
     Del,
 }
 
+#[derive(Clone)]
 pub struct Line {
     pub kind: Kind,
     /// Old-file line number (`None` for added lines).
@@ -65,12 +66,14 @@ pub struct Line {
     pub text: String,
 }
 
+#[derive(Clone)]
 pub struct Hunk {
     /// The original `@@ … @@ …` header line, verbatim.
     pub header: String,
     pub lines: Vec<Line>,
 }
 
+#[derive(Clone)]
 pub struct FileEntry {
     /// The surviving path (new side; old side for deletions) — what GitHub comments use.
     pub path: String,
@@ -83,7 +86,7 @@ pub struct FileEntry {
 }
 
 /// The whole change, in diff order.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Model {
     pub files: Vec<FileEntry>,
 }
