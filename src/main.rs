@@ -24,6 +24,7 @@ mod review;
 mod search;
 mod server;
 mod term;
+mod update;
 mod verify;
 
 use clap::Parser;
@@ -100,6 +101,12 @@ struct Args {
     /// and exit; also offered on the first interactive launch without one
     #[arg(long)]
     configure: bool,
+    /// Install the latest release now (for installs made with the release installer) and exit
+    #[arg(long)]
+    update: bool,
+    /// Skip the check for a newer release (also: REVIEW_MASTER_NO_UPDATE=1)
+    #[arg(long)]
+    no_update: bool,
 }
 
 fn parse_lsp(raw: &str) -> Result<(String, String), String> {
@@ -244,6 +251,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.anthropic_login {
         anthropic_auth::login().await?;
         return Ok(());
+    }
+    if args.update {
+        println!("{}", update::update_now().await?);
+        return Ok(());
+    }
+    if !args.no_update {
+        // Off the startup path; prints a one-line notice when a newer release exists.
+        tokio::spawn(async {
+            if let Some(message) = update::notice().await {
+                println!("{message}");
+            }
+        });
     }
     if args.configure {
         if !term::interactive() {

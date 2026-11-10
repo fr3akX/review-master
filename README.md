@@ -50,6 +50,53 @@ review-master https://github.com/o/r/pull/7
 review-master                                      # no PR: review this worktree vs the default branch
 ```
 
+## Install
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fr3akX/review-master/releases/latest/download/review-master-installer.sh | sh
+```
+
+The installer downloads the prebuilt binary for your platform (macOS and Linux,
+x86_64 and arm64) from the latest
+[GitHub release](https://github.com/fr3akX/review-master/releases), checks its
+checksum and puts `review-master` in `~/.cargo/bin` (it offers to add that to
+your `PATH`).
+
+From source, with a Rust toolchain:
+`cargo install --git https://github.com/fr3akX/review-master --locked` (or
+`cargo install --path . --locked` in a checkout).
+
+### Updates
+
+At most every 6 hours, a review-master installed by the installer checks GitHub
+Releases in the background and prints a one-line notice when a newer version
+exists:
+
+```
+review-master 0.2.0 is available (you have 0.1.0): run `review-master --update`
+```
+
+`review-master --update` downloads and installs it with the same installer.
+`--no-update`, or `REVIEW_MASTER_NO_UPDATE=1`, skips the check. Builds from
+source are not checked; update them by re-running `cargo install`.
+
+### Releasing
+
+Releases are built by GitHub Actions with
+[dist](https://github.com/axodotdev/cargo-dist)
+(`.github/workflows/release.yml`, configured in `dist-workspace.toml`). To
+publish:
+
+```sh
+# bump `version` in Cargo.toml, then:
+cargo build && git commit -am "Release 0.2.0"
+git tag v0.2.0 && git push origin main v0.2.0
+```
+
+The tag triggers builds for the four targets and a GitHub release with the
+archives, checksums and `review-master-installer.sh`. After changing
+`dist-workspace.toml`, run `dist generate` to update the workflow.
+
 ## What a run does
 
 1. Resolves the PR (URL, `owner/repo#N`, or a bare number against the
@@ -100,6 +147,8 @@ settings.
 | `--openai-base-url` | `$OPENAI_BASE_URL` | OpenAI-compatible API root |
 | `--configure` | | interactive setup, then exit |
 | `--anthropic-login` | | Claude subscription OAuth sign-in, then exit |
+| `--update` | | install the latest release now (installer installs), then exit |
+| `--no-update` | | skip the check for a newer release (also `REVIEW_MASTER_NO_UPDATE=1`) |
 
 ## Tests
 

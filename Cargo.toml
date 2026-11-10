@@ -2,9 +2,11 @@
 name = "review-master"
 version = "0.1.0"
 edition = "2021"
-description = "review-master: agent pull-request reviews posted as line-anchored inline comments"
+description = "review-master: code review for humans in a local web UI — diffs, LSP navigation, line-anchored LLM chat, one GitHub review"
+repository = "https://github.com/fr3akX/review-master"
 
 [dependencies]
+axoupdater = "0.10.3"
 axum = "0.8"
 base64 = "0.23.1"
 clap = { version = "4", features = ["derive"] }
@@ -22,6 +24,10 @@ toml = "1"
 uuid = { version = "1.29.0", features = ["v4"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
 
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
