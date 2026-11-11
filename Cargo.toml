@@ -1,6 +1,6 @@
 [package]
 name = "review-master"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "review-master: code review for humans in a local web UI — diffs, LSP navigation, line-anchored LLM chat, one GitHub or GitLab review"
 repository = "https://github.com/fr3akX/review-master"
