@@ -15,6 +15,10 @@ mkdir -p "$WORK/out" "$SHOTS"
 SERVER=; ENGINE=; FAILED=0
 
 stop_server() { [ -n "$SERVER" ] && kill "$SERVER" 2>/dev/null && wait "$SERVER" 2>/dev/null; SERVER=; }
+exited() { # the suite pressed Exit: the server process must end by itself
+  for _ in $(seq 50); do kill -0 "$SERVER" 2>/dev/null || { wait "$SERVER"; SERVER=; return 0; }; sleep 0.1; done
+  echo "   server still running after Exit"; FAILED=1; stop_server
+}
 cleanup() {
   stop_server
   [ -n "$ENGINE" ] && kill "$ENGINE" 2>/dev/null
@@ -48,9 +52,9 @@ node "$HERE/fake-openai.mjs" "$ENGINE_PORT" > "$WORK/engine.log" 2>&1 &
 ENGINE=$!
 
 start_server pr;                               suite suite-main;            stop_server
-FAKE_GH_COMMENTS_FAIL=1 start_server pr;       suite suite-restart --dark;  stop_server
+FAKE_GH_COMMENTS_FAIL=1 start_server pr;       suite suite-restart --dark;  exited
 git -C "$WORK/demo" remote remove origin
-start_server local;                            suite suite-local;           stop_server
+start_server local;                            suite suite-local;           exited
 
 [ $FAILED -eq 0 ] && echo "UI tests passed" || echo "UI tests FAILED"
 exit $FAILED

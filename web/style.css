@@ -1149,6 +1149,18 @@ select { height: 26px; padding: 0 6px; font-size: 12px; }
   background: var(--panel);
   box-shadow: var(--shadow);
 }
+/* after Exit: the server is gone; covers the whole page */
+.stopped {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+.stopped-box { max-width: 560px; padding: 24px; text-align: center; overflow-wrap: anywhere; }
+.stopped-box h2 { margin: 0 0 8px; font-size: 18px; }
 .help-table { width: 100%; padding: 4px 16px 16px; border-spacing: 0 4px; font-size: 13px; }
 .help-table th { padding: 12px 0 2px; color: var(--fg-dim); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-align: left; text-transform: uppercase; }
 .help-table td.keys { width: 130px; white-space: nowrap; }

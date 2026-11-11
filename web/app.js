@@ -59,6 +59,7 @@ const S = {
   flows: { list: null, act: null, running: false, error: null, collapsed: false, jobId: null }, // PR flows card
   walk: null, // { flow, fi, index, playing, timer, marks, note } while walking a flow
   composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
+  exiting: false, // the server was told to stop
   viewed: new Map(), // path → file sig it was marked viewed at (persisted per PR)
   filter: '', // sidebar file filter
   remote: { threads: [], show: true, error: null }, // review comments already on the PR
@@ -97,6 +98,7 @@ function h(tag, props, ...kids) {
 }
 
 function toast(msg, kind = 'info', ms = 6000) {
+  if (S.exiting) return; // the server is gone: requests still in flight fail quietly
   const t = h('div', { class: `toast ${kind}`, role: 'status', onclick: () => t.remove() }, msg);
   $('#toasts').append(t);
   setTimeout(() => t.classList.add('out'), ms);
@@ -2814,8 +2816,12 @@ function renderReview() {
   });
 
   rv.list = h('div', { class: 'review-drafts' });
-  const submit = h('button', { class: 'btn primary', disabled: local || rv.submitting, onclick: submitReview },
+  const submit = h('button', { class: 'btn primary', disabled: local || rv.submitting, onclick: () => submitReview() },
     rv.submitting ? 'Submitting…' : 'Submit review');
+  const submitExit = h('button', {
+    class: 'btn', disabled: local || rv.submitting, title: 'Submit, then stop review-master and close this tab',
+    onclick: () => submitReview(true),
+  }, 'Submit & exit');
   const unviewed = S.order.filter(fs => !isViewed(fs)).length;
 
   $('#review-body').replaceChildren(...[
@@ -2829,7 +2835,7 @@ function renderReview() {
     rv.list,
     h('div', { class: 'review-actions' },
       unviewed > 0 && h('span', { class: 'hint' }, `${plural(unviewed, 'file')} not marked viewed`),
-      h('span', { class: 'spacer' }), submit),
+      h('span', { class: 'spacer' }), submitExit, submit),
   ].filter(Boolean));
   renderReviewDrafts();
 }
@@ -2856,25 +2862,60 @@ function renderReviewDrafts() {
     drafts.length ? h('ul', { class: 'rd-list' }, items) : h('div', { class: 'empty' }, 'No drafts yet. Select lines in a diff and click Comment.'));
 }
 
-async function submitReview() {
+// andExit: once GitHub has the review, stop review-master and close the tab.
+async function submitReview(andExit = false) {
   const ev = EVENTS.find(e => e.value === S.review.event);
   const n = S.drafts.filter(d => !S.excluded.has(d.path)).length;
-  if (!confirm(`Submit review as "${ev.label}" with ${plural(n, 'draft comment')}?`)) return;
+  const then = andExit ? ', then stop review-master' : '';
+  if (!confirm(`Submit review as "${ev.label}" with ${plural(n, 'draft comment')}${then}?`)) return;
   S.review.submitting = true;
   renderReview();
+  let submitted = false;
   try {
     const r = await post('/api/submit', { event: S.review.event, body: S.review.body });
+    submitted = true;
     S.info.submitted = r.url;
     S.review.body = '';
     saveReviewForm();
     renderBanner();
     toast('Review submitted', 'ok');
-    refreshDrafts().catch(() => {});
-    loadRemote(true); // the comments just posted now live on the PR
+    if (!andExit) {
+      refreshDrafts().catch(() => {});
+      loadRemote(true); // the comments just posted now live on the PR
+    }
   } finally {
     S.review.submitting = false;
     if (S.drawer === 'review') renderReview();
   }
+  if (submitted && andExit) await exitApp(false);
+}
+
+// ───────────────────────────── exit ─────────────────────────────
+// Stops the server (POST /api/shutdown) and closes the tab. Browsers only let a script
+// close tabs a script opened, so a tab opened by the terminal stays, saying so.
+
+// Comment or reply text typed but not saved as a draft / posted.
+const unsavedText = () => [...S.composers.values()].some(c => c.ta.value.trim() && c.ta.value !== c.initial) ||
+  [...S.replies.values()].some(r => r.ta.value.trim());
+
+async function exitApp(ask = true) {
+  const kept = 'Drafts, conversations, findings and the summary are kept for next time.';
+  const lost = unsavedText() ? ' Comment text you have not saved as a draft will be lost.' : '';
+  if (ask && !confirm(`Stop review-master and close this tab? ${kept}${lost}`)) return;
+  try {
+    await post('/api/shutdown');
+  } catch {
+    return; // toasted; still running
+  }
+  S.exiting = true;
+  const url = S.info && S.info.submitted;
+  document.body.append(h('div', { class: 'stopped' },
+    h('div', { class: 'stopped-box' },
+      h('h2', {}, 'review-master stopped'),
+      /^https?:\/\//.test(url || '') && h('p', {}, 'Review submitted: ', h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url)),
+      h('p', { class: 'dim' }, 'You can close this tab.'))));
+  document.title = 'review-master (stopped)';
+  window.close();
 }
 
 // ───────────────────────────── PR summary card ─────────────────────────────
@@ -3493,9 +3534,7 @@ function wire() {
 
   // Leaving with a comment still being written would lose it.
   window.addEventListener('beforeunload', e => {
-    const typed = [...S.composers.values()].some(c => c.ta.value.trim() && c.ta.value !== c.initial) ||
-      [...S.replies.values()].some(r => r.ta.value.trim());
-    if (typed) e.preventDefault();
+    if (!S.exiting && unsavedText()) e.preventDefault();
   });
 
   let ticking = false;
@@ -3511,6 +3550,7 @@ function wire() {
   $('#btn-chat').addEventListener('click', () => toggleDrawer('chat'));
   $('#btn-review').addEventListener('click', () => toggleDrawer('review'));
   $('#btn-findings').addEventListener('click', () => toggleDrawer('findings'));
+  $('#btn-exit').addEventListener('click', () => exitApp());
   for (const b of document.querySelectorAll('[data-close]')) b.addEventListener('click', () => openDrawer(null));
   $('#chat-new').addEventListener('click', () => openChatNew(null));
   $('#chat-send').addEventListener('click', () => (S.chat.stopId != null ? stopJob(S.chat.stopId) : sendChat()));

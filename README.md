@@ -48,7 +48,9 @@ branch, its upstream, or the head commit — and it opens a local web UI:
 - write **draft inline comments** (severity + markdown) as you go; drafts,
   conversations and the unsent review summary persist across restarts;
 - submit everything as **one GitHub review** — comment / approve /
-  request-changes — with every comment anchored to the exact diff line.
+  request-changes — with every comment anchored to the exact diff line;
+  **Submit & exit** posts it and stops review-master in one go, **Exit** stops it
+  without posting (drafts and everything else are kept for next time).
 
 The tool never writes reviews for you; it explains, you judge.
 
@@ -125,6 +127,10 @@ archives, checksums and `review-master-installer.sh`. After changing
    comments on lines a hunk shows); drafts that cannot be anchored go into the
    review body instead of being dropped. One review is POSTed, pinned to the
    reviewed head commit, and the drafts are cleared.
+5. Runs until **Exit** (or **Submit & exit**) in the UI, or Ctrl-C in the terminal;
+   then the temporary worktree is removed. Browsers only let a page close tabs a
+   script opened, so the tab the terminal opened stays, saying review-master
+   stopped.
 
 ## Requirements
 

@@ -66,5 +66,14 @@ export default async page => {
   // j walks through all collapsed files to the last one
   for (let i = 0; i < 10; i++) await page.key('j');
   check('j reaches the last file', await q(() => document.querySelector('#file-list li.active .file-item').title === 'tests/test_handler.py'), await q(() => document.querySelector('#file-list li.active .file-item').title));
+
+  // Submit & exit: the review goes out, then the server stops and the page says so
+  await page.key('r');
+  await page.waitFor(() => document.querySelector('.review-summary'));
+  await q(() => { const ta = document.querySelector('.review-summary'); ta.value = 'LGTM after the TTL fix.'; ta.dispatchEvent(new Event('input')); });
+  await q(() => [...document.querySelectorAll('.review-actions .btn')].find(b => b.textContent === 'Submit & exit').click());
+  await page.waitFor(() => document.querySelector('.stopped'), 5000);
+  check('stopped screen links the submitted review', await q(() => /^https?:/.test(document.querySelector('.stopped a')?.href || '')));
+  check('server is gone', await page.waitFor(() => fetch('/api/info').then(() => false, () => true), 5000));
   if (fails) throw new Error(fails + ' check(s) failed');
 };

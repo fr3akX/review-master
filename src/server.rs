@@ -57,6 +57,8 @@ pub struct AppState {
     submitted: Mutex<Option<String>>,
     /// Review comments already on the PR, fetched on first use.
     comments: Mutex<Option<Vec<Value>>>,
+    /// Stops the server: the UI's Exit (Ctrl-C does the same in the terminal).
+    shutdown: Notify,
 }
 
 /// The files this review currently covers.
@@ -134,6 +136,7 @@ impl AppState {
             jobs: Mutex::default(),
             submitted: Mutex::new(None),
             comments: Mutex::new(None),
+            shutdown: Notify::new(),
         })
     }
 
@@ -354,12 +357,25 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/lsp/symbol", post_to(lsp_symbol))
         .route("/api/lsp/references", post_to(lsp_references))
         .route("/api/lsp/outline", get(lsp_outline))
-        .with_state(state);
+        .route("/api/shutdown", post_to(shutdown))
+        .with_state(state.clone());
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = state.shutdown.notified() => println!("review-master: stopped from the browser"),
+            }
         })
         .await
+}
+
+/// Stop serving, once this response is on its way (the UI's Exit button).
+async fn shutdown(State(st): State<Arc<AppState>>) -> Json<Value> {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        st.shutdown.notify_one();
+    });
+    Json(json!({}))
 }
 
 async fn asset(content_type: &'static str, body: &'static str) -> Response {
