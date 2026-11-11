@@ -15,7 +15,8 @@ branch, its upstream, or the head commit — and it opens a local web UI:
 - **import another LLM's review** (a Markdown file, `--findings` or drag-and-drop):
   every finding that cites `path:line` is shown **on that line**, with its severity;
   turn the ones you agree with into draft comments, ask the chat about them, or
-  dismiss them (see [LLM findings](#llm-findings));
+  dismiss them (see [LLM findings](#llm-findings)); an **agent skill** teaches Codex,
+  Claude Code or any other agent to write reviews in that shape;
 - browse the changed files in a collapsible, filterable **directory tree**;
   per-file **diff view** with word-level highlights inside changed lines and
   expandable context between hunks, and a **file viewer** for the whole file
@@ -90,7 +91,8 @@ review-master 0.2.0 is available (you have 0.1.0): run `review-master --update`
 
 `review-master --update` downloads and installs it with the same installer.
 `--no-update`, or `REVIEW_MASTER_NO_UPDATE=1`, skips the check. Builds from
-source are not checked; update them by re-running `cargo install`.
+source are not checked; update them by re-running `cargo install`. Installed
+review-master skills are refreshed on the first start of a new version.
 
 ### Releasing
 
@@ -154,6 +156,8 @@ settings.
 | `--no-lsp` | | disable language servers (navigation falls back to text search) |
 | `--lsp-import-build` | | let Metals import the build (runs the build tool) |
 | `--findings FILE` | | Markdown review whose `path:line` findings annotate the code (repeatable) |
+| `--install-skill [AGENT]` | every agent found | install the agent skill for `codex`, `claude` or `all`, then exit |
+| `--skill` | | print the agent skill (SKILL.md), then exit |
 | `--exclude GLOB` | | drop files from the reviewed diff (repeatable, e.g. `--exclude '*.lock'`) |
 | `--timeout-mins` | 20 | time limit per chat turn |
 | `--cache-dir` | `.review-master` in the checkout | chat sessions and drafts |
@@ -248,12 +252,31 @@ draft; **Ask** opens a chat about it; **Dismiss** hides it. The drawer lists the
 flags locations that could not be placed, and restores dismissed ones. Nothing from an
 imported review is posted unless you save it as a draft.
 
-A prompt that works well with any model:
+### The agent skill
 
+The review-master skill tells a coding agent how to write a review that imports
+cleanly: a `### [severity] title (path:line)` heading per finding, head-commit line
+numbers taken from the diff or a numbered read, lines the diff shows where possible
+(they can become inline comments), only findings, and the `review-master <N>
+--findings <file>` command to open the result.
+
+```sh
+review-master --install-skill          # every agent found: ~/.codex and/or ~/.claude
+review-master --install-skill claude   # $CLAUDE_CONFIG_DIR/skills/review-master/SKILL.md (default ~/.claude)
+review-master --install-skill codex    # $CODEX_HOME/skills/review-master/SKILL.md (default ~/.codex)
 ```
-Review this PR. For each finding write a "### [severity] title (path:line)" heading,
-severity one of blocker/major/minor/nit, then the explanation.
+
+Then ask the agent to "review PR 42 for review-master". Installed skills are kept in
+step with review-master: it rewrites them when it starts and their text changed.
+
+`--skill` prints the same text, for other agents and other places:
+
+```sh
+mkdir -p .claude/skills/review-master && review-master --skill > .claude/skills/review-master/SKILL.md  # project-local
+claude -p "$(review-master --skill) Review PR 42."   # writes /tmp/review-42.md, as the skill says
 ```
+
+The agent decides when to load a skill, so this is guidance, not enforcement.
 
 ## Tests
 

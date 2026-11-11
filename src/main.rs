@@ -25,6 +25,7 @@ mod repo_tools;
 mod review;
 mod search;
 mod server;
+mod skill;
 mod term;
 mod update;
 mod verify;
@@ -107,6 +108,16 @@ struct Args {
     /// and exit; also offered on the first interactive launch without one
     #[arg(long)]
     configure: bool,
+    /// Install the review-master skill for Codex or Claude Code
+    /// (`<config dir>/skills/review-master/SKILL.md`) and exit: their sessions then write
+    /// reviews in the shape `--findings` imports. AGENT: codex, claude, or all (default:
+    /// every agent whose config directory exists)
+    #[arg(long, value_name = "AGENT", value_enum, num_args = 0..=1, default_missing_value = "all")]
+    install_skill: Option<skill::Target>,
+    /// Print the review-master skill (SKILL.md) and exit: for other agents, a
+    /// project-local install, or piping into a prompt
+    #[arg(long)]
+    skill: bool,
     /// Install the latest release now (for installs made with the release installer) and exit
     #[arg(long)]
     update: bool,
@@ -261,6 +272,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.update {
         println!("{}", update::update_now().await?);
         return Ok(());
+    }
+    if args.skill {
+        print!("{}", skill::SKILL);
+        return Ok(());
+    }
+    if let Some(target) = args.install_skill {
+        for path in skill::install(target)? {
+            println!("installed the review-master skill at {}", path.display());
+        }
+        return Ok(());
+    }
+    for path in skill::refresh_installed() {
+        println!("updated the review-master skill at {}", path.display());
     }
     if !args.no_update {
         // Off the startup path; prints a one-line notice when a newer release exists.
