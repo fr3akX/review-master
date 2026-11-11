@@ -230,11 +230,6 @@ fn acquire(pr_arg: Option<&str>, forced: Option<pr::Forge>, exclude: &[String], 
         });
     };
     let pref = pr::parse_ref(&raw, origin.as_ref(), forced)?;
-    if let Some(o) = &origin {
-        if !o.host.eq_ignore_ascii_case(&pref.host) || !o.path.eq_ignore_ascii_case(&pref.slug()) {
-            eprintln!("note: the checkout's origin is {}/{}, not {}/{}; fetching the head may fail", o.host, o.path, pref.host, pref.slug());
-        }
-    }
     let meta = pr::meta(&pref)?;
     let mut state = if meta.merged { "merged".to_owned() } else { meta.state.clone() };
     if meta.draft {
@@ -339,7 +334,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect::<Result<_, String>>()?;
 
-    let cache_dir = args.cache_dir.clone().unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
+    // A request fetched without a local checkout keeps its cache per project in the
+    // user's cache directory, so drafts and chats survive the temporary directory.
+    let fetched_project = change.pr.as_ref().filter(|_| change._checkout.as_ref().is_some_and(pr::Checkout::cloned)).map(|(r, _)| r);
+    let cache_dir = args.cache_dir.clone().or_else(|| fetched_project.and_then(project_cache)).unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
     let ignore = cache_dir.join(".gitignore");
     if !ignore.exists() {
@@ -412,4 +410,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server::serve(listener, state).await?;
     drop(change._checkout); // removes the temporary worktree
     Ok(())
+}
+
+/// `$XDG_CACHE_HOME/review-master/<host>/<project>` (default `~/.cache/…`).
+fn project_cache(r: &pr::PrRef) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("review-master").join(&r.host).join(r.slug()))
 }

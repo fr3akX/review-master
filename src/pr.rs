@@ -270,50 +270,158 @@ pub fn diff(r: &PrRef) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The checkout the review runs in: the repository itself when it already sits on
-/// the request's head, else a detached temporary worktree (removed on drop).
+/// Where the review runs: the repository itself when it already sits on the request's
+/// head, a detached temporary worktree of it, or — when the repository is not the
+/// request's project — a temporary repository holding just the reviewed commit. The
+/// temporary ones are removed on drop.
 pub struct Checkout {
     pub root: PathBuf,
     repo_root: PathBuf,
-    temp: bool,
+    kind: CheckoutKind,
+}
+
+#[derive(PartialEq, Eq)]
+enum CheckoutKind {
+    InPlace,
+    Worktree,
+    Clone,
+}
+
+impl Checkout {
+    /// Fetched from the forge rather than taken from a local checkout of the project.
+    pub fn cloned(&self) -> bool {
+        self.kind == CheckoutKind::Clone
+    }
 }
 
 impl Drop for Checkout {
     fn drop(&mut self) {
-        if self.temp {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_root)
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.root)
-                .output();
+        match self.kind {
+            CheckoutKind::InPlace => {}
+            CheckoutKind::Worktree => {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&self.repo_root)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&self.root)
+                    .output();
+            }
+            CheckoutKind::Clone => {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
         }
     }
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output().map_err(|e| format!("git: {e}"))?;
+    git_command(root, args, false)
+}
+
+/// `quiet`: never prompt (no terminal password prompt, ssh in batch mode unless the
+/// user set their own ssh command), so a URL that needs one fails and the next is tried.
+fn git_command(root: &Path, args: &[&str], quiet: bool) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args(args).stdin(Stdio::null());
+    if quiet {
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+    }
+    let out = cmd.output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         return Err(format!("git {}: {}", args.join(" "), crate::engine::one_line(String::from_utf8_lossy(&out.stderr).trim(), 300)));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_owned())
 }
 
+/// A remote of the local repository that points at the request's project (`origin`
+/// first, then any other, e.g. `upstream` in a fork).
+fn matching_remote(repo: &crate::repo::Repo, r: &PrRef) -> Option<String> {
+    repo.head()?;
+    let names = crate::repo::git(&repo.root, &["remote"])?;
+    let mut names: Vec<&str> = names.lines().collect();
+    names.sort_by_key(|n| *n != "origin");
+    names.into_iter().find(|name| {
+        crate::repo::git(&repo.root, &["remote", "get-url", name])
+            .and_then(|url| parse_remote_url(&url))
+            .is_some_and(|(host, path)| host.eq_ignore_ascii_case(&r.host) && path.eq_ignore_ascii_case(&r.slug()))
+    }).map(str::to_owned)
+}
+
+/// URLs the project can be fetched from, SSH first (keys usually work where HTTPS
+/// needs a credential helper).
+fn clone_urls(r: &PrRef) -> Vec<String> {
+    let mut urls = match r.forge {
+        Forge::Gitlab => gitlab::clone_urls(r),
+        Forge::Github => Vec::new(),
+    };
+    for url in [format!("git@{}:{}.git", r.host, r.slug()), format!("https://{}/{}.git", r.host, r.slug())] {
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// A temporary repository with only the reviewed commit: no history, no other branches.
+fn fetch_alone(r: &PrRef) -> Result<(Checkout, String), String> {
+    let dir = std::env::temp_dir().join(format!("review-master-{}{}-{}", r.forge.id(), r.number, uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let root = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+    // From here on, dropping the checkout removes the directory.
+    let checkout = Checkout { root: root.clone(), repo_root: root.clone(), kind: CheckoutKind::Clone };
+    run_git(&root, &["init", "--quiet"])?;
+    let mut tried = Vec::new();
+    for url in clone_urls(r) {
+        let head_ref = r.head_ref();
+        let args = ["fetch", "--quiet", "--depth", "1", url.as_str(), head_ref.as_str()];
+        match git_command(&root, &args, true) {
+            Ok(_) => {
+                let fetched = run_git(&root, &["rev-parse", "FETCH_HEAD"])?;
+                run_git(&root, &["checkout", "--quiet", "--detach", &fetched])?;
+                let _ = run_git(&root, &["remote", "add", "origin", &url]);
+                return Ok((checkout, fetched));
+            }
+            Err(e) => {
+                let why = e.strip_prefix(&format!("git {}: ", args.join(" "))).unwrap_or(&e).to_owned();
+                tried.push(format!("  {url}: {why}"));
+            }
+        }
+    }
+    Err(format!(
+        "cannot fetch {} from {}:\n{}\nRun review-master in a checkout of the project (or pass --repo DIR), or set up SSH keys or a git credential helper for {}",
+        r.label(),
+        r.host,
+        tried.join("\n"),
+        r.host
+    ))
+}
+
 /// Make `want_sha` (the request's head) available and return the directory to review
 /// in, plus the commit actually reviewed (the head ref's tip at fetch time).
 pub fn checkout(repo: &crate::repo::Repo, r: &PrRef, want_sha: &str) -> Result<(Checkout, String), String> {
     if repo.head().as_deref() == Some(want_sha) {
-        return Ok((Checkout { root: repo.root.clone(), repo_root: repo.root.clone(), temp: false }, want_sha.to_owned()));
+        return Ok((Checkout { root: repo.root.clone(), repo_root: repo.root.clone(), kind: CheckoutKind::InPlace }, want_sha.to_owned()));
     }
-    run_git(&repo.root, &["fetch", "--quiet", "origin", &r.head_ref()])?;
-    let fetched = run_git(&repo.root, &["rev-parse", "FETCH_HEAD"])?;
+    let (checkout, fetched) = match matching_remote(repo, r) {
+        Some(remote) => {
+            run_git(&repo.root, &["fetch", "--quiet", &remote, &r.head_ref()])?;
+            let fetched = run_git(&repo.root, &["rev-parse", "FETCH_HEAD"])?;
+            let dir = std::env::temp_dir().join(format!("review-master-{}{}-{}", r.forge.id(), r.number, uuid::Uuid::new_v4()));
+            run_git(&repo.root, &["worktree", "add", "--detach", dir.to_str().ok_or("temp dir is not UTF-8")?, &fetched])?;
+            let root = dir.canonicalize().map_err(|e| format!("worktree {}: {e}", dir.display()))?;
+            (Checkout { root, repo_root: repo.root.clone(), kind: CheckoutKind::Worktree }, fetched)
+        }
+        None => {
+            println!("  {} is not a checkout of {}/{}: fetching the reviewed commit into a temporary directory", repo.root.display(), r.host, r.slug());
+            fetch_alone(r)?
+        }
+    };
     if fetched != want_sha {
         eprintln!("note: the {} moved while fetching; reviewing {}", r.forge.noun(), &fetched[..fetched.len().min(12)]);
     }
-    let dir = std::env::temp_dir().join(format!("review-master-{}{}-{}", r.forge.id(), r.number, uuid::Uuid::new_v4()));
-    run_git(&repo.root, &["worktree", "add", "--detach", dir.to_str().ok_or("temp dir is not UTF-8")?, &fetched])?;
-    let root = dir.canonicalize().map_err(|e| format!("worktree {}: {e}", dir.display()))?;
-    Ok((Checkout { root, repo_root: repo.root.clone(), temp: true }, fetched))
+    Ok((checkout, fetched))
 }
 
 /// Line comments already on the request, oldest first, replies after their root
@@ -495,6 +603,26 @@ mod tests {
         assert!(parse_ref("5", Some(&unknown), None).unwrap_err().contains("--forge"));
         assert!(parse_ref("https://github.com/acme/widgets", Some(&gh), None).is_err());
         assert!(parse_ref("acme/widgets#x", Some(&gh), None).is_err());
+    }
+
+    #[test]
+    fn the_requests_project_is_found_among_the_remotes() {
+        let dir = std::env::temp_dir().join(format!("review-master-remotes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| run_git(&dir, args).unwrap();
+        g(&["init", "--quiet"]);
+        g(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "--allow-empty", "-m", "x"]);
+        g(&["remote", "add", "origin", "git@github.com:me/widgets.git"]);
+        g(&["remote", "add", "upstream", "https://github.com/Acme/Widgets.git"]);
+        let repo = crate::repo::Repo::open(&dir).unwrap();
+        let at = |owner: &str, repo_name: &str| PrRef { forge: Forge::Github, host: "github.com".into(), owner: owner.into(), repo: repo_name.into(), number: 1 };
+        assert_eq!(matching_remote(&repo, &at("acme", "widgets")).as_deref(), Some("upstream"), "a fork's upstream, case aside");
+        assert_eq!(matching_remote(&repo, &at("me", "widgets")).as_deref(), Some("origin"));
+        assert_eq!(matching_remote(&repo, &at("other", "project")), None);
+        let r = PrRef { forge: Forge::Gitlab, host: "git.example.lv".into(), owner: "g/sub".into(), repo: "p".into(), number: 3 };
+        assert_eq!((r.head_ref(), r.label()), ("merge-requests/3/head".to_owned(), "g/sub/p!3".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

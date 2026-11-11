@@ -149,6 +149,13 @@ fn unified(files: &[Value]) -> String {
     out
 }
 
+/// The project's SSH and HTTPS clone URLs, as GitLab reports them (a self-hosted
+/// instance may serve SSH on another host or port).
+pub fn clone_urls(r: &PrRef) -> Vec<String> {
+    let Ok(v) = get(&r.host, &format!("projects/{}", encode(&r.slug()))) else { return Vec::new() };
+    ["ssh_url_to_repo", "http_url_to_repo"].iter().filter_map(|k| v[*k].as_str().map(str::to_owned)).collect()
+}
+
 /// Diff discussions as review comments (the shape `pr::review_comments` returns). A
 /// note whose position still points at the current diff version is current; GitLab
 /// moves positions forward on new pushes when the line did not change, so one left on

@@ -125,8 +125,13 @@ archives, checksums and `review-master-installer.sh`. After changing
    Without a request, the worktree's change against its merge base with the
    default branch is shown (browse/chat/draft; submitting needs the request).
 2. Fetches `pull/N/head` (GitHub) or `merge-requests/N/head` (GitLab) into a
-   detached temporary worktree (removed on exit); a checkout already on the head
-   is used as is.
+   detached temporary worktree (removed on exit), from whichever remote of the
+   checkout points at the project (`origin`, or e.g. `upstream` in a fork); a
+   checkout already on the head is used as is. Run anywhere else — another
+   repository, or no repository at all — and only the reviewed commit is fetched
+   into a temporary directory, over SSH first, then HTTPS, never prompting; its
+   drafts and chats are kept under `~/.cache/review-master/<host>/<project>`
+   (`$XDG_CACHE_HOME`) unless `--cache-dir` says otherwise.
 3. Serves the UI on localhost and opens the browser.
 4. On submit, every draft is validated against the diff (both forges only accept
    inline comments on lines a hunk shows); drafts that cannot be anchored go into
