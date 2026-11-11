@@ -69,8 +69,10 @@ impl Subject {
     pub fn pr(r: &PrRef, meta: &PrMeta, sha: &str) -> Subject {
         Subject {
             heading: format!(
-                "The reviewer is reviewing GitHub pull request #{} of {}: {}\nAuthor {}; merging `{}` into `{}`; head commit {}.\n",
-                r.number,
+                "The reviewer is reviewing {} {} {} of {}: {}\nAuthor {}; merging `{}` into `{}`; head commit {}.\n",
+                r.forge.name(),
+                r.forge.noun(),
+                r.number_label(),
                 r.slug(),
                 meta.title,
                 meta.author,

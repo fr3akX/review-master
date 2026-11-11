@@ -36,10 +36,10 @@
         <label id="test-toggle" class="pill-toggle" title="Exclude test files from the review (drafts on them won't be submitted)" hidden>
           <input id="hide-tests" type="checkbox"> <span id="test-count"></span>
         </label>
-        <label id="remote-toggle" class="pill-toggle" title="Show the review comments already on this pull request" hidden>
+        <label id="remote-toggle" class="pill-toggle" title="Show the review comments already on this pull/merge request" hidden>
           <input id="show-remote" type="checkbox"> <span id="remote-count"></span>
         </label>
-        <button id="remote-retry" class="link-btn" type="button" hidden>PR comments failed · retry</button>
+        <button id="remote-retry" class="link-btn" type="button" hidden>Review comments failed · retry</button>
         <label id="findings-toggle" class="pill-toggle" title="Show the imported LLM findings on the code" hidden>
           <input id="show-findings" type="checkbox"> <span id="findings-count"></span>
         </label>
@@ -62,7 +62,7 @@
       <div class="drawer-head">
         <h2>Chat</h2>
         <span class="spacer"></span>
-        <button id="chat-new" class="btn small" type="button" title="Ask about the whole pull request">New question</button>
+        <button id="chat-new" class="btn small" type="button" title="Ask about the whole change">New question</button>
         <button class="icon-btn" type="button" data-close aria-label="Close">×</button>
       </div>
       <div id="thread-list" class="thread-list"></div>

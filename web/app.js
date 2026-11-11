@@ -372,14 +372,14 @@ function renderHeader() {
   if (pr) {
     title.replaceChildren(
       h('a', { href: pr.url, target: '_blank', rel: 'noopener noreferrer' }, pr.title),
-      h('span', { class: 'pr-number' }, ` #${pr.number}`),
+      h('span', { class: 'pr-number' }, ` ${pr.number_label}`),
     );
     const state = pr.merged ? 'merged' : pr.draft ? 'draft' : String(pr.state || '').toLowerCase();
     meta.replaceChildren(
       h('span', { class: `state state-${state}` }, state),
       h('span', {}, h('strong', {}, pr.author), ' wants ', h('code', {}, pr.base_ref), ' ← ', h('code', {}, pr.head_ref)),
     );
-    document.title = `#${pr.number} ${pr.title} · review-master`;
+    document.title = `${pr.number_label} ${pr.title} · review-master`;
   } else {
     title.replaceChildren(h('span', {}, `Local review · ${branch}`));
     meta.replaceChildren(
@@ -488,7 +488,13 @@ const pathsUnder = dir => [...S.allPaths].filter(p => underDir(p, dir));
 const testPaths = () => [...S.allPaths].filter(isTestPath);
 const coveredByControls = p => (S.scope.tests && isTestPath(p)) || [...S.scope.dirs].some(d => underDir(p, d));
 
-const prId = () => (S.info.pr ? `${S.info.pr.owner}/${S.info.pr.repo}#${S.info.pr.number}` : `local:${S.info.branch}`);
+const prId = () => (S.info.pr ? `${S.info.pr.owner}/${S.info.pr.repo}${S.info.pr.number_label}` : `local:${S.info.branch}`);
+// GitHub or GitLab; `kind` is "PR" / "MR" for short labels.
+const forge = () => {
+  const pr = S.info && S.info.pr;
+  const gitlab = !!pr && pr.forge === 'gitlab';
+  return { gitlab, name: pr ? pr.forge_name : 'GitHub', noun: pr ? pr.noun : 'pull request', kind: gitlab ? 'MR' : 'PR' };
+};
 
 function scopePrefKey() {
   return `review-master:scope:${prId()}`;
@@ -763,7 +769,7 @@ const fileTitle = f => (f.status === 'renamed' && f.old_path
 function makeFileState(f) {
   const fs = { file: f, path: f.path, idx: 0, diff: null, pane: null, loading: null, collapsed: false };
   fs.navBadge = h('span', { class: 'nav-drafts', title: 'your drafts', hidden: true });
-  fs.navRemote = h('span', { class: 'nav-remote', title: 'comment threads on the PR', hidden: true });
+  fs.navRemote = h('span', { class: 'nav-remote', title: `comment threads on the ${forge().noun}`, hidden: true });
   fs.navFindings = h('span', { class: 'nav-findings', title: 'open LLM findings', hidden: true });
   fs.nav = h('li', {},
     h('div', { class: 'file-line' },
@@ -1586,10 +1592,11 @@ function renderRemoteControls() {
   const n = S.remote.threads.length;
   $('#remote-toggle').hidden = n === 0;
   $('#show-remote').checked = S.remote.show;
-  $('#remote-count').textContent = `PR comments · ${n}`;
+  $('#remote-count').textContent = `${forge().kind} comments · ${n}`;
   const retry = $('#remote-retry');
   retry.hidden = !S.remote.error;
   retry.title = S.remote.error || '';
+  retry.textContent = `${forge().kind} comments failed · retry`;
   const per = new Map();
   for (const t of S.remote.threads) per.set(t.path, (per.get(t.path) || 0) + 1);
   for (const fs of S.fileCache.values()) {
@@ -1610,7 +1617,7 @@ function toggleReply(t) {
   }
   const ta = h('textarea', { class: 'composer-text', rows: '2', placeholder: `Reply… (markdown, ${MOD}+Enter to post)` });
   autosize(ta);
-  const send = h('button', { class: 'btn primary small' }, 'Reply on GitHub');
+  const send = h('button', { class: 'btn primary small' }, `Reply on ${forge().name}`);
   const r = { ta, el: null };
   r.el = h('div', { class: 'reply-box' }, ta,
     h('div', { class: 'composer-actions' },
@@ -1655,8 +1662,8 @@ function remoteCard(t) {
         i === 0 && outdated && h('span', { class: 'tag' }, `outdated${t.original != null ? ` · was line ${t.original}` : ''}`),
         h('span', { class: 'spacer' }),
         i === 0 && !outdated && h('button', { class: 'link-btn', title: 'Ask the LLM about this comment', onclick: ask }, 'Ask'),
-        i === 0 && h('button', { class: 'link-btn', title: 'Reply in this thread on GitHub', onclick: () => toggleReply(t) }, 'Reply'),
-        c.url && h('a', { class: 'link-btn', href: c.url, target: '_blank', rel: 'noopener noreferrer' }, 'GitHub ↗')),
+        i === 0 && h('button', { class: 'link-btn', title: `Reply in this thread on ${forge().name}`, onclick: () => toggleReply(t) }, 'Reply'),
+        c.url && h('a', { class: 'link-btn', href: c.url, target: '_blank', rel: 'noopener noreferrer' }, `${forge().name} ↗`)),
       h('div', { class: 'md card-body', html: md(c.body || '') }))),
   reply && reply.el);
 }
@@ -2713,7 +2720,7 @@ function renderConvo() {
   if (job && job.error) nodes.push(h('div', { class: 'msg error' }, job.error));
   if (job && job.stopped) nodes.push(h('div', { class: 'msg note' }, 'Stopped before an answer.'));
   if (!nodes.length) {
-    nodes.push(h('div', { class: 'empty' }, anchor ? `Ask a question about ${anchorText(anchor)}.` : 'Ask a question about the whole pull request.'));
+    nodes.push(h('div', { class: 'empty' }, anchor ? `Ask a question about ${anchorText(anchor)}.` : `Ask a question about the whole ${forge().noun}.`));
   }
   if (c.threadId == null && c.snippet) {
     nodes.unshift(h('div', { class: 'snippet' }, h('div', { class: 'snippet-label' }, 'Selected code'), h('pre', {}, c.snippet)));
@@ -2793,8 +2800,10 @@ function renderReview() {
   const rv = S.review;
   const local = info.mode === 'local';
   const own = !!(info.pr && info.viewer && info.viewer === info.pr.author);
-  const restricted = local || own;
-  if (restricted && rv.event !== 'comment') rv.event = 'comment';
+  const { gitlab, noun } = forge();
+  // GitHub refuses approve/request-changes on your own PR; GitLab has no request-changes API.
+  const blocked = ev => ev !== 'comment' && (local || (own && !gitlab) || (gitlab && ev === 'request_changes'));
+  if (blocked(rv.event)) rv.event = 'comment';
 
   const summary = h('textarea', { class: 'review-summary', rows: '6', placeholder: 'Review summary (markdown, optional)…' });
   summary.value = rv.body;
@@ -2805,7 +2814,7 @@ function renderReview() {
   autosize(summary);
 
   const radios = EVENTS.map(ev => {
-    const off = ev.value !== 'comment' && restricted;
+    const off = blocked(ev.value);
     const pick = () => {
       rv.event = ev.value;
       saveReviewForm();
@@ -2826,12 +2835,13 @@ function renderReview() {
 
   $('#review-body').replaceChildren(...[
     info.submitted && submittedNode(),
-    local && h('div', { class: 'banner info' }, 'Local mode: this worktree has no known pull request, so submitting is disabled. Chat and drafts still work.'),
+    local && h('div', { class: 'banner info' }, 'Local mode: this worktree has no known pull or merge request, so submitting is disabled. Chat and drafts still work.'),
     h('label', { class: 'field-label' }, 'Summary'),
     summary,
     h('div', { class: 'field-label' }, 'Event'),
     h('div', { class: 'radios' }, radios),
-    own && !local && h('div', { class: 'hint' }, 'You authored this pull request; GitHub only allows comment reviews on your own PR.'),
+    own && !local && !gitlab && h('div', { class: 'hint' }, `You authored this ${noun}; GitHub only allows comment reviews on your own PR.`),
+    gitlab && !local && h('div', { class: 'hint' }, 'GitLab: the comments are published as one review; Approve then approves the merge request. Request changes is not available through GitLab\'s API.'),
     rv.list,
     h('div', { class: 'review-actions' },
       unviewed > 0 && h('span', { class: 'hint' }, `${plural(unviewed, 'file')} not marked viewed`),
@@ -2862,7 +2872,7 @@ function renderReviewDrafts() {
     drafts.length ? h('ul', { class: 'rd-list' }, items) : h('div', { class: 'empty' }, 'No drafts yet. Select lines in a diff and click Comment.'));
 }
 
-// andExit: once GitHub has the review, stop review-master and close the tab.
+// andExit: once the forge has the review, stop review-master and close the tab.
 async function submitReview(andExit = false) {
   const ev = EVENTS.find(e => e.value === S.review.event);
   const n = S.drafts.filter(d => !S.excluded.has(d.path)).length;
@@ -2871,9 +2881,12 @@ async function submitReview(andExit = false) {
   S.review.submitting = true;
   renderReview();
   let submitted = false;
+  let warning = null;
   try {
     const r = await post('/api/submit', { event: S.review.event, body: S.review.body });
     submitted = true;
+    warning = r.warning || null;
+    if (warning) toast(warning, 'warn', 15000);
     S.info.submitted = r.url;
     S.review.body = '';
     saveReviewForm();
@@ -2881,13 +2894,13 @@ async function submitReview(andExit = false) {
     toast('Review submitted', 'ok');
     if (!andExit) {
       refreshDrafts().catch(() => {});
-      loadRemote(true); // the comments just posted now live on the PR
+      loadRemote(true); // the comments just posted now live on the PR/MR
     }
   } finally {
     S.review.submitting = false;
     if (S.drawer === 'review') renderReview();
   }
-  if (submitted && andExit) await exitApp(false);
+  if (submitted && andExit && !warning) await exitApp(false); // a warning stays on screen
 }
 
 // ───────────────────────────── exit ─────────────────────────────

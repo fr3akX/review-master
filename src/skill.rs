@@ -16,14 +16,15 @@ description: Use when asked to review a pull request or a branch's changes for t
 review-master is the user's local code-review UI. It imports a Markdown review and
 shows every finding on the line it cites, with its severity. The user decides what
 happens to each: turn it into a draft comment (which they edit), ask about it, or
-dismiss it. Nothing you write reaches GitHub unless the user saves it as a draft and
-submits the review themselves — so write for a reviewer who will judge each finding.
+dismiss it. Nothing you write reaches GitHub or GitLab unless the user saves it as a
+draft and submits the review themselves — so write for a reviewer who will judge each
+finding.
 
 ## Write the review
 
-1. Read the change: `gh pr diff <N>` (or `git diff <base>...HEAD` for a branch), and
-   the surrounding code where the diff alone does not settle a question. Do not
-   modify the repository.
+1. Read the change: `gh pr diff <N>` (GitHub), `glab mr diff <N>` (GitLab), or
+   `git diff <base>...HEAD` for a branch, and the surrounding code where the diff
+   alone does not settle a question. Do not modify the repository.
 2. One finding per issue, each a heading with severity, title and location:
 
    ```markdown
@@ -55,10 +56,11 @@ Tell the user the command, run from the repository checkout:
 review-master <N> --findings /tmp/review-<N>.md
 ```
 
-(`<N>` may also be a PR URL or `owner/repo#N`; without a PR, review-master reviews the
-current branch against the default branch.) Into a running review-master, the file can
-be imported from the Findings drawer (`f`) or dropped on the page. If the user asks you
-to start it, run it in the background: it serves the UI until stopped.
+(`<N>` may also be a pull/merge request URL, `owner/repo#N` or `project!N`; without
+one, review-master reviews the current branch against the default branch.) Into a
+running review-master, the file can be imported from the Findings drawer (`f`) or
+dropped on the page. If the user asks you to start it, run it in the background: it
+serves the UI until stopped.
 "#;
 
 /// Agents the skill is written for, by their config directory.

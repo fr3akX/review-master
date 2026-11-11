@@ -1,6 +1,6 @@
-//! review-master: review a pull request (or a local worktree) in a browser UI —
-//! diffs, full files with highlighted changes, line-anchored LLM chat, draft
-//! comments — and submit one GitHub review with inline comments. The LLM side
+//! review-master: review a pull request, a merge request (GitLab) or a local worktree
+//! in a browser UI — diffs, full files with highlighted changes, line-anchored LLM
+//! chat, draft comments — and submit one review with inline comments. The LLM side
 //! runs like cxplr: Codex app-server, Claude Code, native Anthropic Messages or
 //! any OpenAI-compatible model over a read-only checkout.
 
@@ -15,6 +15,7 @@ mod diff;
 mod engine;
 mod findings;
 mod flows;
+mod gitlab;
 mod lsp;
 mod native;
 mod openai;
@@ -35,16 +36,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Review a GitHub pull request (or a local worktree) in a local web UI and
-/// post the findings as line-anchored inline comments.
+/// Review a GitHub pull request, a GitLab merge request (or a local worktree) in a
+/// local web UI and post the findings as line-anchored inline comments.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// What to review: a pull request (URL, <owner>/<repo>#<number>, or a bare
-    /// number against the checkout's origin) or a path to a checkout/worktree,
-    /// whose branch resolves to its open PR. Omitted: review the --repo
-    /// worktree (its PR if one exists, else its diff against the default branch)
+    /// What to review: a pull/merge request (URL, <owner>/<repo>#<number>,
+    /// <project>!<number>, or a bare number against the checkout's origin) or a
+    /// path to a checkout/worktree, whose branch resolves to its open request.
+    /// Omitted: review the --repo worktree (its request if one exists, else its
+    /// diff against the default branch)
     target: Option<String>,
+    /// Where the checkout's origin is hosted, when its name does not say (a
+    /// self-hosted GitLab the GitLab CLI is not logged in to)
+    #[arg(long, value_enum)]
+    forge: Option<pr::Forge>,
     /// Local checkout of the repository; the PR head is fetched into a
     /// temporary worktree when the checkout is not already on it
     #[arg(long, default_value = ".")]
@@ -203,13 +209,10 @@ struct Change {
     _checkout: Option<pr::Checkout>,
 }
 
-fn acquire(pr_arg: Option<&str>, exclude: &[String], repo: &repo::Repo) -> Result<Change, String> {
-    let origin = pr::origin_slug(&repo.root);
-    // No PR given: resolve the open PR for this checkout, if any.
-    let resolved = pr_arg.map(str::to_owned).or_else(|| {
-        let (owner, name) = origin.as_ref()?;
-        pr::resolve_pr(&repo.root, &format!("{owner}/{name}")).map(|n| n.to_string())
-    });
+fn acquire(pr_arg: Option<&str>, forced: Option<pr::Forge>, exclude: &[String], repo: &repo::Repo) -> Result<Change, String> {
+    let origin = pr::origin(&repo.root, forced);
+    // Nothing given: resolve the open request for this checkout, if any.
+    let resolved = pr_arg.map(str::to_owned).or_else(|| pr::resolve_pr(&repo.root, origin.as_ref()?));
     let Some(raw) = resolved else {
         // Local mode: the worktree's change against the default branch.
         let local = pr::local_change(&repo.root)?;
@@ -226,10 +229,10 @@ fn acquire(pr_arg: Option<&str>, exclude: &[String], repo: &repo::Repo) -> Resul
             _checkout: None,
         });
     };
-    let pref = pr::parse_ref(&raw, origin.as_ref())?;
-    if let Some((owner, name)) = &origin {
-        if !owner.eq_ignore_ascii_case(&pref.owner) || !name.eq_ignore_ascii_case(&pref.repo) {
-            eprintln!("note: the checkout's origin is {owner}/{name}, not {}; fetching the PR head may fail", pref.slug());
+    let pref = pr::parse_ref(&raw, origin.as_ref(), forced)?;
+    if let Some(o) = &origin {
+        if !o.host.eq_ignore_ascii_case(&pref.host) || !o.path.eq_ignore_ascii_case(&pref.slug()) {
+            eprintln!("note: the checkout's origin is {}/{}, not {}/{}; fetching the head may fail", o.host, o.path, pref.host, pref.slug());
         }
     }
     let meta = pr::meta(&pref)?;
@@ -237,11 +240,11 @@ fn acquire(pr_arg: Option<&str>, exclude: &[String], repo: &repo::Repo) -> Resul
     if meta.draft {
         state.push_str(", draft");
     }
-    println!("review-master: {}#{} — {}", pref.slug(), pref.number, meta.title);
+    println!("review-master: {} — {}", pref.label(), meta.title);
     println!("  {} wants `{}` ← `{}`; {state}; head {}", meta.author, meta.base_ref, meta.head_ref, &meta.head_sha[..meta.head_sha.len().min(12)]);
     println!("  {}", meta.url);
-    if meta.state != "open" {
-        eprintln!("note: this pull request is {state}; reviews can still be posted");
+    if !meta.is_open() {
+        eprintln!("note: this {} is {state}; reviews can still be posted", pref.forge.noun());
     }
     let mut model = diff::Model::parse(&pr::diff(&pref)?);
     let skipped = apply_excludes(&mut model, exclude)?;
@@ -322,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         other => (args.repo.clone(), other.map(str::to_owned)),
     };
     let repo = repo::Repo::open(&repo_path)?;
-    let change = acquire(pr_arg.as_deref(), &args.exclude, &repo)?;
+    let change = acquire(pr_arg.as_deref(), args.forge, &args.exclude, &repo)?;
     if change.model.files.is_empty() {
         return Err("nothing to review: the diff is empty after exclusions".into());
     }
@@ -355,10 +358,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  engine {}{model_note}, checkout {}", engine.kind().id(), change.root.display());
 
     let draft_key = match &change.pr {
+        Some((r, _)) if r.forge == pr::Forge::Gitlab => format!("mr-{}", r.number),
         Some((r, _)) => format!("pr-{}", r.number),
         None => change.branch.replace(['/', '\\'], "-"),
     };
-    let viewer = pr::viewer();
+    let viewer = pr::viewer(change.pr.as_ref().map(|(r, _)| r));
     let lsp = lsp::Lsp::new(&change.root, !args.no_lsp, &args.lsp, args.lsp_import_build);
     let servers = lsp.configured();
     if servers.is_empty() {
@@ -369,9 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let state = server::AppState::new(
         change.root.clone(),
-        change.pr.as_ref().map(|(r, m)| {
-            (pr::PrRef { owner: r.owner.clone(), repo: r.repo.clone(), number: r.number }, clone_meta(m))
-        }),
+        change.pr.clone(),
         change.head_sha.clone(),
         change.branch.clone(),
         change.dirty,
@@ -410,20 +412,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server::serve(listener, state).await?;
     drop(change._checkout); // removes the temporary worktree
     Ok(())
-}
-
-/// `PrMeta` is plain data; the server keeps its own copy.
-fn clone_meta(m: &pr::PrMeta) -> pr::PrMeta {
-    pr::PrMeta {
-        title: m.title.clone(),
-        body: m.body.clone(),
-        author: m.author.clone(),
-        state: m.state.clone(),
-        draft: m.draft,
-        merged: m.merged,
-        base_ref: m.base_ref.clone(),
-        head_ref: m.head_ref.clone(),
-        head_sha: m.head_sha.clone(),
-        url: m.url.clone(),
-    }
 }

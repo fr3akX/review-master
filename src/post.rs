@@ -1,8 +1,10 @@
-//! Compose and submit the GitHub review: one POST carrying every line-anchored
-//! inline comment at the reviewed head commit. Findings that could not be
-//! anchored go into the review body, so nothing is silently dropped.
+//! Compose and submit the review. GitHub: one POST carrying every line-anchored inline
+//! comment at the reviewed head commit. GitLab: draft notes published together (see
+//! `gitlab::submit`). Findings that could not be anchored go into the review body, so
+//! nothing is silently dropped.
 
-use crate::pr::{self, PrRef};
+use crate::diff::Model;
+use crate::pr::{self, Forge, PrMeta, PrRef};
 use crate::review::{Anchored, Finding};
 use serde_json::{json, Value};
 
@@ -24,15 +26,15 @@ impl Event {
 }
 
 /// `**severity: title**` then the comment body.
-fn comment_body(f: &Finding) -> String {
+pub fn comment_body(f: &Finding) -> String {
     match f.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         Some(title) => format!("**{}: {}**\n\n{}", f.severity, title, f.body),
         None => format!("**{}**\n\n{}", f.severity, f.body),
     }
 }
 
-/// The review POST body for `POST /repos/{o}/{r}/pulls/{n}/reviews`.
-pub fn payload(sha: &str, event: Event, summary: &str, inline: &[Anchored], fallback: &[(Finding, String)]) -> Value {
+/// The summary, then the findings that could not be anchored, quoted.
+pub fn review_body(summary: &str, fallback: &[(Finding, String)]) -> String {
     let mut body = summary.trim().to_owned();
     if !fallback.is_empty() {
         body.push_str("\n\n---\n**Findings that could not be anchored to the diff:**\n");
@@ -43,6 +45,12 @@ pub fn payload(sha: &str, event: Event, summary: &str, inline: &[Anchored], fall
             }
         }
     }
+    body.trim().to_owned()
+}
+
+/// The review POST body for `POST /repos/{o}/{r}/pulls/{n}/reviews`.
+pub fn payload(sha: &str, event: Event, summary: &str, inline: &[Anchored], fallback: &[(Finding, String)]) -> Value {
+    let body = review_body(summary, fallback);
     let comments: Vec<Value> = inline
         .iter()
         .map(|a| {
@@ -62,10 +70,26 @@ pub fn payload(sha: &str, event: Event, summary: &str, inline: &[Anchored], fall
     json!({ "commit_id": sha, "event": event.api(), "body": body, "comments": comments })
 }
 
-/// Submit the review; returns its URL.
-pub fn submit(r: &PrRef, payload: &Value) -> Result<String, String> {
+/// Submit the review; returns its URL and, when only a GitLab approval failed, why.
+#[allow(clippy::too_many_arguments)]
+pub fn submit(
+    r: &PrRef,
+    meta: &PrMeta,
+    model: &Model,
+    head: &str,
+    event: Event,
+    summary: &str,
+    inline: &[Anchored],
+    fallback: &[(Finding, String)],
+) -> Result<(String, Option<String>), String> {
+    if r.forge == Forge::Gitlab {
+        if event == Event::RequestChanges {
+            return Err("GitLab has no request-changes review through its API; submit a comment review (and leave the approval off)".into());
+        }
+        return crate::gitlab::submit(r, meta, model, event == Event::Approve, summary, inline, fallback);
+    }
     let path = format!("repos/{}/pulls/{}/reviews", r.slug(), r.number);
-    let bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&payload(head, event, summary, inline, fallback)).map_err(|e| e.to_string())?;
     let out = pr::gh(&["api", &path, "-X", "POST", "--input", "-"], Some(&bytes)).map_err(|e| {
         if e.contains("your own pull request") {
             format!("{e}; use --event comment")
@@ -74,7 +98,7 @@ pub fn submit(r: &PrRef, payload: &Value) -> Result<String, String> {
         }
     })?;
     let v: Value = serde_json::from_slice(&out).map_err(|e| format!("gh api {path}: {e}"))?;
-    Ok(v["html_url"].as_str().map(str::to_owned).unwrap_or_else(|| format!("review id {}", v["id"])))
+    Ok((v["html_url"].as_str().map(str::to_owned).unwrap_or_else(|| format!("review id {}", v["id"])), None))
 }
 
 #[cfg(test)]

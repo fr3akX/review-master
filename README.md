@@ -1,8 +1,9 @@
 # review-master
 
 Code review for humans, with an LLM to help you understand the change. Point it
-at a pull request, or just a worktree path — the open PR is resolved from the
-branch, its upstream, or the head commit — and it opens a local web UI:
+at a GitHub pull request, a GitLab merge request (gitlab.com or self-hosted), or
+just a worktree path — the open request is resolved from the branch, its upstream,
+or the head commit — and it opens a local web UI:
 
 - a generated **PR summary** (why the change, things to note, change outline
   with clickable citations) appears at the top while you browse — cached per
@@ -47,8 +48,9 @@ branch, its upstream, or the head commit — and it opens a local web UI:
   stopped;
 - write **draft inline comments** (severity + markdown) as you go; drafts,
   conversations and the unsent review summary persist across restarts;
-- submit everything as **one GitHub review** — comment / approve /
-  request-changes — with every comment anchored to the exact diff line;
+- submit everything as **one review** — comment / approve / request-changes on
+  GitHub, comment / approve on GitLab — with every comment anchored to the exact
+  diff line;
   **Submit & exit** posts it and stops review-master in one go, **Exit** stops it
   without posting (drafts and everything else are kept for next time).
 
@@ -59,10 +61,12 @@ Code, a native Anthropic Messages client, or any OpenAI-compatible model, with
 read-only repository-confined tools.
 
 ```sh
-review-master 176                                  # PR #176 of this checkout's origin → browser
+review-master 176                                  # PR #176 (or MR !176) of this checkout's origin → browser
 review-master acme/widgets#176 --repo ~/src/widgets # explicit repo + checkout
 review-master https://github.com/o/r/pull/7
-review-master                                      # no PR: review this worktree vs the default branch
+review-master https://gitlab.example.com/group/project/-/merge_requests/12
+review-master group/sub/project!12                 # GitLab merge request
+review-master                                      # no request: review this worktree vs the default branch
 ```
 
 ## Install
@@ -115,18 +119,20 @@ archives, checksums and `review-master-installer.sh`. After changing
 
 ## What a run does
 
-1. Resolves the PR (URL, `owner/repo#N`, or a bare number against the
-   checkout's GitHub `origin`) and fetches metadata plus the unified diff
-   through `gh` — your GitHub CLI login is the only auth. Without a PR, the
-   worktree's change against its merge base with the default branch is shown
-   (browse/chat/draft; submitting needs the PR).
-2. Fetches `pull/N/head` into a detached temporary worktree (removed on exit);
-   a checkout already on the PR head is used as is.
+1. Resolves the request (URL, `owner/repo#N`, `project!N`, or a bare number
+   against the checkout's `origin`) and fetches metadata plus the unified diff
+   through `gh` (GitHub) or `glab` (GitLab) — your CLI login is the only auth.
+   Without a request, the worktree's change against its merge base with the
+   default branch is shown (browse/chat/draft; submitting needs the request).
+2. Fetches `pull/N/head` (GitHub) or `merge-requests/N/head` (GitLab) into a
+   detached temporary worktree (removed on exit); a checkout already on the head
+   is used as is.
 3. Serves the UI on localhost and opens the browser.
-4. On submit, every draft is validated against the diff (GitHub only accepts
-   comments on lines a hunk shows); drafts that cannot be anchored go into the
-   review body instead of being dropped. One review is POSTed, pinned to the
-   reviewed head commit, and the drafts are cleared.
+4. On submit, every draft is validated against the diff (both forges only accept
+   inline comments on lines a hunk shows); drafts that cannot be anchored go into
+   the review body instead of being dropped, and the drafts are cleared. GitHub:
+   one review is POSTed, pinned to the reviewed head commit. GitLab: see
+   [GitLab](#gitlab).
 5. Runs until **Exit** (or **Submit & exit**) in the UI, or Ctrl-C in the terminal;
    then the temporary worktree is removed. Browsers only let a page close tabs a
    script opened, so the tab the terminal opened stays, saying review-master
@@ -134,7 +140,8 @@ archives, checksums and `review-master-installer.sh`. After changing
 
 ## Requirements
 
-- `gh` (GitHub CLI), logged in, and `git`.
+- `git`, and the forge's CLI, logged in: `gh` (GitHub CLI) or `glab` (GitLab CLI,
+  `glab auth login --hostname <your GitLab>` for self-hosted instances).
 - One engine for the chat:
   - `codex` on `PATH` with `codex app-server` (default), or
   - `claude` (Claude Code) on `PATH` for `--engine claude`, or
@@ -152,7 +159,8 @@ settings.
 
 | Flag | Default | |
 | --- | --- | --- |
-| `PR` | | URL, `owner/repo#N`, `#N`, or `N`; omitted = review the worktree |
+| `PR` | | URL, `owner/repo#N`, `project!N`, `#N`/`!N`, or `N`; omitted = review the worktree |
+| `--forge` | from the origin | `github` \| `gitlab`, for an origin whose host name does not say and that `glab` is not logged in to |
 | `--repo DIR` | `.` | local checkout of the repository |
 | `--engine` | configured, else `codex` | `codex` \| `claude` \| `anthropic` \| `openai` |
 | `--model` | engine default | model for the chat engine |
@@ -286,10 +294,33 @@ claude -p "$(review-master --skill) Review PR 42."   # writes /tmp/review-42.md,
 
 The agent decides when to load a skill, so this is guidance, not enforcement.
 
+## GitLab
+
+Merge requests work like pull requests, through `glab api` on the host the request
+lives on. The forge comes from the reference or URL (`!N`, `/-/merge_requests/N`), or
+from the checkout's `origin`: github.com is GitHub; a host with `gitlab` in its name, or
+one `glab` is logged in to, is GitLab; `--forge gitlab` settles anything else. Projects
+in subgroups (`group/sub/project`) are fine.
+
+- **Diff**: the merge request's latest diff version, per file from the API, rebuilt as
+  one unified diff.
+- **Existing comments**: diff discussions with their replies; general comments and
+  system notes are left out. A discussion whose position is not on the latest diff
+  version is shown as outdated. **Reply** posts into the discussion right away.
+- **Submit**: every inline draft becomes a draft note on its line (an unchanged line
+  carries both its old and new number, as GitLab requires), the summary a general
+  draft note, and all of them are published at once as your review. A multi-line draft
+  is anchored on its last line and names the range. **Approve** then approves the
+  merge request at the reviewed head; if only the approval fails (e.g. the project
+  forbids approving your own merge request), the review stays published and the UI
+  says why. GitLab's API has no request-changes review, so that option is off.
+  A draft GitLab rejects goes into the summary like any unanchorable draft; if
+  publishing itself fails, the notes wait as your pending review on GitLab.
+
 ## Tests
 
 `cargo test` covers the Rust side. `tests/ui/run.sh` drives the real binary and
-web UI in headless Chrome against a demo repository, a fake `gh` and a fake
+web UI in headless Chrome against a demo repository, a fake `gh`, a fake `glab` and a fake
 engine — no network, nothing is posted (needs node ≥ 22 and Chrome; `$CHROME`
 overrides the macOS default path, `--keep` leaves screenshots behind).
 

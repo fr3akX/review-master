@@ -1,6 +1,6 @@
 //! Local HTTP API and embedded web UI: browse the change, chat with the engine
-//! about exact lines, keep draft comments, submit one GitHub review. Engine
-//! turns run as background jobs the UI polls.
+//! about exact lines, keep draft comments, submit one review to GitHub or GitLab.
+//! Engine turns run as background jobs the UI polls.
 
 use crate::diff::{Diff, Kind, Model, Side, Status};
 use crate::engine::Engine;
@@ -48,7 +48,7 @@ pub struct AppState {
     flows_file: PathBuf,
     findings: Mutex<findings::Store>,
     pub engine: Engine,
-    /// The `gh` login, for own-PR hints in the UI.
+    /// The forge login (`gh` / `glab`), for own-request hints in the UI.
     pub viewer: Option<String>,
     pub lsp: Lsp,
     drafts: Mutex<DraftStore>,
@@ -419,7 +419,8 @@ async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
     };
     let pr = st.pr.as_ref().map(|(r, m)| {
         json!({
-            "owner": r.owner, "repo": r.repo, "number": r.number,
+            "forge": r.forge.id(), "forge_name": r.forge.name(), "noun": r.forge.noun(),
+            "owner": r.owner, "repo": r.repo, "number": r.number, "number_label": r.number_label(),
             "title": m.title, "author": m.author, "url": m.url,
             "state": m.state, "draft": m.draft, "merged": m.merged,
             "base_ref": m.base_ref, "head_ref": m.head_ref,
@@ -883,15 +884,15 @@ struct CommentsQuery {
     refresh: bool,
 }
 
-/// Review comments already on the pull request (none in local mode).
+/// Review comments already on the pull/merge request (none in local mode).
 async fn pr_comments(State(st): State<Arc<AppState>>, Query(q): Query<CommentsQuery>) -> ApiResult {
-    let Some((r, _)) = &st.pr else { return Ok(Json(json!({ "comments": [] }))) };
+    let Some((r, m)) = &st.pr else { return Ok(Json(json!({ "comments": [] }))) };
     let cached = if q.refresh { None } else { st.comments.lock().unwrap().clone() };
     let list = match cached {
         Some(list) => list,
         None => {
-            let pref = PrRef { owner: r.owner.clone(), repo: r.repo.clone(), number: r.number };
-            let list = tokio::task::spawn_blocking(move || crate::pr::review_comments(&pref))
+            let (r, m) = (r.clone(), m.clone());
+            let list = tokio::task::spawn_blocking(move || crate::pr::review_comments(&r, &m))
                 .await
                 .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
                 .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
@@ -911,12 +912,12 @@ struct ReplyRequest {
 
 /// Reply in an existing review thread; unlike drafts this is posted right away.
 async fn reply_comment(State(st): State<Arc<AppState>>, Json(req): Json<ReplyRequest>) -> ApiResult {
-    let Some((r, _)) = &st.pr else { return Err(fail(StatusCode::BAD_REQUEST, "no pull request to reply on")) };
+    let Some((r, _)) = &st.pr else { return Err(fail(StatusCode::BAD_REQUEST, "no pull/merge request to reply on")) };
     if req.body.trim().is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "the reply is empty"));
     }
-    let pref = PrRef { owner: r.owner.clone(), repo: r.repo.clone(), number: r.number };
-    tokio::task::spawn_blocking(move || crate::pr::reply(&pref, req.id, &req.body))
+    let r = r.clone();
+    tokio::task::spawn_blocking(move || crate::pr::reply(&r, req.id, &req.body))
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
@@ -989,8 +990,8 @@ struct SubmitRequest {
 }
 
 async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>) -> ApiResult {
-    let Some((pref, _)) = &st.pr else {
-        return Err(fail(StatusCode::BAD_REQUEST, "no pull request: reviewing a local worktree; give the PR on the command line to submit"));
+    let Some((pref, meta)) = &st.pr else {
+        return Err(fail(StatusCode::BAD_REQUEST, "no pull/merge request: reviewing a local worktree; give it on the command line to submit"));
     };
     let event = match req.event.as_str() {
         "comment" => post::Event::Comment,
@@ -1008,7 +1009,7 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
     let mut inline = Vec::new();
     let mut fallback = Vec::new();
     let mut excluded_drafts = 0usize;
-    {
+    let model = {
         let scope = st.scope.lock().unwrap();
         for d in items {
             // Drafts on files excluded from this review are kept but never posted.
@@ -1030,13 +1031,13 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
                 Err(bad) => fallback.push(bad),
             }
         }
-    }
+        scope.model.clone()
+    };
     if inline.is_empty() && fallback.is_empty() && req.body.trim().is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, format!("nothing to submit: {excluded_drafts} draft(s) sit on files excluded from this review")));
     }
-    let payload = post::payload(&st.head_sha, event, &req.body, &inline, &fallback);
-    let pref = PrRef { owner: pref.owner.clone(), repo: pref.repo.clone(), number: pref.number };
-    let url = tokio::task::spawn_blocking(move || post::submit(&pref, &payload))
+    let (pref, meta, head, body) = (pref.clone(), meta.clone(), st.head_sha.clone(), req.body.clone());
+    let (url, warning) = tokio::task::spawn_blocking(move || post::submit(&pref, &meta, &model, &head, event, &body, &inline, &fallback))
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
@@ -1048,7 +1049,7 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
         drafts.items.retain(|d| scope.model.file(&d.path).is_none());
         drafts.save();
     }
-    Ok(Json(json!({ "url": url, "not_submitted": excluded_drafts })))
+    Ok(Json(json!({ "url": url, "not_submitted": excluded_drafts, "warning": warning })))
 }
 
 #[derive(Deserialize)]

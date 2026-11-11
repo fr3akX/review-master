@@ -55,6 +55,8 @@ start_server pr;                               suite suite-main;            stop
 FAKE_GH_COMMENTS_FAIL=1 start_server pr;       suite suite-restart --dark;  exited
 git -C "$WORK/demo" remote remove origin
 start_server local;                            suite suite-local;           exited
+git -C "$WORK/demo" remote add origin https://gitlab.example.com/acme/demo.git
+start_server gitlab;                           suite suite-gitlab;          stop_server
 
 [ $FAILED -eq 0 ] && echo "UI tests passed" || echo "UI tests FAILED"
 exit $FAILED

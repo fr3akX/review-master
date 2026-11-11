@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+// Fake GitLab CLI for the UI tests: serves one merge request (acme/demo!1 on
+// gitlab.example.com) from the demo repository in $FAKE_GH_REPO and records what gets
+// posted (draft notes, publish, approval, replies) next to $FAKE_GH_OUT.
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const repo = process.env.FAKE_GH_REPO;
+const dir = path.dirname(process.env.FAKE_GH_OUT || '/tmp/x');
+const a = process.argv.slice(2);
+const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', maxBuffer: 1 << 26 });
+const say = v => process.stdout.write(JSON.stringify(v));
+const fail = msg => { console.error(msg); process.exit(1); };
+fs.appendFileSync(path.join(dir, 'glab-calls.log'), a.join(' ') + '\n');
+if (a[0] === 'auth') process.exit(0);
+if (a[0] !== 'api') fail('fake glab: unsupported ' + a.join(' '));
+
+// api [--hostname H] [--paginate] [--method M] [-H header] [--input -] PATH
+let method = 'GET';
+let p = null;
+for (let i = 1; i < a.length; i++) {
+  if (a[i] === '--hostname' || a[i] === '-H') i++;
+  else if (a[i] === '--method') method = a[++i];
+  else if (a[i] === '--input') { method = method === 'GET' ? 'POST' : method; i++; }
+  else if (!a[i].startsWith('-')) p = a[i];
+}
+const body = () => JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
+const state = file => path.join(dir, file);
+const load = (file, init) => (fs.existsSync(state(file)) ? JSON.parse(fs.readFileSync(state(file), 'utf8')) : init);
+const save = (file, v) => fs.writeFileSync(state(file), JSON.stringify(v, null, 1));
+const head = git('rev-parse', 'feature/ttl-cache').trim();
+const base = git('merge-base', 'main', 'feature/ttl-cache').trim();
+const mr = 'projects/acme%2Fdemo/merge_requests/1';
+const web = 'https://gitlab.example.com/acme/demo/-/merge_requests/1';
+
+// Per-file diffs as the API returns them: headers as flags, the text from the first hunk.
+function diffs() {
+  return git('diff', '-M', 'main', 'feature/ttl-cache').split(/^diff --git /m).filter(Boolean).map(part => {
+    const lines = part.split('\n');
+    const m = /^a\/(.+) b\/(.+)$/.exec(lines[0]);
+    const at = lines.findIndex(l => l.startsWith('@@'));
+    return {
+      old_path: m[1], new_path: m[2],
+      new_file: lines.some(l => l.startsWith('new file mode')), deleted_file: lines.some(l => l.startsWith('deleted file mode')),
+      renamed_file: lines.some(l => l.startsWith('rename from')), a_mode: '100644', b_mode: '100644',
+      diff: at < 0 ? '' : lines.slice(at).join('\n'),
+    };
+  });
+}
+
+const note = (id, who, text, position, created) => ({ id, body: text, author: { username: who }, created_at: created, system: false, position });
+const pos = (headSha, oldPath, newPath, oldLine, newLine) => ({ position_type: 'text', base_sha: base, start_sha: base, head_sha: headSha, old_path: oldPath, new_path: newPath, old_line: oldLine, new_line: newLine });
+function discussions() {
+  const list = [
+    { id: 'd1', notes: [
+      note(1, 'alice', 'Why does `get` need `&mut self` now? This breaks shared readers.', pos(head, 'src/store/cache.rs', 'src/store/cache.rs', null, 16), '2026-11-08T10:00:00Z'),
+      note(2, 'bob', 'Hit counting. I can switch to an `AtomicU64`.', null, '2026-11-08T11:30:00Z'),
+      { id: 3, body: 'changed this line in version 2', system: true, author: { username: 'bob' } },
+    ] },
+    { id: 'd2', notes: [note(4, 'alice', '400 was fine here.', pos(head, 'src/api/handler.py', 'src/api/handler.py', 7, null), '2026-11-09T09:00:00Z')] },
+    { id: 'd3', notes: [note(5, 'carol', 'Outdated: this was on an earlier version.', pos('0000old', 'src/store/ttl.rs', 'src/store/ttl.rs', null, 9), '2026-11-07T09:00:00Z')] },
+    { id: 'd4', individual_note: true, notes: [note(6, 'dave', 'General comment, not on a line.', null, '2026-11-07T08:00:00Z')] },
+  ];
+  for (const r of load('glab-replies.json', [])) list.find(d => d.id === r.discussion).notes.push(r.note);
+  return list;
+}
+
+if (p === 'user') say({ username: process.env.FAKE_GH_USER || 'reviewer' });
+else if (p.startsWith('projects/acme%2Fdemo/merge_requests?')) say([{ iid: 1, sha: head }]);
+else if (p === mr) say({
+  iid: 1, title: 'Add TTL and hit counting to the cache', description: 'Adds a TTL type and counts cache hits.',
+  author: { username: 'bob' }, state: 'opened', draft: false, target_branch: 'main', source_branch: 'feature/ttl-cache',
+  sha: head, web_url: web, diff_refs: { base_sha: base, start_sha: base, head_sha: head },
+});
+else if (p.startsWith(`${mr}/diffs`)) say(diffs());
+else if (p.startsWith(`${mr}/discussions?`)) say(discussions());
+else if (method === 'POST' && /\/discussions\/[^/]+\/notes$/.test(p)) {
+  const discussion = /discussions\/([^/]+)\/notes/.exec(p)[1];
+  const replies = load('glab-replies.json', []);
+  const n = note(100 + replies.length, 'reviewer', body().body, null, new Date().toISOString());
+  replies.push({ discussion, note: n });
+  save('glab-replies.json', replies);
+  say(n);
+} else if (method === 'POST' && p === `${mr}/draft_notes`) {
+  const review = load('gitlab-review.json', { drafts: [], published: false, approved: null });
+  const d = body();
+  if (d.position && !d.position.new_line && !d.position.old_line) fail('400 Bad request - position: line_code can\'t be blank');
+  review.drafts.push(d);
+  save('gitlab-review.json', review);
+  say({ id: review.drafts.length, ...d });
+} else if (method === 'POST' && p === `${mr}/draft_notes/bulk_publish`) {
+  const review = load('gitlab-review.json', { drafts: [], published: false, approved: null });
+  review.published = true;
+  save('gitlab-review.json', review);
+} else if (method === 'POST' && p === `${mr}/approve`) {
+  const review = load('gitlab-review.json', { drafts: [], published: false, approved: null });
+  review.approved = body().sha;
+  save('gitlab-review.json', review);
+  say({ approved: true });
+} else fail(`fake glab: unsupported ${method} ${p}`);
