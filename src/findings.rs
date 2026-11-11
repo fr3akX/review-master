@@ -423,11 +423,11 @@ impl Store {
     }
 
     /// Replace the findings of `source` with those parsed from `text`. A finding that is
-    /// still there (same place and title) keeps its status, so re-importing an updated
-    /// review does not bring back what was dismissed.
+    /// still there (same place and title, under any source name) keeps its status, so
+    /// importing an updated review does not bring back what was dismissed.
     pub fn import(&mut self, source: &str, text: &str, root: &Path, model: &Model) -> Imported {
         let (parsed, skipped) = parse(text);
-        let old: Vec<Finding> = self.items.iter().filter(|f| f.source == source).cloned().collect();
+        let old = self.items.clone();
         self.items.retain(|f| f.source != source);
         let added = parsed.len();
         for p in parsed {
@@ -449,6 +449,11 @@ impl Store {
         let f = self.items.iter_mut().find(|f| f.id == id).ok_or_else(|| format!("no finding {id}"))?;
         f.status = status.to_owned();
         Ok(())
+    }
+
+    /// Drop every source but these.
+    pub fn keep(&mut self, sources: &[&str]) {
+        self.items.retain(|f| sources.contains(&f.source.as_str()));
     }
 
     /// Drop one source's findings, or all of them.
@@ -572,8 +577,11 @@ diff --git a/src/old.rs b/src/old.rs\ndeleted file mode 100644\n--- a/src/old.rs
         store.import("review.md", md, &root, &model);
         let statuses: Vec<(&str, &str)> = store.items.iter().map(|f| (f.source.as_str(), f.status.as_str())).take(3).collect();
         assert_eq!(statuses, [("other.md", "open"), ("other.md", "open"), ("review.md", "dismissed")]);
-        store.remove(Some("other.md"));
-        assert_eq!(store.items.len(), 6);
+        // A re-run under another name: what was dismissed stays dismissed, and `keep` drops the earlier run.
+        store.import("rerun.md", md, &root, &model);
+        assert_eq!(store.items.iter().find(|f| f.source == "rerun.md").unwrap().status, "dismissed");
+        store.keep(&["rerun.md"]);
+        assert!(store.items.len() == 6 && store.items.iter().all(|f| f.source == "rerun.md"));
         store.remove(None);
         assert!(store.items.is_empty());
         let _ = fs::remove_dir_all(&dir);

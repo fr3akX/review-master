@@ -155,6 +155,14 @@ impl AppState {
         imported
     }
 
+    /// Forget the imports not in `names`: the reviews named on the command line are the
+    /// current ones, whatever an earlier run imported.
+    pub fn keep_findings(&self, names: &[&str]) {
+        let mut store = self.findings.lock().unwrap();
+        store.keep(names);
+        store.save();
+    }
+
     /// Everything not in this review, for the chat prompt.
     fn out_of_scope(&self, scope: &Scope) -> Vec<String> {
         self.cli_skipped.iter().chain(scope.excluded.iter()).cloned().collect()

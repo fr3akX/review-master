@@ -392,6 +392,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let skipped = if imported.skipped.is_empty() { String::new() } else { format!("; {} section(s) without a file:line left out", imported.skipped.len()) };
         println!("  findings: {} from {name}{skipped}", imported.added);
     }
+    if !reviews.is_empty() {
+        state.keep_findings(&reviews.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>());
+    }
     let listener = match tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await {
         Ok(l) => l,
         Err(e) => {

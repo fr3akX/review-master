@@ -241,7 +241,9 @@ leaves; `Alt+←` then returns to where the walk started.
 Have another model review the change, then import its Markdown: `--findings
 review.md` (repeatable), **Import Markdown…** or paste in the **Findings** drawer (`f`),
 or drop the file on the page. Importing the same file name again replaces its
-findings and keeps what you dismissed.
+findings and keeps what you dismissed. Starting with `--findings` replaces every
+earlier import of this review, so a re-run saved under a new name does not leave the
+previous run's findings behind.
 
 The review can take most shapes models produce: a heading per finding, bullets under
 severity headings (`## Critical`, `## Nits`), or fields (`**Location:** …`,
