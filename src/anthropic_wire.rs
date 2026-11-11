@@ -123,24 +123,86 @@ pub struct Transport {
     client: reqwest::Client,
     model: String,
     max_tokens: u32,
+    /// Thinking request for `--effort`; `None`: the API's default.
+    thinking: Option<Thinking>,
     auth: Auth,
     device_id: String,
 }
 
+/// Output tokens left for the answer after a thinking budget.
+const ANSWER_RESERVE: u32 = 8_192;
+/// Beta that enables `output_config.effort`.
+const EFFORT_BETA: &str = "effort-2025-11-24";
+
+/// How a request asks for thinking (as omp and Claude Code do).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Thinking {
+    /// Claude 5, Opus 4.6+ and Sonnet 4.6+: Claude decides how much to think, and
+    /// `output_config.effort` scales it. `display` asks for summarized thinking text,
+    /// which Claude 5 and Opus 4.7+ otherwise omit (older ones reject the field).
+    Adaptive { effort: &'static str, display: bool },
+    /// Older models: a fixed token budget.
+    Budget(u32),
+}
+
+/// (major, minor) of a Claude model id such as `claude-sonnet-5-5` or
+/// `claude-opus-4-6-20260101`; date suffixes are ignored.
+fn generation(model: &str) -> (u32, u32) {
+    let mut numbers = model.split('-').filter_map(|p| p.parse::<u32>().ok()).filter(|n| *n < 100);
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
+}
+
+/// The thinking request for an effort word (`--effort`) on `model`; `None` sends no
+/// thinking field. Adaptive models always think, so `off` only works on older ones.
+pub fn thinking_for(model: &str, effort: &str) -> Result<Option<Thinking>, String> {
+    let (major, minor) = generation(model);
+    let adaptive = major >= 5 || (major == 4 && minor >= 6);
+    let level = match effort {
+        "off" | "none" if adaptive => {
+            return Err(format!("{model} always thinks (adaptive thinking cannot be switched off); `low` thinks least"))
+        }
+        "off" | "none" => return Ok(None),
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        other => return Err(format!("unknown effort `{other}` for --engine anthropic: use low, medium, high, xhigh or max (or off on models before Claude 4.6)")),
+    };
+    if adaptive {
+        let display = major >= 5 || minor >= 7;
+        return Ok(Some(Thinking::Adaptive { effort: level, display }));
+    }
+    let budget = match level {
+        "low" => 4_096,
+        "medium" => 10_000,
+        "high" => 20_000,
+        "xhigh" => 32_000,
+        _ => 64_000,
+    };
+    Ok(Some(Thinking::Budget(budget)))
+}
+
 impl Transport {
-    /// Selects credentials and builds the HTTP client; sends no request.
-    pub async fn new(model: &str) -> Result<Transport, String> {
+    /// Selects credentials and builds the HTTP client; sends no request. The thinking
+    /// budget is capped so the model always has room left for its answer.
+    pub async fn new(model: &str, thinking: Option<Thinking>) -> Result<Transport, String> {
         let auth = Auth::resolve()?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| format!("http client: {e}"))?;
+        let max_tokens = max_output_tokens(model);
         Ok(Transport {
             device_id: device_id(auth.install_id(), auth.account_id()),
             client,
             model: model.to_owned(),
-            max_tokens: max_output_tokens(model),
+            max_tokens,
+            thinking: thinking.map(|t| match t {
+                Thinking::Budget(b) => Thinking::Budget(b.clamp(1_024, max_tokens - ANSWER_RESERVE)),
+                adaptive => adaptive,
+            }),
             auth,
         })
     }
@@ -159,11 +221,11 @@ impl Transport {
             let wire = oauth.then(|| OAuthWire {
                 version: &version, device_id: &self.device_id, account_id: self.auth.account_id(), session,
             });
-            let body = build_body(&self.model, self.max_tokens, system, messages, tools, wire.as_ref());
+            let body = build_body(&self.model, self.max_tokens, self.thinking, system, messages, tools, wire.as_ref());
             let (url, headers) = if oauth {
-                (format!("{MESSAGES_URL}?beta=true"), oauth_headers(&credential, session, &version, !tools.is_empty())?)
+                (format!("{MESSAGES_URL}?beta=true"), oauth_headers(&credential, session, &version, !tools.is_empty(), self.effort_beta())?)
             } else {
-                (MESSAGES_URL.to_owned(), api_key_headers(&credential)?)
+                (MESSAGES_URL.to_owned(), api_key_headers(&credential, self.effort_beta())?)
             };
             let response = self
                 .client
@@ -192,6 +254,11 @@ impl Transport {
             }
             return Err(http_error(status.as_u16(), &text, request_id.as_deref(), retry_after.as_deref(), self.auth.source()));
         }
+    }
+
+    /// `output_config.effort` needs its beta flag.
+    fn effort_beta(&self) -> bool {
+        matches!(self.thinking, Some(Thinking::Adaptive { .. }))
     }
 }
 
@@ -239,8 +306,11 @@ fn stainless_os() -> String {
 }
 
 /// Claude Code's OAuth header set, in omp's order.
-fn oauth_headers(token: &Secret, session: &str, version: &str, agent: bool) -> Result<HeaderMap, String> {
-    let betas = if agent { AGENT_BETAS } else { UTILITY_BETAS };
+fn oauth_headers(token: &Secret, session: &str, version: &str, agent: bool, effort_beta: bool) -> Result<HeaderMap, String> {
+    let mut betas: Vec<&str> = if agent { AGENT_BETAS } else { UTILITY_BETAS }.to_vec();
+    if effort_beta {
+        betas.push(EFFORT_BETA);
+    }
     let mut h = HeaderMap::new();
     let mut put = |name: &'static str, value: HeaderValue| {
         h.insert(HeaderName::from_static(name), value);
@@ -270,13 +340,16 @@ fn oauth_headers(token: &Secret, session: &str, version: &str, agent: bool) -> R
 }
 
 /// Plain API-key headers: no Claude Code identity at all.
-fn api_key_headers(key: &Secret) -> Result<HeaderMap, String> {
+fn api_key_headers(key: &Secret, effort_beta: bool) -> Result<HeaderMap, String> {
     let mut h = HeaderMap::new();
     h.insert("accept", HeaderValue::from_static("text/event-stream"));
     h.insert("accept-encoding", HeaderValue::from_static(ACCEPT_ENCODING));
     h.insert("connection", HeaderValue::from_static("keep-alive"));
     h.insert("content-type", HeaderValue::from_static("application/json"));
     h.insert("anthropic-version", HeaderValue::from_static(API_VERSION));
+    if effort_beta {
+        h.insert("anthropic-beta", HeaderValue::from_static(EFFORT_BETA));
+    }
     h.insert("user-agent", header_value(concat!("review-master/", env!("CARGO_PKG_VERSION")))?);
     let mut value = header_value(key.expose())?;
     value.set_sensitive(true);
@@ -386,9 +459,10 @@ fn message_breakpoints(messages: &[Value], cache: &Value, budget: usize) -> Vec<
 }
 
 /// Serializes the request in omp's field order: model, messages, system, tools,
-/// metadata, max_tokens, stream. Only the ≤2 decorated messages are cloned.
+/// metadata, thinking, max_tokens, stream. Only the ≤2 decorated messages are cloned.
+#[allow(clippy::too_many_arguments)]
 fn build_body(
-    model: &str, max_tokens: u32, system: &str, messages: &[Value], tools: &[Value], oauth: Option<&OAuthWire>,
+    model: &str, max_tokens: u32, thinking: Option<Thinking>, system: &str, messages: &[Value], tools: &[Value], oauth: Option<&OAuthWire>,
 ) -> Vec<u8> {
     // OAuth defaults to 1h retention (Claude Code subscriber policy); API keys use 5m.
     let cache = match oauth {
@@ -474,6 +548,16 @@ fn build_body(
         out.extend_from_slice(b",\"metadata\":{\"user_id\":");
         write_json(&mut out, std::str::from_utf8(&user_id).expect("JSON is UTF-8"));
         out.push(b'}');
+    }
+    match thinking {
+        Some(Thinking::Adaptive { effort, display }) => {
+            let display = if display { ",\"display\":\"summarized\"" } else { "" };
+            out.extend_from_slice(format!(",\"thinking\":{{\"type\":\"adaptive\"{display}}},\"output_config\":{{\"effort\":\"{effort}\"}}").as_bytes());
+        }
+        Some(Thinking::Budget(budget)) => {
+            out.extend_from_slice(format!(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{budget}}}").as_bytes());
+        }
+        None => {}
     }
     out.extend_from_slice(format!(",\"max_tokens\":{max_tokens},\"stream\":true}}").as_bytes());
 
@@ -888,7 +972,7 @@ mod tests {
         let first = r#"Look at "system":[{"type":"text","text":"x-anthropic-billing-header: cch=00000;"#;
         let messages = sample_messages(first);
         let wire = OAuthWire { version: "2.1.280", device_id: "dev", account_id: Some("acc"), session: "sess" };
-        let body = build_body("claude-sonnet-5-5", 128_000, "SYSTEM", &messages, &sample_tools(), Some(&wire));
+        let body = build_body("claude-sonnet-5-5", 128_000, None, "SYSTEM", &messages, &sample_tools(), Some(&wire));
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.starts_with("{\"model\":\"claude-sonnet-5-5\",\"messages\":["));
         let marker = "\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header:";
@@ -915,11 +999,35 @@ mod tests {
     }
 
     #[test]
+    fn effort_words_pick_adaptive_or_budget_thinking_by_model() {
+        assert_eq!(thinking_for("claude-sonnet-5-5", "low").unwrap(), Some(Thinking::Adaptive { effort: "low", display: true }));
+        assert_eq!(thinking_for("claude-sonnet-4-6", "max").unwrap(), Some(Thinking::Adaptive { effort: "max", display: false }));
+        assert_eq!(thinking_for("claude-opus-4-7-20260101", "high").unwrap(), Some(Thinking::Adaptive { effort: "high", display: true }));
+        assert_eq!(thinking_for("claude-sonnet-4-5", "high").unwrap(), Some(Thinking::Budget(20_000)));
+        assert_eq!(thinking_for("claude-sonnet-4-5", "off").unwrap(), None);
+        assert!(thinking_for("claude-sonnet-5-5", "off").unwrap_err().contains("always thinks"));
+        assert!(thinking_for("claude-sonnet-5-5", "minimal").unwrap_err().contains("unknown effort"));
+
+        let adaptive = Some(Thinking::Adaptive { effort: "low", display: true });
+        let body: Value = serde_json::from_slice(&build_body("claude-sonnet-5-5", 128_000, adaptive, "", &sample_messages("hi"), &[], None)).unwrap();
+        assert_eq!(body["thinking"], json!({"type":"adaptive","display":"summarized"}));
+        assert_eq!(body["output_config"], json!({"effort":"low"}));
+        let budget: Value = serde_json::from_slice(&build_body("claude-sonnet-4-5", 32_768, Some(Thinking::Budget(20_000)), "", &sample_messages("hi"), &[], None)).unwrap();
+        assert_eq!(budget["thinking"], json!({"type":"enabled","budget_tokens":20_000}));
+        assert!(budget.get("output_config").is_none());
+        let headers = api_key_headers(&Secret::for_test("key"), true).unwrap();
+        assert_eq!(headers["anthropic-beta"], EFFORT_BETA);
+        let oauth = oauth_headers(&Secret::for_test("tok"), "sess", "2.1.280", true, true).unwrap();
+        assert!(oauth["anthropic-beta"].to_str().unwrap().ends_with(",effort-2025-11-24"));
+        assert_eq!(budget["max_tokens"], 32_768);
+    }
+
+    #[test]
     fn caching_stays_within_four_breakpoints() {
         let messages = sample_messages("hello");
         let wire = OAuthWire { version: "2.1.280", device_id: "dev", account_id: None, session: "sess" };
         for oauth in [Some(&wire), None] {
-            let body = build_body("claude-sonnet-5-5", 128_000, "SYSTEM", &messages, &sample_tools(), oauth);
+            let body = build_body("claude-sonnet-5-5", 128_000, None, "SYSTEM", &messages, &sample_tools(), oauth);
             let text = std::str::from_utf8(&body).unwrap();
             assert!(text.matches("\"cache_control\"").count() <= MAX_BREAKPOINTS);
             let parsed: Value = serde_json::from_slice(&body).unwrap();
@@ -940,7 +1048,7 @@ mod tests {
         // Caller history is never mutated.
         assert!(messages[2]["content"][0].get("cache_control").is_none());
         let strings = vec![json!({"role":"user","content":"a"}), json!({"role":"user","content":"b"})];
-        let body = build_body("m", 1, "", &strings, &[], None);
+        let body = build_body("m", 1, None, "", &strings, &[], None);
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["messages"][1]["content"][0]["cache_control"], json!({"type":"ephemeral"}));
         assert!(parsed.get("system").is_none() && parsed.get("tools").is_none());
@@ -948,13 +1056,13 @@ mod tests {
 
     #[test]
     fn headers_isolate_oauth_identity_from_api_keys() {
-        let oauth = oauth_headers(&Secret::for_test("tok"), "sess", "2.1.280", true).unwrap();
+        let oauth = oauth_headers(&Secret::for_test("tok"), "sess", "2.1.280", true, false).unwrap();
         assert_eq!(oauth["user-agent"], "claude-cli/2.1.280 (external, cli)");
         assert_eq!(oauth["x-claude-code-session-id"], "sess");
         assert!(oauth["anthropic-beta"].to_str().unwrap().starts_with("claude-code-20250219,oauth-2025-04-20"));
         assert_eq!(oauth["authorization"], "Bearer tok");
         assert!(oauth["authorization"].is_sensitive());
-        let key = api_key_headers(&Secret::for_test("key")).unwrap();
+        let key = api_key_headers(&Secret::for_test("key"), false).unwrap();
         assert_eq!(key["x-api-key"], "key");
         for name in ["authorization", "x-app", "anthropic-beta", "x-claude-code-session-id", "x-stainless-os"] {
             assert!(key.get(name).is_none(), "{name}");

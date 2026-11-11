@@ -31,6 +31,8 @@ or use the network. When a turn defines an output schema, answer with exactly th
 pub struct CodexConfig {
     pub bin: String,
     pub model: Option<String>,
+    /// Reasoning effort for every turn; `None`: the Codex config's.
+    pub effort: Option<String>,
     /// Limit for one turn.
     pub timeout: Duration,
 }
@@ -138,6 +140,10 @@ impl Codex {
 
     pub fn model(&self) -> Option<&str> {
         self.cfg.model.as_deref()
+    }
+
+    pub fn effort(&self) -> Option<&str> {
+        self.cfg.effort.as_deref()
     }
 
     fn fail_all(&self, reason: String) {
@@ -292,11 +298,14 @@ impl Codex {
         }
         let _subscription = Subscription { codex: self, thread: thread.to_owned() };
 
-        let params = json!({
+        let mut params = json!({
             "threadId": thread,
             "input": [{ "type": "text", "text": prompt }],
             "outputSchema": schema,
         });
+        if let Some(effort) = &self.cfg.effort {
+            params["effort"] = json!(effort);
+        }
         let started = self.request("turn/start", params).await?;
         let turn_id = started["turn"]["id"].as_str().unwrap_or_default().to_owned();
 

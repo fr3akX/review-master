@@ -164,11 +164,32 @@ async fn setup(kind: Kind, cfg: &mut Config, model: Option<String>) -> Result<Op
     }
 }
 
-fn summary(kind: Kind, model: Option<&str>, cfg: &Config) -> String {
+/// The reasoning effort for `kind`; Enter keeps `current`, `-` returns to the default.
+fn effort(kind: Kind, current: Option<String>) -> Result<Option<String>, String> {
+    let (levels, default) = match kind {
+        Kind::Codex => ("a level your model offers, e.g. low, medium, high", "your Codex config"),
+        Kind::Claude => ("low, medium, high, xhigh or max", "Claude Code's default"),
+        Kind::Anthropic => ("low, medium, high, xhigh or max; current models always think, off works only before Claude 4.6", "the API's default"),
+        Kind::OpenAi => ("sent as reasoning_effort, e.g. none, low, medium, high; the server checks it", "the server's default"),
+    };
+    println!("  Reasoning effort: {levels}.");
+    loop {
+        let chosen = text("Reasoning effort", current.as_deref(), default)?;
+        match (&chosen, kind) {
+            (Some(e), Kind::Anthropic) if !["off", "none", "low", "medium", "high", "xhigh", "max"].contains(&e.as_str()) => {
+                println!("  use low, medium, high, xhigh or max (off only on models before Claude 4.6)");
+            }
+            _ => return Ok(chosen),
+        }
+    }
+}
+
+fn summary(kind: Kind, model: Option<&str>, effort: Option<&str>, cfg: &Config) -> String {
     let model = model.map_or_else(|| "default model".to_owned(), |m| format!("model {m}"));
+    let effort = effort.map_or_else(|| "default effort".to_owned(), |e| format!("effort {e}"));
     match kind {
-        Kind::OpenAi => format!("{} ({model}) at {}", kind.id(), cfg.openai_base_url.as_deref().unwrap_or(openai::DEFAULT_BASE_URL)),
-        _ => format!("{} ({model})", kind.id()),
+        Kind::OpenAi => format!("{} ({model}, {effort}) at {}", kind.id(), cfg.openai_base_url.as_deref().unwrap_or(openai::DEFAULT_BASE_URL)),
+        _ => format!("{} ({model}, {effort})", kind.id()),
     }
 }
 
@@ -181,11 +202,13 @@ pub async fn run(current: Option<Config>) -> Result<Config, String> {
 
     let default_engine = cfg.engine.unwrap_or(if on_path("codex") || !on_path("claude") { Kind::Codex } else { Kind::Claude });
     let engine = pick_engine("Engine that reviews pull requests:", default_engine, &cfg)?;
-    let model = if cfg.engine.unwrap_or(Kind::Codex) == engine { cfg.model.clone() } else { None };
+    let own = cfg.engine.unwrap_or(Kind::Codex) == engine;
+    let model = if own { cfg.model.clone() } else { None };
     cfg.model = setup(engine, &mut cfg, model).await?;
+    cfg.effort = effort(engine, if own { cfg.effort.clone() } else { None })?;
     cfg.engine = Some(engine);
 
-    println!("\nReviews: {}", summary(engine, cfg.model.as_deref(), &cfg));
+    println!("\nReviews: {}", summary(engine, cfg.model.as_deref(), cfg.effort.as_deref(), &cfg));
     if !confirm("Save?", true)? {
         return Err("configuration not saved".into());
     }

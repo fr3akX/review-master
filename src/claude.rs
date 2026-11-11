@@ -33,6 +33,8 @@ repository root. When a turn defines an output schema, answer with exactly that 
 pub struct ClaudeConfig {
     pub bin: String,
     pub model: Option<String>,
+    /// `--effort` for every turn (low, medium, high, xhigh, max); `None`: Claude Code's default.
+    pub effort: Option<String>,
     /// Limit for one turn.
     pub timeout: Duration,
 }
@@ -94,6 +96,10 @@ impl Claude {
 
     pub fn model(&self) -> Option<&str> {
         self.cfg.model.as_deref()
+    }
+
+    pub fn effort(&self) -> Option<&str> {
+        self.cfg.effort.as_deref()
     }
 
     pub fn start_session(&self, name: &str) -> Result<String, String> {
@@ -172,6 +178,9 @@ impl Claude {
             .arg(schema.to_string());
         if let Some(model) = &self.cfg.model {
             cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &self.cfg.effort {
+            cmd.args(["--effort", effort]);
         }
         cmd.args(self.session_args(session)?);
         let mut child = cmd
@@ -343,7 +352,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("review-master-claude-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("projects/-repo")).unwrap();
-        let cfg = ClaudeConfig { bin: "claude".into(), model: None, timeout: Duration::from_secs(60) };
+        let cfg = ClaudeConfig { bin: "claude".into(), model: None, effort: None, timeout: Duration::from_secs(60) };
         let claude = Claude::new(cfg, Path::new("/repo"), dir.join("projects"));
 
         let parent = claude.start_session("system").unwrap();

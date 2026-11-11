@@ -154,11 +154,27 @@ archives, checksums and `review-master-installer.sh`. After changing
     `--engine anthropic` (`review-master --anthropic-login`), or
   - an OpenAI-compatible server with tool calling for `--engine openai`.
 
-`review-master --configure` picks and checks the engine and model interactively
+`review-master --configure` picks and checks the engine, model and reasoning effort interactively
 and saves them to `~/.config/review-master/config.toml`; the first interactive
 launch without a configuration offers it too. Flags override the configuration,
 and `$OPENAI_BASE_URL` / `$OPENAI_API_KEY` / `$OPENAI_MODEL` override the OpenAI
 settings.
+
+### Reasoning effort
+
+`--effort` (or `effort` in the configuration, asked by `--configure`) sets how hard the
+engine reasons for chats, the summary and flows; without it each engine uses its own
+default. The word goes to the engine, which checks it:
+
+| Engine | Sent as | Levels | Without `--effort` |
+| --- | --- | --- | --- |
+| `codex` | the turn's `effort` | what the model offers (e.g. `low`, `medium`, `high`) | `model_reasoning_effort` in your Codex config |
+| `claude` | `claude -p --effort` | `low`, `medium`, `high`, `xhigh`, `max` | Claude Code's default (`--restricted` ignores your settings files) |
+| `anthropic` | Claude 5 / Opus and Sonnet 4.6+: adaptive thinking with `output_config.effort`; older models: a thinking budget | `low`, `medium`, `high`, `xhigh`, `max`; `off` only before Claude 4.6 | the API's default |
+| `openai` | `reasoning_effort` | the server's, e.g. `minimal`…`high`, or `none` (thinking off) on llama.cpp Qwen templates | the server's |
+
+A configured effort belongs to its engine: `--engine claude` does not inherit the
+effort configured for `codex`. The startup line and the header chip show it.
 
 ## Flags
 
@@ -169,6 +185,7 @@ settings.
 | `--repo DIR` | `.` | local checkout of the repository |
 | `--engine` | configured, else `codex` | `codex` \| `claude` \| `anthropic` \| `openai` |
 | `--model` | engine default | model for the chat engine |
+| `--effort LEVEL` | configured, else engine default | reasoning effort (see [Reasoning effort](#reasoning-effort)) |
 | `--host` / `--port` | `127.0.0.1` / `7979` | where the UI is served (busy port → a free one) |
 | `--no-open` | | do not open the browser |
 | `--lsp LANG=COMMAND` | auto-detected on PATH | language server override; empty command disables one language |
@@ -223,6 +240,11 @@ disables it, `--no-lsp` disables all. Language servers can run project tooling; 
 ### Scala
 
 Install Metals with [coursier](https://get-coursier.io) (needs a JDK): `cs install metals`.
+review-master finds it on `PATH` or, if coursier's bin directory is not on `PATH`, there
+(`$COURSIER_BIN_DIR`, `~/.local/share/coursier/bin`, `~/Library/Application
+Support/Coursier/bin`). When a change has files of a language whose server is not
+installed, the startup output says so with the install command, and the viewer's chip
+reads `scala: no language server` instead of falling back silently.
 By default review-master declines Metals' build import, so nothing in the project runs:
 the outline and hover within a file work, while definitions and references across files
 fall back to text search. `--lsp-import-build` imports the build (sbt, Mill, Gradle, …

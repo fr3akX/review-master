@@ -25,6 +25,7 @@ fn message(role: &str, blocks: Vec<Value>) -> Value {
 
 pub struct Anthropic {
     model: String,
+    effort: Option<String>,
     transport: Transport,
     tools: Tools,
     sessions: Sessions,
@@ -33,16 +34,20 @@ pub struct Anthropic {
 }
 
 impl Anthropic {
-    pub async fn start(root: &Path, cache: &Path, model: Option<String>, timeout: Duration) -> Result<Self, String> {
+    /// `effort` picks the thinking request for the model (see `anthropic_wire::thinking_for`).
+    pub async fn start(root: &Path, cache: &Path, model: Option<String>, effort: Option<String>, timeout: Duration) -> Result<Self, String> {
         let model = model.unwrap_or_else(|| DEFAULT_MODEL.into());
-        let transport = Transport::new(&model).await?;
+        let thinking = effort.as_deref().map(|e| crate::anthropic_wire::thinking_for(&model, e)).transpose()?.flatten();
+        let transport = Transport::new(&model, thinking).await?;
         Ok(Self {
-            model, transport, tools: Tools::new(root)?, sessions: Sessions::new(root, cache, "anthropic-sessions")?,
+            model, effort, transport, tools: Tools::new(root)?, sessions: Sessions::new(root, cache, "anthropic-sessions")?,
             timeout, busy: BusySet::default(),
         })
     }
 
     pub fn model(&self) -> Option<&str> { Some(&self.model) }
+
+    pub fn effort(&self) -> Option<&str> { self.effort.as_deref() }
 
     pub fn start_session(&self, name: &str) -> Result<String, String> { self.sessions.create(name, None) }
 

@@ -73,6 +73,16 @@ impl Engine {
         }
     }
 
+    /// Reasoning effort set for this run; `None`: the engine's own default.
+    pub fn effort(&self) -> Option<&str> {
+        match self {
+            Engine::Codex(c) => c.effort(),
+            Engine::Claude(c) => c.effort(),
+            Engine::Anthropic(c) => c.effort(),
+            Engine::OpenAi(c) => c.effort(),
+        }
+    }
+
     /// A new persisted session.
     pub async fn start_session(&self, name: &str) -> Result<String, String> {
         match self {

@@ -64,6 +64,12 @@ struct Args {
     /// native Anthropic claude-sonnet-5-5, openai $OPENAI_MODEL or the server's only model)
     #[arg(long)]
     model: Option<String>,
+    /// Reasoning effort (default: the configured effort, else the engine's own).
+    /// codex: a level the model offers (e.g. low, medium, high); claude: low,
+    /// medium, high, xhigh, max; anthropic: low … max (off only before Claude 4.6);
+    /// openai: sent as `reasoning_effort` (e.g. none to turn thinking off)
+    #[arg(long)]
+    effort: Option<String>,
     /// OpenAI-compatible API root for --engine openai (also $OPENAI_BASE_URL; a bare
     /// host gets /v1). The API key, if the server needs one, comes from $OPENAI_API_KEY
     #[arg(long)]
@@ -150,23 +156,23 @@ struct EngineOpts {
     timeout: Duration,
 }
 
-async fn start_engine(kind: engine::Kind, model: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
+async fn start_engine(kind: engine::Kind, model: Option<String>, effort: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
     let timeout = o.timeout;
     Ok(match kind {
         engine::Kind::Codex => {
-            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, timeout };
+            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, effort, timeout };
             engine::Engine::Codex(codex::Codex::start(cfg, root).await?)
         }
         engine::Kind::Claude => {
-            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, timeout };
+            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, effort, timeout };
             engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, root).await?))
         }
         engine::Kind::Anthropic => {
             let model = model.or_else(|| Some(anthropic::DEFAULT_MODEL.to_owned()));
-            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, timeout).await?))
+            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, effort, timeout).await?))
         }
         engine::Kind::OpenAi => {
-            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, timeout };
+            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, effort, timeout };
             engine::Engine::OpenAi(Arc::new(openai::OpenAi::start(root, cache_dir, cfg).await?))
         }
     })
@@ -301,14 +307,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut cfg = config::load()?;
     // First interactive launch without a configuration: set one up, then carry on.
-    let engine_flags = args.engine.is_some() || args.model.is_some() || args.openai_base_url.is_some();
+    let engine_flags = args.engine.is_some() || args.model.is_some() || args.effort.is_some() || args.openai_base_url.is_some();
     if cfg.is_none() && !engine_flags && term::interactive() {
         println!("No review-master configuration yet; let's set it up first (`review-master --configure` changes it later).\n");
         cfg = Some(configure::run(None).await?);
     }
     let cfg = cfg.unwrap_or_default();
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-    let mut choice = config::choose(&cfg, args.engine, args.model.clone());
+    let mut choice = config::choose(&cfg, args.engine, args.model.clone(), args.effort.clone());
     // $OPENAI_MODEL sits between flags and the configuration.
     if choice.engine == engine::Kind::OpenAi && args.model.is_none() {
         choice.model = env("OPENAI_MODEL").or(choice.model);
@@ -351,8 +357,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         openai_api_key: env("OPENAI_API_KEY").or(cfg.openai_api_key),
         timeout: Duration::from_secs(args.timeout_mins.max(1) * 60),
     };
-    let engine = start_engine(choice.engine, choice.model, &opts, &change.root, &cache_dir).await?;
-    let model_note = engine.model().map_or(String::new(), |m| format!(" ({m})"));
+    let engine = start_engine(choice.engine, choice.model, choice.effort, &opts, &change.root, &cache_dir).await?;
+    let details: Vec<String> = [engine.model().map(str::to_owned), engine.effort().map(|e| format!("effort {e}"))].into_iter().flatten().collect();
+    let model_note = if details.is_empty() { String::new() } else { format!(" ({})", details.join(", ")) };
     println!("  engine {}{model_note}, checkout {}", engine.kind().id(), change.root.display());
 
     let draft_key = match &change.pr {
@@ -368,6 +375,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for (lang, cmd) in servers {
         println!("  language server: {lang} = {cmd}");
+    }
+    for (lang, hint) in lsp.missing_for(change.model.files.iter().map(|f| f.path.as_str())) {
+        println!("  language server: {lang} not found, its files use text search; install: {hint}");
     }
     let state = server::AppState::new(
         change.root.clone(),

@@ -19,6 +19,9 @@ pub struct Config {
     /// Model for `engine`; absent: the engine's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort for `engine`; absent: the engine's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_base_url: Option<String>,
     /// Stored in a private (0600) file; `$OPENAI_API_KEY` wins when set.
@@ -77,21 +80,24 @@ pub fn save(config: &Config) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Engine and model for one run.
+/// Engine, model and reasoning effort for one run (`None`: the engine's default).
 #[derive(Debug, PartialEq)]
 pub struct Choice {
     pub engine: Kind,
     pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
-/// Combine command-line flags with the configuration. A configured model only
-/// applies to the engine it was configured for, so `--engine claude` does not
-/// inherit the model of a configured `openai` engine.
-pub fn choose(cfg: &Config, engine: Option<Kind>, model: Option<String>) -> Choice {
+/// Combine command-line flags with the configuration. A configured model or effort
+/// only applies to the engine it was configured for, so `--engine claude` does not
+/// inherit the model or effort of a configured `openai` engine.
+pub fn choose(cfg: &Config, engine: Option<Kind>, model: Option<String>, effort: Option<String>) -> Choice {
     let cfg_engine = cfg.engine.unwrap_or(Kind::Codex);
     let engine = engine.unwrap_or(cfg_engine);
-    let model = model.or_else(|| (engine == cfg_engine).then(|| cfg.model.clone()).flatten());
-    Choice { engine, model }
+    let own = engine == cfg_engine;
+    let model = model.or_else(|| own.then(|| cfg.model.clone()).flatten());
+    let effort = effort.or_else(|| own.then(|| cfg.effort.clone()).flatten());
+    Choice { engine, model, effort }
 }
 
 #[cfg(test)]
@@ -103,15 +109,16 @@ mod tests {
     }
 
     #[test]
-    fn flags_override_and_models_stay_with_their_engine() {
-        let c = cfg("engine = \"openai\"\nmodel = \"qwen\"\n");
-        assert_eq!(choose(&c, None, None), Choice { engine: Kind::OpenAi, model: Some("qwen".into()) });
-        // Another engine drops the configured model.
-        assert_eq!(choose(&c, Some(Kind::Claude), None), Choice { engine: Kind::Claude, model: None });
+    fn flags_override_and_settings_stay_with_their_engine() {
+        let c = cfg("engine = \"openai\"\nmodel = \"qwen\"\neffort = \"none\"\n");
+        assert_eq!(choose(&c, None, None, None), Choice { engine: Kind::OpenAi, model: Some("qwen".into()), effort: Some("none".into()) });
+        // Another engine drops the configured model and effort.
+        assert_eq!(choose(&c, Some(Kind::Claude), None, None), Choice { engine: Kind::Claude, model: None, effort: None });
         // Flags win.
-        assert_eq!(choose(&c, None, Some("big".into())).model.as_deref(), Some("big"));
+        let flagged = choose(&c, None, Some("big".into()), Some("high".into()));
+        assert_eq!((flagged.model.as_deref(), flagged.effort.as_deref()), (Some("big"), Some("high")));
         // No configuration: Codex with its own defaults.
-        assert_eq!(choose(&Config::default(), None, None), Choice { engine: Kind::Codex, model: None });
+        assert_eq!(choose(&Config::default(), None, None, None), Choice { engine: Kind::Codex, model: None, effort: None });
     }
 
     #[test]

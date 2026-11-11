@@ -432,7 +432,7 @@ async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "head": st.head_sha,
         "branch": st.branch,
         "dirty": st.dirty,
-        "engine": { "kind": st.engine.kind().id(), "model": st.engine.model() },
+        "engine": { "kind": st.engine.kind().id(), "model": st.engine.model(), "effort": st.engine.effort() },
         "viewer": st.viewer,
         "files": files,
         "skipped": st.cli_skipped,

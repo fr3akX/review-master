@@ -388,7 +388,7 @@ function renderHeader() {
     );
     document.title = `${branch} · review-master`;
   }
-  $('#engine-chip').textContent = engine ? `${engine.kind}${engine.model ? ` · ${engine.model}` : ''}` : 'no engine';
+  $('#engine-chip').textContent = engine ? [engine.kind, engine.model, engine.effort && `effort ${engine.effort}`].filter(Boolean).join(' · ') : 'no engine';
 }
 
 function submittedNode() {
@@ -2130,6 +2130,7 @@ function renderLspChip(v) {
     indexing: `${server}: indexing…`,
     ready: server,
     failed: `${server}: unavailable`,
+    missing: `${st.language}: no language server`,
   }[st.state] || st.state;
   v.lspChip.title = st.state === 'none'
     ? 'No language server for this file type: navigation uses whole-word text search'

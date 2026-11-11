@@ -33,6 +33,20 @@ const DEFAULT_SERVERS: &[(&str, &[&str])] = &[
 
 pub const LANGUAGES: &[&str] = &["rust", "python", "typescript", "go", "c", "scala"];
 
+/// How to get each language's server, for when none is found.
+const INSTALL_HINTS: &[(&str, &str)] = &[
+    ("rust", "rustup component add rust-analyzer"),
+    ("python", "npm install -g pyright (or pip install pyright)"),
+    ("typescript", "npm install -g typescript typescript-language-server"),
+    ("go", "go install golang.org/x/tools/gopls@latest"),
+    ("c", "install clangd (apt install clangd, brew install llvm)"),
+    ("scala", "cs install metals (coursier, needs a JDK)"),
+];
+
+fn install_hint(lang: &str) -> &'static str {
+    INSTALL_HINTS.iter().find(|(l, _)| *l == lang).map_or("see the README", |(_, h)| *h)
+}
+
 /// Server language for a file, plus the document's LSP `languageId`.
 pub fn language_of(path: &str) -> Option<(&'static str, &'static str)> {
     let ext = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
@@ -85,6 +99,30 @@ fn on_path(program: &str) -> bool {
         return Path::new(program).is_file();
     }
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+}
+
+/// Where coursier puts launchers (`cs install metals`): `$COURSIER_BIN_DIR`, else its
+/// Linux and macOS defaults. Often not on `PATH`.
+fn coursier_bins() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("COURSIER_BIN_DIR").filter(|d| !d.is_empty()).map(PathBuf::from).into_iter().collect();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local/share/coursier/bin"));
+        dirs.push(home.join("Library/Application Support/Coursier/bin"));
+    }
+    dirs
+}
+
+/// Where a server command's program is: `None` when it runs from `PATH` as written,
+/// `Some(path)` for a coursier launcher outside `PATH`. `Err` when it is nowhere.
+fn locate(cmd: &str) -> Result<Option<PathBuf>, ()> {
+    let program = cmd.split_whitespace().next().ok_or(())?;
+    if on_path(program) {
+        return Ok(None);
+    }
+    if program.contains('/') {
+        return Err(());
+    }
+    coursier_bins().into_iter().map(|d| d.join(program)).find(|p| p.is_file()).map(Some).ok_or(())
 }
 
 /// The rustup default toolchain name (`stable-aarch64-apple-darwin`), if rustup exists.
@@ -363,7 +401,8 @@ pub struct SymbolInfo {
 pub struct Status {
     pub language: Option<&'static str>,
     pub server: Option<String>,
-    /// `none` (no server for this file), `idle` (not started), `starting`, `ready`, `indexing` or `failed`.
+    /// `none` (no server for this file type), `missing` (none installed; `error` says how
+    /// to get one), `idle` (not started), `starting`, `ready`, `indexing` or `failed`.
     pub state: &'static str,
     pub error: Option<String>,
 }
@@ -376,6 +415,10 @@ pub struct Lsp {
     root: PathBuf,
     client: Client,
     commands: HashMap<String, String>,
+    /// Programs found outside `PATH` (coursier launchers), by language.
+    programs: HashMap<String, PathBuf>,
+    /// Languages with no server found (and none disabled on purpose).
+    missing: Vec<&'static str>,
     slots: Mutex<HashMap<&'static str, Slot>>,
 }
 
@@ -384,13 +427,23 @@ impl Lsp {
     /// `import_builds` lets servers import the project build (Metals), which runs the build tool.
     pub fn new(root: &Path, enabled: bool, overrides: &[(String, String)], import_builds: bool) -> Lsp {
         let mut commands = HashMap::new();
+        let mut programs = HashMap::new();
+        let mut missing = Vec::new();
         if enabled {
             for (lang, candidates) in DEFAULT_SERVERS {
-                if let Some(cmd) = candidates.iter().find(|c| c.split_whitespace().next().is_some_and(on_path)) {
-                    commands.insert((*lang).to_owned(), (*cmd).to_owned());
+                match candidates.iter().find_map(|c| locate(c).ok().map(|at| (c, at))) {
+                    Some((cmd, at)) => {
+                        commands.insert((*lang).to_owned(), (*cmd).to_owned());
+                        if let Some(path) = at {
+                            programs.insert((*lang).to_owned(), path);
+                        }
+                    }
+                    None => missing.push(*lang),
                 }
             }
             for (lang, cmd) in overrides {
+                programs.remove(lang);
+                missing.retain(|l| l != lang);
                 if cmd.trim().is_empty() {
                     commands.remove(lang);
                 } else {
@@ -399,14 +452,29 @@ impl Lsp {
             }
         }
         let client = Client { root_uri: path_to_uri(root), import_builds };
-        Lsp { root: root.to_owned(), client, commands, slots: Default::default() }
+        Lsp { root: root.to_owned(), client, commands, programs, missing, slots: Default::default() }
     }
 
     /// Configured (language, command) pairs, for the startup banner.
     pub fn configured(&self) -> Vec<(String, String)> {
-        let mut list: Vec<_> = self.commands.iter().map(|(l, c)| (l.clone(), c.clone())).collect();
+        let mut list: Vec<_> = self
+            .commands
+            .iter()
+            .map(|(l, c)| match self.programs.get(l) {
+                Some(path) => (l.clone(), path.display().to_string()),
+                None => (l.clone(), c.clone()),
+            })
+            .collect();
         list.sort();
         list
+    }
+
+    /// Languages among `paths` that have no server installed, with how to get one.
+    pub fn missing_for<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Vec<(&'static str, &'static str)> {
+        let mut langs: Vec<&'static str> = paths.filter_map(|p| language_of(p).map(|(l, _)| l)).filter(|l| self.missing.contains(l)).collect();
+        langs.sort_unstable();
+        langs.dedup();
+        langs.into_iter().map(|l| (l, install_hint(l))).collect()
     }
 
     pub async fn status(&self, path: &str) -> Status {
@@ -414,6 +482,10 @@ impl Lsp {
             return Status { language: None, server: None, state: "none", error: None };
         };
         let Some(cmd) = self.commands.get(lang) else {
+            if self.missing.contains(&lang) {
+                let error = format!("no {lang} language server found; install one: {}", install_hint(lang));
+                return Status { language: Some(lang), server: None, state: "missing", error: Some(error) };
+            }
             return Status { language: Some(lang), server: None, state: "none", error: None };
         };
         let slot = self.slots.lock().unwrap().get(lang).cloned();
@@ -453,7 +525,10 @@ impl Lsp {
 
     async fn start_with(&self, lang: &str, cmd: &str, env: Option<(&'static str, String)>) -> Result<Arc<Server>, String> {
         let argv: Vec<&str> = cmd.split_whitespace().collect();
-        let mut command = Command::new(argv[0]);
+        let mut command = match self.programs.get(lang) {
+            Some(path) => Command::new(path),
+            None => Command::new(argv[0]),
+        };
         command
             .args(&argv[1..])
             .current_dir(&self.root)

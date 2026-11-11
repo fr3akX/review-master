@@ -23,6 +23,8 @@ pub struct OpenAiConfig {
     pub api_key: Option<String>,
     /// `None`: use the server's only model.
     pub model: Option<String>,
+    /// Sent as `reasoning_effort`; `None`: the server's default.
+    pub effort: Option<String>,
     pub timeout: Duration,
 }
 
@@ -31,6 +33,7 @@ pub struct OpenAi {
     endpoint: String,
     api_key: Option<String>,
     model: String,
+    effort: Option<String>,
     tools: Tools,
     sessions: Sessions,
     timeout: Duration,
@@ -109,6 +112,8 @@ struct Request<'a> {
     messages: Messages<'a>,
     tools: &'a [Value],
     tool_choice: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 impl OpenAi {
@@ -127,6 +132,7 @@ impl OpenAi {
             endpoint: format!("{base}/chat/completions"),
             api_key: cfg.api_key,
             model,
+            effort: cfg.effort,
             tools: Tools::new(root)?,
             sessions: Sessions::new(root, cache, "openai-sessions")?,
             timeout: cfg.timeout,
@@ -136,6 +142,10 @@ impl OpenAi {
 
     pub fn model(&self) -> Option<&str> {
         Some(&self.model)
+    }
+
+    pub fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
     }
 
     pub fn start_session(&self, name: &str) -> Result<String, String> {
@@ -172,7 +182,13 @@ impl OpenAi {
 
     async fn complete(&self, messages: &[Value], tools: &[Value]) -> Result<Value, String> {
         let system = json!({ "role": "system", "content": SYSTEM });
-        let body = Request { model: &self.model, messages: Messages { system: &system, rest: messages }, tools, tool_choice: "auto" };
+        let body = Request {
+            model: &self.model,
+            messages: Messages { system: &system, rest: messages },
+            tools,
+            tool_choice: "auto",
+            reasoning_effort: self.effort.as_deref(),
+        };
         let mut req = self.client.post(&self.endpoint).json(&body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -332,6 +348,17 @@ mod tests {
         assert_eq!(json_answer("Here it is: {\"a\": {\"b\": 2}} done"), Some(json!({ "a": { "b": 2 } })));
         assert_eq!(json_answer("no json here"), None);
         assert_eq!(json_answer("{broken"), None);
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_only_when_set() {
+        let system = json!({ "role": "system", "content": "s" });
+        let body = |effort| {
+            let req = Request { model: "m", messages: Messages { system: &system, rest: &[] }, tools: &[], tool_choice: "auto", reasoning_effort: effort };
+            serde_json::to_value(&req).unwrap()
+        };
+        assert_eq!(body(Some("none"))["reasoning_effort"], "none");
+        assert!(body(None).get("reasoning_effort").is_none());
     }
 
     #[test]
