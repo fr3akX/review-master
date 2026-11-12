@@ -1,7 +1,9 @@
 //! Compose and submit the review. GitHub: one POST carrying every line-anchored inline
-//! comment at the reviewed head commit. GitLab: draft notes published together (see
-//! `gitlab::submit`). Findings that could not be anchored go into the review body, so
-//! nothing is silently dropped.
+//! comment at the reviewed head commit; findings on lines the diff does not show become
+//! comments on their whole file, which takes a pending review, a GraphQL call per file
+//! comment, then the submission. GitLab: draft notes published together (see
+//! `gitlab::submit`). Findings that could not be anchored otherwise go into the review
+//! body, so nothing is silently dropped.
 
 use crate::diff::Model;
 use crate::pr::{self, Forge, PrMeta, PrRef};
@@ -48,9 +50,23 @@ pub fn review_body(summary: &str, fallback: &[(Finding, String)]) -> String {
     body.trim().to_owned()
 }
 
+/// The review body; GitHub requires one to request changes.
+fn github_body(event: Event, summary: &str, has_comments: bool, fallback: &[(Finding, String)]) -> String {
+    let body = review_body(summary, fallback);
+    if !body.is_empty() || event != Event::RequestChanges {
+        return body;
+    }
+    if has_comments { "See the inline comments." } else { "Changes requested." }.into()
+}
+
+/// A file-level comment: the cited lines, then the finding.
+fn file_comment_body(f: &Finding) -> String {
+    format!("`{}` (outside the diff)\n\n{}", f.location(), comment_body(f))
+}
+
 /// The review POST body for `POST /repos/{o}/{r}/pulls/{n}/reviews`.
 pub fn payload(sha: &str, event: Event, summary: &str, inline: &[Anchored], fallback: &[(Finding, String)]) -> Value {
-    let body = review_body(summary, fallback);
+    let body = github_body(event, summary, !inline.is_empty(), fallback);
     let comments: Vec<Value> = inline
         .iter()
         .map(|a| {
@@ -89,16 +105,58 @@ pub fn submit(
         return crate::gitlab::submit(r, meta, model, event == Event::Approve, summary, inline, fallback);
     }
     let path = format!("repos/{}/pulls/{}/reviews", r.slug(), r.number);
-    let bytes = serde_json::to_vec(&payload(head, event, summary, inline, fallback)).map_err(|e| e.to_string())?;
-    let out = pr::gh(&["api", &path, "-X", "POST", "--input", "-"], Some(&bytes)).map_err(|e| {
+    // A finding in a file of the diff, on lines it does not show, goes on the whole file.
+    let (on_file, rest): (Vec<_>, Vec<_>) = fallback.iter().cloned().partition(|(f, _)| model.file(&f.path).is_some());
+    if on_file.is_empty() {
+        let v = post_json(&path, &payload(head, event, summary, inline, fallback))?;
+        return Ok((review_url(&v), None));
+    }
+    // Without an event the review stays pending, so file comments can join it.
+    let mut pending = payload(head, event, "", inline, &[]);
+    pending.as_object_mut().expect("object").retain(|k, _| k != "event" && k != "body");
+    let v = post_json(&path, &pending)?;
+    let node = v["node_id"].as_str().ok_or_else(|| format!("gh api {path}: no node_id in the response"))?;
+    let mut rest = rest;
+    let mut filed = 0usize;
+    for (f, _) in on_file {
+        match file_thread(node, &f) {
+            Ok(()) => filed += 1,
+            Err(e) => rest.push((f, format!("GitHub refused a file comment: {}", crate::engine::one_line(&e, 200)))),
+        }
+    }
+    let body = github_body(event, summary, !inline.is_empty() || filed > 0, &rest);
+    let v = post_json(&format!("{path}/{}/events", v["id"]), &json!({ "event": event.api(), "body": body }))
+        .map_err(|e| format!("{e}; the comments are saved as your pending review on GitHub: submit or discard it there"))?;
+    Ok((review_url(&v), None))
+}
+
+fn post_json(path: &str, body: &Value) -> Result<Value, String> {
+    let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    let out = pr::gh(&["api", path, "-X", "POST", "--input", "-"], Some(&bytes)).map_err(|e| {
         if e.contains("your own pull request") {
             format!("{e}; use --event comment")
         } else {
             e
         }
     })?;
-    let v: Value = serde_json::from_slice(&out).map_err(|e| format!("gh api {path}: {e}"))?;
-    Ok((v["html_url"].as_str().map(str::to_owned).unwrap_or_else(|| format!("review id {}", v["id"])), None))
+    serde_json::from_slice(&out).map_err(|e| format!("gh api {path}: {e}"))
+}
+
+fn review_url(v: &Value) -> String {
+    v["html_url"].as_str().map(str::to_owned).unwrap_or_else(|| format!("review id {}", v["id"]))
+}
+
+/// Add a comment on `f`'s whole file to the pending review `review` (a GraphQL node id).
+fn file_thread(review: &str, f: &Finding) -> Result<(), String> {
+    const Q: &str = "mutation($review: ID!, $path: String!, $body: String!) { addPullRequestReviewThread(input: \
+        {pullRequestReviewId: $review, path: $path, body: $body, subjectType: FILE}) { thread { id } } }";
+    let req = json!({ "query": Q, "variables": { "review": review, "path": f.path, "body": file_comment_body(f) } });
+    let out = pr::gh(&["api", "graphql", "--input", "-"], Some(&serde_json::to_vec(&req).map_err(|e| e.to_string())?))?;
+    let v: Value = serde_json::from_slice(&out).map_err(|e| format!("gh api graphql: {e}"))?;
+    match v["data"]["addPullRequestReviewThread"]["thread"]["id"].as_str() {
+        Some(_) => Ok(()),
+        None => Err(format!("no thread created: {}", v["errors"])),
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +200,13 @@ mod tests {
         assert!(body.starts_with("Needs a fix."));
         assert!(body.contains("`src/a.rs:12` (major; `src/a.rs` is not part of the reviewed diff)"));
         assert!(body.contains("> off-by-one in the loop bound"));
+        // An empty summary still posts; only request-changes gets a stand-in body.
+        assert_eq!(payload("s", Event::RequestChanges, " ", &inline, &[])["body"], "See the inline comments.");
+        assert_eq!(payload("s", Event::Comment, "", &inline, &[])["body"], "");
+        // A file-level comment names the lines it was about.
+        let mut f = finding(Some("loop bound"));
+        f.start_line = Some(3);
+        assert!(file_comment_body(&f).starts_with("`src/a.rs:3-12` (outside the diff)\n\n**major: loop bound**"));
     }
 
 }

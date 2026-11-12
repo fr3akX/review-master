@@ -999,11 +999,10 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
         "request_changes" => post::Event::RequestChanges,
         other => return Err(fail(StatusCode::BAD_REQUEST, format!("unknown event `{other}`"))),
     };
-    if event == post::Event::RequestChanges && req.body.trim().is_empty() {
-        return Err(fail(StatusCode::BAD_REQUEST, "request_changes needs a summary"));
-    }
+    // Approving or requesting changes says something on its own; a bare comment does not.
+    let empty = event == post::Event::Comment && req.body.trim().is_empty();
     let items = st.drafts.lock().unwrap().items.clone();
-    if items.is_empty() && req.body.trim().is_empty() {
+    if items.is_empty() && empty {
         return Err(fail(StatusCode::BAD_REQUEST, "nothing to submit: no drafts and no summary"));
     }
     let mut inline = Vec::new();
@@ -1033,7 +1032,7 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
         }
         scope.model.clone()
     };
-    if inline.is_empty() && fallback.is_empty() && req.body.trim().is_empty() {
+    if inline.is_empty() && fallback.is_empty() && empty {
         return Err(fail(StatusCode::BAD_REQUEST, format!("nothing to submit: {excluded_drafts} draft(s) sit on files excluded from this review")));
     }
     let (pref, meta, head, body) = (pref.clone(), meta.clone(), st.head_sha.clone(), req.body.clone());

@@ -134,10 +134,12 @@ archives, checksums and `review-master-installer.sh`. After changing
    (`$XDG_CACHE_HOME`) unless `--cache-dir` says otherwise.
 3. Serves the UI on localhost and opens the browser.
 4. On submit, every draft is validated against the diff (both forges only accept
-   inline comments on lines a hunk shows); drafts that cannot be anchored go into
-   the review body instead of being dropped, and the drafts are cleared. GitHub:
-   one review is POSTed, pinned to the reviewed head commit. GitLab: see
-   [GitLab](#gitlab).
+   inline comments on lines a hunk shows; a range overhanging a hunk is trimmed to
+   it); drafts that cannot be anchored are not dropped, and the drafts are cleared.
+   GitHub: one review is POSTed, pinned to the reviewed head commit; a draft on lines
+   the diff does not show becomes a comment on its whole file (the review is then
+   created pending, gets those comments, and is submitted). GitLab: such drafts go
+   into the review body; see [GitLab](#gitlab).
 5. Runs until **Exit** (or **Submit & exit**) in the UI, or Ctrl-C in the terminal;
    then the temporary worktree is removed. Browsers only let a page close tabs a
    script opened, so the tab the terminal opened stays, saying review-master

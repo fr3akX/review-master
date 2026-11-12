@@ -43,7 +43,7 @@ fn side_of(f: &Finding) -> Side {
     }
 }
 
-/// Normalize (drop no-op ranges, swap reversed ones) and check against the diff.
+/// Normalize (drop no-op ranges, swap reversed ones), then clamp to what the diff shows.
 pub fn anchor(diff: &Diff, f: &Finding) -> Result<Anchored, (Finding, String)> {
     let side = side_of(f);
     let start = f.start_line.filter(|&s| s != f.line);
@@ -52,7 +52,7 @@ pub fn anchor(diff: &Diff, f: &Finding) -> Result<Anchored, (Finding, String)> {
         other => (other, f.line),
     };
     match diff.check(&f.path, side, start, line) {
-        Ok(()) => Ok(Anchored { finding: f.clone(), side, start, line }),
+        Ok((start, line)) => Ok(Anchored { finding: f.clone(), side, start, line }),
         Err(why) => Err((f.clone(), why)),
     }
 }

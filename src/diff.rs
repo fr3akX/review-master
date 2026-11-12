@@ -303,8 +303,9 @@ pub struct Diff {
 }
 
 impl Diff {
-    /// `Ok` means GitHub will accept `start..=line` on `side` as an inline position.
-    pub fn check(&self, path: &str, side: Side, start: Option<u64>, line: u64) -> Result<(), String> {
+    /// The inline position GitHub will accept for `start..=line` on `side`: the range
+    /// clamped to the last hunk it overlaps, as `(start, line)`.
+    pub fn check(&self, path: &str, side: Side, start: Option<u64>, line: u64) -> Result<(Option<u64>, u64), String> {
         let Some(f) = self.files.get(path) else {
             return Err(format!("`{path}` is not part of the reviewed diff"));
         };
@@ -312,20 +313,18 @@ impl Diff {
             Side::Left => &f.left,
             Side::Right => &f.right,
         };
-        let Some(&hunk) = lines.get(&line) else {
-            return Err(format!("{side} line {line} of `{path}` is not shown in the diff"));
-        };
-        if let Some(start) = start {
-            if start >= line {
-                return Err(format!("start_line {start} must be smaller than line {line}"));
-            }
-            match lines.get(&start) {
-                None => return Err(format!("{side} line {start} of `{path}` is not shown in the diff")),
-                Some(&h) if h != hunk => return Err(format!("lines {start}-{line} of `{path}` span different hunks; comment on one hunk")),
-                Some(_) => {}
-            }
+        if let Some(start) = start.filter(|&s| s >= line) {
+            return Err(format!("start_line {start} must be smaller than line {line}"));
         }
-        Ok(())
+        let lo = start.unwrap_or(line);
+        let Some(end) = (lo..=line).rev().find(|n| lines.contains_key(n)) else {
+            let what = if lo == line { format!("line {line}") } else { format!("lines {lo}-{line}") };
+            return Err(format!("{side} {what} of `{path}` is not shown in the diff"));
+        };
+        // A hunk's lines are contiguous on each side, so the clamped range is too.
+        let hunk = lines[&end];
+        let begin = (lo..end).find(|n| lines.get(n) == Some(&hunk)).unwrap_or(end);
+        Ok(((begin < end).then_some(begin), end))
     }
 }
 
@@ -415,11 +414,16 @@ rename to new/name.rs
     }
 
     #[test]
-    fn ranges_must_stay_inside_one_hunk_and_run_forward() {
+    fn ranges_are_clamped_to_one_hunk_and_run_forward() {
         let d = Model::parse(DIFF).anchors();
-        assert!(d.check("src/lib.rs", Side::Right, Some(13), 42).unwrap_err().contains("span different hunks"));
+        // Spanning two hunks keeps the last one's part; overhanging either end is trimmed.
+        assert_eq!(d.check("src/lib.rs", Side::Right, Some(13), 42), Ok((Some(41), 42)));
+        assert_eq!(d.check("src/lib.rs", Side::Right, Some(5), 11), Ok((Some(10), 11)));
+        assert_eq!(d.check("src/lib.rs", Side::Right, Some(12), 20), Ok((Some(12), 13)));
+        assert_eq!(d.check("src/lib.rs", Side::Right, Some(1), 10), Ok((None, 10)));
+        assert!(d.check("src/lib.rs", Side::Right, Some(20), 30).unwrap_err().contains("lines 20-30"));
         assert!(d.check("src/lib.rs", Side::Right, Some(13), 13).unwrap_err().contains("must be smaller"));
-        assert!(d.check("src/lib.rs", Side::Right, Some(41), 42).is_ok());
+        assert_eq!(d.check("src/lib.rs", Side::Right, Some(41), 42), Ok((Some(41), 42)));
     }
 
     #[test]

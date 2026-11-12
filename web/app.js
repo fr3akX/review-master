@@ -490,6 +490,9 @@ const coveredByControls = p => (S.scope.tests && isTestPath(p)) || [...S.scope.d
 
 const prId = () => (S.info.pr ? `${S.info.pr.owner}/${S.info.pr.repo}${S.info.pr.number_label}` : `local:${S.info.branch}`);
 // GitHub or GitLab; `kind` is "PR" / "MR" for short labels.
+// Where a draft the diff cannot anchor ends up.
+const unanchoredTo = () => forge().gitlab ? 'the review body' : 'a comment on its whole file';
+
 const forge = () => {
   const pr = S.info && S.info.pr;
   const gitlab = !!pr && pr.forge === 'gitlab';
@@ -1553,7 +1556,7 @@ function draftCard(d) {
       h('button', { class: 'link-btn', onclick: () => editDraft(d) }, 'Edit'),
       h('button', { class: 'link-btn danger', onclick: () => deleteDraft(d) }, 'Delete')),
     h('div', { class: 'md card-body', html: md(d.body) }),
-    d.problem && h('div', { class: 'warn-line' }, `⚠ won't anchor: ${d.problem}; will go into the review body`));
+    d.problem && h('div', { class: 'warn-line' }, `⚠ won't anchor: ${d.problem}; will go into ${unanchoredTo()}`));
 }
 
 // ───────────── comments already on the PR ─────────────
@@ -1762,7 +1765,7 @@ function findingCard(f) {
     h('div', { class: 'md card-body', html: md(f.body) }),
     f.problem
       ? h('div', { class: 'warn-line' }, `⚠ ${f.problem}`)
-      : fs && f.anchor_problem && h('div', { class: 'warn-line' }, '⚠ not on a line the diff shows: as a draft it goes into the review body'));
+      : fs && f.anchor_problem && h('div', { class: 'warn-line' }, `⚠ not on a line the diff shows: as a draft it goes into ${unanchoredTo()}`));
 }
 
 // Jump to where a finding sits (the diff, or the viewer for lines and files outside it).
@@ -1891,7 +1894,7 @@ function makeComposer(key, a) {
         id: a.draft ? a.draft.id : null, path: a.path, line: a.line, start: a.start ?? null,
         side: a.side, severity: sev.value, body,
       });
-      if (r.problem) toast(`Draft saved, but it won't anchor: ${r.problem}. It will go into the review body.`, 'warn', 9000);
+      if (r.problem) toast(`Draft saved, but it won't anchor: ${r.problem}. It will go into ${unanchoredTo()}.`, 'warn', 9000);
       closeComposer(c, false);
       await refreshDrafts();
       if (a.onSaved) await a.onSaved(r);
@@ -2866,7 +2869,7 @@ function renderReviewDrafts() {
         h('span', { class: 'spacer' }),
         h('button', { class: 'icon-btn', title: 'Delete draft', 'aria-label': 'Delete draft', onclick: () => deleteDraft(d) }, '×')),
       h('div', { class: 'rd-first' }, first),
-      d.problem && h('div', { class: 'warn-line' }, `⚠ won't anchor: ${d.problem}; will go into the review body`));
+      d.problem && h('div', { class: 'warn-line' }, `⚠ won't anchor: ${d.problem}; will go into ${unanchoredTo()}`));
   });
   list.replaceChildren(
     h('div', { class: 'field-label' }, `Draft comments (${drafts.length})`),
