@@ -48,6 +48,9 @@ pub struct AppState {
     flows_file: PathBuf,
     findings: Mutex<findings::Store>,
     pub engine: Engine,
+    /// Reasoning effort for the next engine turns (`--effort`/config at start, the UI
+    /// after); `None`: the engine's own default. Running turns keep theirs.
+    effort: Mutex<Option<String>>,
     /// The forge login (`gh` / `glab`), for own-request hints in the UI.
     pub viewer: Option<String>,
     pub lsp: Lsp,
@@ -91,6 +94,7 @@ impl AppState {
         model: Model,
         skipped: Vec<String>,
         engine: Engine,
+        effort: Option<String>,
         viewer: Option<String>,
         drafts_file: PathBuf,
         scope_file: PathBuf,
@@ -129,6 +133,7 @@ impl AppState {
             flows_file,
             findings: Mutex::new(findings::Store::load(findings_file)),
             engine,
+            effort: Mutex::new(effort),
             viewer,
             lsp,
             drafts: Mutex::new(DraftStore::load(drafts_file)),
@@ -145,6 +150,10 @@ impl AppState {
             Some((r, m)) => review::Subject::pr(r, m, &self.head_sha),
             None => review::Subject::local(&self.branch, &self.head_sha, self.dirty),
         }
+    }
+
+    fn effort(&self) -> Option<String> {
+        self.effort.lock().unwrap().clone()
     }
 
     /// Import an LLM review (Markdown) as findings, replacing an earlier import of the same name.
@@ -366,6 +375,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/lsp/references", post_to(lsp_references))
         .route("/api/lsp/outline", get(lsp_outline))
         .route("/api/shutdown", post_to(shutdown))
+        .route("/api/effort", post_to(set_effort))
         .with_state(state.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -384,6 +394,22 @@ async fn shutdown(State(st): State<Arc<AppState>>) -> Json<Value> {
         st.shutdown.notify_one();
     });
     Json(json!({}))
+}
+
+#[derive(Deserialize)]
+struct EffortRequest {
+    /// `null` (or empty): back to the engine's default.
+    effort: Option<String>,
+}
+
+/// Change the reasoning effort for the next engine turns of this run.
+async fn set_effort(State(st): State<Arc<AppState>>, Json(req): Json<EffortRequest>) -> ApiResult {
+    let effort = req.effort.map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty());
+    if let Some(e) = &effort {
+        st.engine.check_effort(e).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    }
+    *st.effort.lock().unwrap() = effort.clone();
+    Ok(Json(json!({ "effort": effort })))
 }
 
 async fn asset(content_type: &'static str, body: &'static str) -> Response {
@@ -432,7 +458,10 @@ async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "head": st.head_sha,
         "branch": st.branch,
         "dirty": st.dirty,
-        "engine": { "kind": st.engine.kind().id(), "model": st.engine.model(), "effort": st.engine.effort() },
+        "engine": {
+            "kind": st.engine.kind().id(), "model": st.engine.model(),
+            "effort": st.effort(), "effort_levels": st.engine.effort_levels(),
+        },
         "viewer": st.viewer,
         "files": files,
         "skipped": st.cli_skipped,
@@ -785,7 +814,8 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> 
     let st2 = st.clone();
     tokio::spawn(async move {
         let progress = |line: String| job.push(line);
-        let out = st2.engine.turn::<ChatAnswer>(&session, &prompt, &chat_schema(), &job.cancel, progress).await;
+        let effort = st2.effort();
+        let out = st2.engine.turn::<ChatAnswer>(&session, &prompt, &chat_schema(), effort.as_deref(), &job.cancel, progress).await;
         let mut threads = st2.threads.lock().unwrap();
         let thread = threads.by_id.get_mut(&thread_id);
         let result = out.map(|out| {
@@ -1186,7 +1216,8 @@ fn spawn_summary(st: Arc<AppState>) -> ApiResult {
         let result = async {
             let session = st2.engine.start_session(&name).await?;
             let progress = |line: String| job.push(line);
-            let out = st2.engine.turn::<SummaryAnswer>(&session, &prompt, &summary_schema(), &job.cancel, progress).await?;
+            let effort = st2.effort();
+            let out = st2.engine.turn::<SummaryAnswer>(&session, &prompt, &summary_schema(), effort.as_deref(), &job.cancel, progress).await?;
             Ok::<String, String>(out.answer.summary)
         }
         .await;
@@ -1256,7 +1287,8 @@ async fn generate_flows(State(st): State<Arc<AppState>>) -> ApiResult {
         let result = async {
             let session = st2.engine.start_session(&name).await?;
             let progress = |line: String| job.push(line);
-            let out = st2.engine.turn::<flows::Flows>(&session, &prompt, &flows::schema(), &job.cancel, progress).await?;
+            let effort = st2.effort();
+            let out = st2.engine.turn::<flows::Flows>(&session, &prompt, &flows::schema(), effort.as_deref(), &job.cancel, progress).await?;
             Ok::<flows::Flows, String>(out.answer)
         }
         .await;

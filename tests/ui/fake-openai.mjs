@@ -1,6 +1,10 @@
-// Fake OpenAI-compatible server: answers every chat completion with a JSON answer.
+// Fake OpenAI-compatible server: answers every chat completion with a JSON answer and
+// records each request's reasoning_effort (`-` when absent) next to $FAKE_GH_OUT.
 import http from 'node:http';
+import { appendFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 const port = +process.argv[2] || 8765;
+const effortLog = process.env.FAKE_GH_OUT && join(dirname(process.env.FAKE_GH_OUT), 'efforts.log');
 http.createServer((req, res) => {
   let body = '';
   req.on('data', c => (body += c));
@@ -8,6 +12,7 @@ http.createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'fake' }] }));
     const j = JSON.parse(body || '{}');
+    if (effortLog) appendFileSync(effortLog, `${j.reasoning_effort ?? '-'}\n`);
     const last = [...(j.messages || [])].reverse().find(m => m.role === 'user');
     const text = String(last && last.content || '');
     const isSummary = text.includes('Write the summary a reviewer');

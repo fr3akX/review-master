@@ -123,8 +123,6 @@ pub struct Transport {
     client: reqwest::Client,
     model: String,
     max_tokens: u32,
-    /// Thinking request for `--effort`; `None`: the API's default.
-    thinking: Option<Thinking>,
     auth: Auth,
     device_id: String,
 }
@@ -184,25 +182,19 @@ pub fn thinking_for(model: &str, effort: &str) -> Result<Option<Thinking>, Strin
 }
 
 impl Transport {
-    /// Selects credentials and builds the HTTP client; sends no request. The thinking
-    /// budget is capped so the model always has room left for its answer.
-    pub async fn new(model: &str, thinking: Option<Thinking>) -> Result<Transport, String> {
+    /// Selects credentials and builds the HTTP client; sends no request.
+    pub async fn new(model: &str) -> Result<Transport, String> {
         let auth = Auth::resolve()?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| format!("http client: {e}"))?;
-        let max_tokens = max_output_tokens(model);
         Ok(Transport {
             device_id: device_id(auth.install_id(), auth.account_id()),
             client,
             model: model.to_owned(),
-            max_tokens,
-            thinking: thinking.map(|t| match t {
-                Thinking::Budget(b) => Thinking::Budget(b.clamp(1_024, max_tokens - ANSWER_RESERVE)),
-                adaptive => adaptive,
-            }),
+            max_tokens: max_output_tokens(model),
             auth,
         })
     }
@@ -210,9 +202,17 @@ impl Transport {
     /// Streams one Messages call. Dropping the future drops the connection.
     /// Retries at most once for a newer required Claude Code version (OAuth) and
     /// once after refreshing a rejected stored OAuth token; nothing else.
+    /// `thinking` is the effort's request (see `thinking_for`); a budget is capped so
+    /// the model always has room left for its answer.
     pub async fn message(
-        &self, session: &str, system: &str, messages: &[Value], tools: &[Value], progress: &mut impl FnMut(String),
+        &self, session: &str, system: &str, messages: &[Value], tools: &[Value], thinking: Option<Thinking>, progress: &mut impl FnMut(String),
     ) -> Result<Reply, String> {
+        let thinking = thinking.map(|t| match t {
+            Thinking::Budget(b) => Thinking::Budget(b.clamp(1_024, self.max_tokens - ANSWER_RESERVE)),
+            adaptive => adaptive,
+        });
+        // `output_config.effort` needs its beta flag.
+        let effort_beta = matches!(thinking, Some(Thinking::Adaptive { .. }));
         let oauth = self.auth.is_oauth();
         let (mut version_retry, mut auth_retry) = (oauth, true);
         loop {
@@ -221,11 +221,11 @@ impl Transport {
             let wire = oauth.then(|| OAuthWire {
                 version: &version, device_id: &self.device_id, account_id: self.auth.account_id(), session,
             });
-            let body = build_body(&self.model, self.max_tokens, self.thinking, system, messages, tools, wire.as_ref());
+            let body = build_body(&self.model, self.max_tokens, thinking, system, messages, tools, wire.as_ref());
             let (url, headers) = if oauth {
-                (format!("{MESSAGES_URL}?beta=true"), oauth_headers(&credential, session, &version, !tools.is_empty(), self.effort_beta())?)
+                (format!("{MESSAGES_URL}?beta=true"), oauth_headers(&credential, session, &version, !tools.is_empty(), effort_beta)?)
             } else {
-                (MESSAGES_URL.to_owned(), api_key_headers(&credential, self.effort_beta())?)
+                (MESSAGES_URL.to_owned(), api_key_headers(&credential, effort_beta)?)
             };
             let response = self
                 .client
@@ -254,11 +254,6 @@ impl Transport {
             }
             return Err(http_error(status.as_u16(), &text, request_id.as_deref(), retry_after.as_deref(), self.auth.source()));
         }
-    }
-
-    /// `output_config.effort` needs its beta flag.
-    fn effort_beta(&self) -> bool {
-        matches!(self.thinking, Some(Thinking::Adaptive { .. }))
     }
 }
 

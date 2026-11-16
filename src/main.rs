@@ -156,23 +156,23 @@ struct EngineOpts {
     timeout: Duration,
 }
 
-async fn start_engine(kind: engine::Kind, model: Option<String>, effort: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
+async fn start_engine(kind: engine::Kind, model: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
     let timeout = o.timeout;
     Ok(match kind {
         engine::Kind::Codex => {
-            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, effort, timeout };
+            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, timeout };
             engine::Engine::Codex(codex::Codex::start(cfg, root).await?)
         }
         engine::Kind::Claude => {
-            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, effort, timeout };
+            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, timeout };
             engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, root).await?))
         }
         engine::Kind::Anthropic => {
             let model = model.or_else(|| Some(anthropic::DEFAULT_MODEL.to_owned()));
-            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, effort, timeout).await?))
+            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, timeout).await?))
         }
         engine::Kind::OpenAi => {
-            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, effort, timeout };
+            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, timeout };
             engine::Engine::OpenAi(Arc::new(openai::OpenAi::start(root, cache_dir, cfg).await?))
         }
     })
@@ -357,8 +357,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         openai_api_key: env("OPENAI_API_KEY").or(cfg.openai_api_key),
         timeout: Duration::from_secs(args.timeout_mins.max(1) * 60),
     };
-    let engine = start_engine(choice.engine, choice.model, choice.effort, &opts, &change.root, &cache_dir).await?;
-    let details: Vec<String> = [engine.model().map(str::to_owned), engine.effort().map(|e| format!("effort {e}"))].into_iter().flatten().collect();
+    let engine = start_engine(choice.engine, choice.model, &opts, &change.root, &cache_dir).await?;
+    if let Some(effort) = &choice.effort {
+        engine.check_effort(effort).map_err(|e| format!("--effort: {e}"))?;
+    }
+    let details: Vec<String> = [engine.model().map(str::to_owned), choice.effort.as_ref().map(|e| format!("effort {e}"))].into_iter().flatten().collect();
     let model_note = if details.is_empty() { String::new() } else { format!(" ({})", details.join(", ")) };
     println!("  engine {}{model_note}, checkout {}", engine.kind().id(), change.root.display());
 
@@ -388,6 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         change.model,
         change.skipped,
         engine,
+        choice.effort,
         viewer,
         cache_dir.join(format!("drafts-{draft_key}.json")),
         cache_dir.join(format!("scope-{draft_key}.json")),

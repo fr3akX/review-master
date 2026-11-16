@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 let fails = 0;
 const check = (name, ok, extra = '') => { if (!ok) fails++; console.log(ok ? 'ok  ' : 'FAIL', name, ok ? '' : extra); };
 export default async page => {
@@ -246,6 +248,29 @@ export default async page => {
   await page.sleep(200);
   check('Alt+← again returns to the diff where the walk started', await q(() => document.querySelector('#viewer').hidden));
   await page.key('Escape', { vk: 27 });
+
+  // ── reasoning effort from the header: the next engine turn carries it
+  const efforts = () => readFileSync(join(dirname(process.env.FAKE_GH_OUT), 'efforts.log'), 'utf8').trim().split('\n');
+  check('no effort sent by default', efforts().every(e => e === '-'), efforts().join(','));
+  await q(() => document.querySelector('#engine-chip').click());
+  await page.waitFor(() => document.querySelector('.effort-pop'));
+  const levels = await q(() => [...document.querySelectorAll('.effort-pop .effort-item')].map(b => b.textContent));
+  check('openai effort levels offered', JSON.stringify(levels) === '["default","none","minimal","low","medium","high"]', JSON.stringify(levels));
+  await q(() => [...document.querySelectorAll('.effort-pop .effort-item')].find(b => b.textContent === 'high').click());
+  await page.waitFor(() => !document.querySelector('.effort-pop') && document.querySelector('#engine-chip').textContent.endsWith('effort high'));
+  const sent = efforts().length;
+  await q(() => document.querySelector('#flows-card .icon-btn[aria-label="Regenerate flows"]').click());
+  for (let t = 0; t < 80 && efforts().length === sent; t++) await page.sleep(100);
+  await page.waitFor(() => !document.querySelector('#flows-card .summary-status') && document.querySelector('#flows-card .flow'), 8000);
+  check('the next turn carries the effort', efforts().length > sent && efforts().slice(sent).every(e => e === 'high'), efforts().slice(sent).join(','));
+  await q(() => document.querySelector('#engine-chip').click());
+  await page.shot('effort');
+  await q(() => { const i = document.querySelector('.effort-custom'); i.value = 'two words'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })); });
+  await page.waitFor(() => document.querySelector('.toast.error'));
+  check('a bad level is refused, the picker stays', await q(() => !!document.querySelector('.effort-pop') && document.querySelector('#engine-chip').textContent.endsWith('effort high')));
+  await q(() => [...document.querySelectorAll('.effort-pop .effort-item')].find(b => b.textContent === 'default').click());
+  await page.waitFor(() => !document.querySelector('#engine-chip').textContent.includes('effort'));
+  check('back to the engine default', true);
 
   // ── review drawer: body persists across reload
   await q(() => document.activeElement.blur());

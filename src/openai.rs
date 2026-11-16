@@ -23,8 +23,6 @@ pub struct OpenAiConfig {
     pub api_key: Option<String>,
     /// `None`: use the server's only model.
     pub model: Option<String>,
-    /// Sent as `reasoning_effort`; `None`: the server's default.
-    pub effort: Option<String>,
     pub timeout: Duration,
 }
 
@@ -33,7 +31,6 @@ pub struct OpenAi {
     endpoint: String,
     api_key: Option<String>,
     model: String,
-    effort: Option<String>,
     tools: Tools,
     sessions: Sessions,
     timeout: Duration,
@@ -132,7 +129,6 @@ impl OpenAi {
             endpoint: format!("{base}/chat/completions"),
             api_key: cfg.api_key,
             model,
-            effort: cfg.effort,
             tools: Tools::new(root)?,
             sessions: Sessions::new(root, cache, "openai-sessions")?,
             timeout: cfg.timeout,
@@ -142,10 +138,6 @@ impl OpenAi {
 
     pub fn model(&self) -> Option<&str> {
         Some(&self.model)
-    }
-
-    pub fn effort(&self) -> Option<&str> {
-        self.effort.as_deref()
     }
 
     pub fn start_session(&self, name: &str) -> Result<String, String> {
@@ -168,11 +160,12 @@ impl OpenAi {
         id: &str,
         prompt: &str,
         schema: &Value,
+        effort: Option<&str>,
         cancel: &Notify,
         mut progress: impl FnMut(String),
     ) -> Result<Outcome<Value>, String> {
         let _busy = self.busy.claim(id)?;
-        let run = self.run(id, prompt, schema, &mut progress);
+        let run = self.run(id, prompt, schema, effort, &mut progress);
         tokio::select! {
             result = run => result,
             _ = cancel.notified() => Err("cancelled".into()),
@@ -180,14 +173,14 @@ impl OpenAi {
         }
     }
 
-    async fn complete(&self, messages: &[Value], tools: &[Value]) -> Result<Value, String> {
+    async fn complete(&self, messages: &[Value], tools: &[Value], effort: Option<&str>) -> Result<Value, String> {
         let system = json!({ "role": "system", "content": SYSTEM });
         let body = Request {
             model: &self.model,
             messages: Messages { system: &system, rest: messages },
             tools,
             tool_choice: "auto",
-            reasoning_effort: self.effort.as_deref(),
+            reasoning_effort: effort,
         };
         let mut req = self.client.post(&self.endpoint).json(&body);
         if let Some(key) = &self.api_key {
@@ -207,7 +200,7 @@ impl OpenAi {
         serde_json::from_str(&text).map_err(|e| format!("{} did not return JSON ({e}): {}", self.endpoint, one_line(&text, 300)))
     }
 
-    async fn run(&self, id: &str, prompt: &str, schema: &Value, progress: &mut impl FnMut(String)) -> Result<Outcome<Value>, String> {
+    async fn run(&self, id: &str, prompt: &str, schema: &Value, effort: Option<&str>, progress: &mut impl FnMut(String)) -> Result<Outcome<Value>, String> {
         let validator = jsonschema::validator_for(schema).map_err(|e| format!("invalid answer schema: {e}"))?;
         let mut session = self.sessions.load(id)?;
         session.messages.push(json!({ "role": "user", "content": prompt }));
@@ -215,7 +208,7 @@ impl OpenAi {
         let mut outcome = Outcome { answer: Value::Null, commands: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
         let mut nudges = 0;
         loop {
-            let reply = self.complete(&session.messages, &tools).await?;
+            let reply = self.complete(&session.messages, &tools, effort).await?;
             let usage = &reply["usage"];
             outcome.input_tokens += usage["prompt_tokens"].as_u64().unwrap_or(0);
             outcome.cached_input_tokens += usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);

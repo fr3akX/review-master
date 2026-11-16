@@ -49,6 +49,7 @@ const S = {
   fileCache: new Map(), // path → FileState, reused across scope changes
   scopeChain: Promise.resolve(), // serializes POST /api/scope
   scopePop: null, // open "N excluded" restore popover
+  effortPop: null, // open reasoning-effort picker
   io: null, // IntersectionObserver that lazily loads diffs
   sym: null, // { el } — open symbol (LSP) popup
   foldOverrides: new Map(), // "path|foldKey" → open: per-fold choices since the last tests-toggle flip (persisted)
@@ -388,7 +389,57 @@ function renderHeader() {
     );
     document.title = `${branch} · review-master`;
   }
-  $('#engine-chip').textContent = engine ? [engine.kind, engine.model, engine.effort && `effort ${engine.effort}`].filter(Boolean).join(' · ') : 'no engine';
+  renderEngineChip();
+}
+
+// ───────────── reasoning effort ─────────────
+// For the next engine turns of this run (chat, summary, flows); running turns keep theirs.
+// `--effort` / the configuration sets the starting value.
+
+function renderEngineChip() {
+  const e = S.info.engine;
+  $('#engine-chip').textContent = e ? [e.kind, e.model, e.effort && `effort ${e.effort}`].filter(Boolean).join(' · ') : 'no engine';
+}
+
+function closeEffortPop() {
+  if (!S.effortPop) return;
+  S.effortPop.remove();
+  S.effortPop = null;
+}
+
+async function setEffort(value) {
+  let r;
+  try {
+    r = await post('/api/effort', { effort: value });
+  } catch {
+    return; // toasted; the picker stays open
+  }
+  S.info.engine.effort = r.effort;
+  closeEffortPop();
+  renderEngineChip();
+  toast(r.effort ? `Effort ${r.effort} for the next turns` : 'The engine\'s default effort for the next turns', 'ok', 3000);
+}
+
+function toggleEffortPop() {
+  if (S.effortPop) return closeEffortPop();
+  const e = S.info.engine;
+  if (!e) return;
+  const levels = [...(e.effort_levels || [])];
+  if (e.effort && !levels.includes(e.effort)) levels.push(e.effort);
+  const choice = value => h('button', {
+    class: `effort-item${(e.effort || null) === value ? ' on' : ''}`, type: 'button',
+    title: value ? `Reason with effort ${value}` : `The ${e.kind} engine's own default`, onclick: () => setEffort(value),
+  }, value || 'default');
+  const custom = h('input', { class: 'effort-custom', type: 'text', placeholder: 'Other level, Enter to set', 'aria-label': 'Other effort level', spellcheck: 'false' });
+  custom.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter' && custom.value.trim()) setEffort(custom.value.trim());
+  });
+  S.effortPop = h('div', { class: 'effort-pop', role: 'dialog', 'aria-label': 'Reasoning effort' },
+    h('div', { class: 'scope-pop-title' }, `Reasoning effort · ${e.kind}`),
+    h('div', { class: 'effort-list' }, choice(null), levels.map(choice)),
+    custom,
+    h('div', { class: 'hint' }, 'For the next chat, summary and flows turns of this run. --effort or --configure sets the starting value.'));
+  $('#topbar .top-actions').append(S.effortPop);
 }
 
 function submittedNode() {
@@ -1974,6 +2025,7 @@ function onDocMouseDown(e) {
   if (!(e.target instanceof Element)) return;
   if (S.sym && !e.target.closest('.sym-popup')) closeSym();
   if (S.scopePop && !e.target.closest('.scope-pop, .scope-link')) closeScopePop();
+  if (S.effortPop && !e.target.closest('.effort-pop, #engine-chip')) closeEffortPop();
   if (S.viewer && S.viewer.outlineEl && !e.target.closest('.outline-pop, .outline-btn')) closeOutline();
   const codeCell = (e.metaKey || e.ctrlKey || e.altKey) && e.target.closest('tr.ln-row td.code');
   if (codeCell && paneOf(codeCell)) {
@@ -3376,6 +3428,7 @@ function onKeyDown(e) {
     if (S.help) toggleHelp();
     else if (S.sym) closeSym();
     else if (S.scopePop) closeScopePop();
+    else if (S.effortPop) closeEffortPop();
     else if (S.viewer && S.viewer.outlineEl) closeOutline();
     else if (S.walk) exitWalk();
     else if (S.viewer) closeViewer();
@@ -3503,6 +3556,7 @@ function wire() {
   document.addEventListener('keydown', onKeyDown);
   wireResizers();
   $('#btn-help').addEventListener('click', toggleHelp);
+  $('#engine-chip').addEventListener('click', toggleEffortPop);
 
   const filter = $('#file-filter');
   const setFilter = value => {

@@ -178,6 +178,13 @@ default. The word goes to the engine, which checks it:
 A configured effort belongs to its engine: `--engine claude` does not inherit the
 effort configured for `codex`. The startup line and the header chip show it.
 
+In the web UI, click the engine chip in the header to change the effort while you
+review: pick a level offered for the engine, `default` for the engine's own, or type
+another the engine accepts. It applies to the next chat, summary and flows turns of
+this run; a turn already running keeps its effort, and the next start goes back to
+`--effort` / the configuration. Levels that cannot work are refused right away (a
+multi-word value, or one this native Anthropic model does not take).
+
 ## Flags
 
 | Flag | Default | |

@@ -73,13 +73,25 @@ impl Engine {
         }
     }
 
-    /// Reasoning effort set for this run; `None`: the engine's own default.
-    pub fn effort(&self) -> Option<&str> {
+    /// Levels to offer for this engine; the engine itself has the last word (Codex
+    /// models and OpenAI-compatible servers differ), so others can still be given.
+    pub fn effort_levels(&self) -> &'static [&'static str] {
         match self {
-            Engine::Codex(c) => c.effort(),
-            Engine::Claude(c) => c.effort(),
-            Engine::Anthropic(c) => c.effort(),
-            Engine::OpenAi(c) => c.effort(),
+            Engine::Codex(_) => &["minimal", "low", "medium", "high", "xhigh"],
+            Engine::Claude(_) | Engine::Anthropic(_) => &["low", "medium", "high", "xhigh", "max"],
+            Engine::OpenAi(_) => &["none", "minimal", "low", "medium", "high"],
+        }
+    }
+
+    /// Reject an effort the engine can be told up front it will not take: blank or
+    /// multi-word, or (native Anthropic) not a level of this model.
+    pub fn check_effort(&self, effort: &str) -> Result<(), String> {
+        if effort.is_empty() || effort.len() > 32 || !effort.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(format!("`{effort}` is not an effort level"));
+        }
+        match self {
+            Engine::Anthropic(c) => c.check_effort(effort),
+            _ => Ok(()),
         }
     }
 
@@ -118,20 +130,22 @@ impl Engine {
         }
     }
 
-    /// Run one turn in `session` whose final answer must match `schema`.
+    /// Run one turn in `session` whose final answer must match `schema`; `effort`
+    /// overrides the engine's default reasoning effort for this turn.
     pub async fn turn<T: DeserializeOwned>(
         &self,
         session: &str,
         prompt: &str,
         schema: &Value,
+        effort: Option<&str>,
         cancel: &Notify,
         progress: impl FnMut(String),
     ) -> Result<Outcome<T>, String> {
         let out = match self {
-            Engine::Codex(c) => c.turn(session, prompt, schema, cancel, progress).await?,
-            Engine::Claude(c) => c.turn(session, prompt, schema, cancel, progress).await?,
-            Engine::Anthropic(c) => c.turn(session, prompt, schema, cancel, progress).await?,
-            Engine::OpenAi(c) => c.turn(session, prompt, schema, cancel, progress).await?,
+            Engine::Codex(c) => c.turn(session, prompt, schema, effort, cancel, progress).await?,
+            Engine::Claude(c) => c.turn(session, prompt, schema, effort, cancel, progress).await?,
+            Engine::Anthropic(c) => c.turn(session, prompt, schema, effort, cancel, progress).await?,
+            Engine::OpenAi(c) => c.turn(session, prompt, schema, effort, cancel, progress).await?,
         };
         let answer = T::deserialize(&out.answer).map_err(|e| {
             format!("{} answer does not match the schema ({e}): {}", self.kind().id(), one_line(&out.answer.to_string(), 400))

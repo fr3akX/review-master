@@ -25,7 +25,6 @@ fn message(role: &str, blocks: Vec<Value>) -> Value {
 
 pub struct Anthropic {
     model: String,
-    effort: Option<String>,
     transport: Transport,
     tools: Tools,
     sessions: Sessions,
@@ -34,20 +33,21 @@ pub struct Anthropic {
 }
 
 impl Anthropic {
-    /// `effort` picks the thinking request for the model (see `anthropic_wire::thinking_for`).
-    pub async fn start(root: &Path, cache: &Path, model: Option<String>, effort: Option<String>, timeout: Duration) -> Result<Self, String> {
+    pub async fn start(root: &Path, cache: &Path, model: Option<String>, timeout: Duration) -> Result<Self, String> {
         let model = model.unwrap_or_else(|| DEFAULT_MODEL.into());
-        let thinking = effort.as_deref().map(|e| crate::anthropic_wire::thinking_for(&model, e)).transpose()?.flatten();
-        let transport = Transport::new(&model, thinking).await?;
+        let transport = Transport::new(&model).await?;
         Ok(Self {
-            model, effort, transport, tools: Tools::new(root)?, sessions: Sessions::new(root, cache, "anthropic-sessions")?,
+            model, transport, tools: Tools::new(root)?, sessions: Sessions::new(root, cache, "anthropic-sessions")?,
             timeout, busy: BusySet::default(),
         })
     }
 
     pub fn model(&self) -> Option<&str> { Some(&self.model) }
 
-    pub fn effort(&self) -> Option<&str> { self.effort.as_deref() }
+    /// Whether `effort` is a level this model takes (see `anthropic_wire::thinking_for`).
+    pub fn check_effort(&self, effort: &str) -> Result<(), String> {
+        crate::anthropic_wire::thinking_for(&self.model, effort).map(|_| ())
+    }
 
     pub fn start_session(&self, name: &str) -> Result<String, String> { self.sessions.create(name, None) }
 
@@ -58,11 +58,13 @@ impl Anthropic {
         self.sessions.delete(id)
     }
 
+    /// `effort` picks the thinking request for the model (see `anthropic_wire::thinking_for`).
     pub async fn turn(
-        &self, id: &str, prompt: &str, schema: &Value, cancel: &Notify, mut progress: impl FnMut(String),
+        &self, id: &str, prompt: &str, schema: &Value, effort: Option<&str>, cancel: &Notify, mut progress: impl FnMut(String),
     ) -> Result<Outcome<Value>, String> {
+        let thinking = effort.map(|e| crate::anthropic_wire::thinking_for(&self.model, e)).transpose()?.flatten();
         let _busy = self.busy.claim(id)?;
-        let run = self.run(id, prompt, schema, &mut progress);
+        let run = self.run(id, prompt, schema, thinking, &mut progress);
         tokio::select! {
             result = run => result,
             _ = cancel.notified() => Err("cancelled".into()),
@@ -71,7 +73,7 @@ impl Anthropic {
     }
 
     async fn run(
-        &self, id: &str, prompt: &str, schema: &Value, progress: &mut impl FnMut(String),
+        &self, id: &str, prompt: &str, schema: &Value, thinking: Option<crate::anthropic_wire::Thinking>, progress: &mut impl FnMut(String),
     ) -> Result<Outcome<Value>, String> {
         let validator = jsonschema::validator_for(schema).map_err(|e| format!("invalid answer schema: {e}"))?;
         let mut session = self.sessions.load(id)?;
@@ -80,7 +82,7 @@ impl Anthropic {
         tools.push(json!({ "name": "_answer", "description": ANSWER_DESCRIPTION, "input_schema": schema }));
         let mut outcome = Outcome { answer: Value::Null, commands: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
         loop {
-            let reply = self.transport.message(id, SYSTEM, &session.messages, &tools, progress).await?;
+            let reply = self.transport.message(id, SYSTEM, &session.messages, &tools, thinking, progress).await?;
             outcome.input_tokens += reply.input_tokens;
             outcome.cached_input_tokens += reply.cached_input_tokens;
             outcome.output_tokens += reply.output_tokens;
