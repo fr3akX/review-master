@@ -1,0 +1,15 @@
+#!/bin/bash
+# Fake `codex` for the UI tests: only the sign-in. `login` prints a link and waits for a
+# pasted code; with `ok-code`, `login status` reports signed in from then on.
+state="$(dirname "$FAKE_GH_OUT")/codex-login"
+case "$1 ${2:-}" in
+  "login status")
+    [ -f "$state" ] && { echo "Logged in using ChatGPT"; exit 0; }
+    echo "Not logged in" >&2; exit 1 ;;
+  "login ")
+    echo "Open this link to sign in: https://auth.example.com/oauth/authorize?client=fake"
+    read -r code
+    [ "$code" = ok-code ] || { echo "that code is not valid" >&2; exit 1; }
+    touch "$state"; echo "Successfully logged in" ;;
+  *) echo "fake codex: unsupported: $*" >&2; exit 2 ;;
+esac

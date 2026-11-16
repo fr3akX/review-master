@@ -16,6 +16,7 @@ mod engine;
 mod findings;
 mod flows;
 mod gitlab;
+mod login;
 mod lsp;
 mod native;
 mod openai;
@@ -33,7 +34,6 @@ mod verify;
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Review a GitHub pull request, a GitLab merge request (or a local worktree) in a
@@ -145,37 +145,6 @@ fn parse_lsp(raw: &str) -> Result<(String, String), String> {
         return Err(format!("unknown language `{lang}`; expected one of {}", lsp::LANGUAGES.join(", ")));
     }
     Ok((lang, cmd.trim().to_owned()))
-}
-
-/// Engine settings resolved from flags, the environment and the configuration.
-struct EngineOpts {
-    codex: String,
-    claude: String,
-    openai_base_url: String,
-    openai_api_key: Option<String>,
-    timeout: Duration,
-}
-
-async fn start_engine(kind: engine::Kind, model: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
-    let timeout = o.timeout;
-    Ok(match kind {
-        engine::Kind::Codex => {
-            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, timeout };
-            engine::Engine::Codex(codex::Codex::start(cfg, root).await?)
-        }
-        engine::Kind::Claude => {
-            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, timeout };
-            engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, root).await?))
-        }
-        engine::Kind::Anthropic => {
-            let model = model.or_else(|| Some(anthropic::DEFAULT_MODEL.to_owned()));
-            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, timeout).await?))
-        }
-        engine::Kind::OpenAi => {
-            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, timeout };
-            engine::Engine::OpenAi(Arc::new(openai::OpenAi::start(root, cache_dir, cfg).await?))
-        }
-    })
 }
 
 /// Drop `--exclude`d files from the model, in place.
@@ -350,14 +319,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::write(ignore, "# review-master cache: local only\n*\n");
     }
 
-    let opts = EngineOpts {
+    let opts = engine::EngineOpts {
         codex: args.codex.clone(),
         claude: args.claude.clone(),
         openai_base_url: args.openai_base_url.clone().or_else(|| env("OPENAI_BASE_URL")).or(cfg.openai_base_url).unwrap_or_else(|| openai::DEFAULT_BASE_URL.to_owned()),
         openai_api_key: env("OPENAI_API_KEY").or(cfg.openai_api_key),
         timeout: Duration::from_secs(args.timeout_mins.max(1) * 60),
     };
-    let engine = start_engine(choice.engine, choice.model, &opts, &change.root, &cache_dir).await?;
+    let engine = engine::start(choice.engine, choice.model, &opts, &change.root, &cache_dir).await?;
     if let Some(effort) = &choice.effort {
         engine.check_effort(effort).map_err(|e| format!("--effort: {e}"))?;
     }
@@ -390,8 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         change.dirty,
         change.model,
         change.skipped,
-        engine,
-        choice.effort,
+        server::EngineSetup { engine, effort: choice.effort, opts, cache_dir: cache_dir.clone() },
         viewer,
         cache_dir.join(format!("drafts-{draft_key}.json")),
         cache_dir.join(format!("scope-{draft_key}.json")),

@@ -10,7 +10,10 @@ use crate::codex::Codex;
 use crate::openai::OpenAi;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Start of the error for a turn in a session that no longer exists.
@@ -27,6 +30,8 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::Codex, Kind::Claude, Kind::Anthropic, Kind::OpenAi];
+
     /// Identifier used in flags, cache keys and the API.
     pub fn id(self) -> &'static str {
         match self {
@@ -36,6 +41,160 @@ impl Kind {
             Kind::OpenAi => "openai",
         }
     }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Kind::Codex => "Codex CLI (codex app-server)",
+            Kind::Claude => "Claude Code CLI (claude -p)",
+            Kind::Anthropic => "built-in agent: Claude subscription or Anthropic API key",
+            Kind::OpenAi => "built-in agent: OpenAI-compatible server (OpenAI, OpenRouter, llama.cpp, vLLM, Ollama, …)",
+        }
+    }
+
+    /// Levels to offer; the engine itself has the last word (Codex models and
+    /// OpenAI-compatible servers differ), so others can still be given.
+    pub fn effort_levels(self) -> &'static [&'static str] {
+        match self {
+            Kind::Codex => &["minimal", "low", "medium", "high", "xhigh"],
+            Kind::Claude | Kind::Anthropic => &["low", "medium", "high", "xhigh", "max"],
+            Kind::OpenAi => &["none", "minimal", "low", "medium", "high"],
+        }
+    }
+}
+
+/// A model an engine offers.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Display name, when it differs from the id.
+    pub label: Option<String>,
+    /// The engine's default.
+    pub default: bool,
+    /// Reasoning efforts this model takes, when the engine says (Codex).
+    pub efforts: Vec<String>,
+}
+
+impl ModelInfo {
+    fn plain(id: &str, label: Option<&str>, default: bool) -> ModelInfo {
+        ModelInfo { id: id.to_owned(), label: label.map(str::to_owned), default, efforts: Vec::new() }
+    }
+}
+
+/// How engines are reached: CLI executables and the OpenAI-compatible server.
+#[derive(Clone, Debug)]
+pub struct EngineOpts {
+    pub codex: String,
+    pub claude: String,
+    pub openai_base_url: String,
+    pub openai_api_key: Option<String>,
+    /// Limit for one turn.
+    pub timeout: Duration,
+}
+
+/// Start an engine over the checkout at `root`.
+pub async fn start(kind: Kind, model: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<Engine, String> {
+    let timeout = o.timeout;
+    Ok(match kind {
+        Kind::Codex => {
+            let cfg = crate::codex::CodexConfig { bin: o.codex.clone(), model, timeout };
+            Engine::Codex(Codex::start(cfg, root).await?)
+        }
+        Kind::Claude => {
+            let cfg = crate::claude::ClaudeConfig { bin: o.claude.clone(), model, timeout };
+            Engine::Claude(Arc::new(Claude::start(cfg, root).await?))
+        }
+        Kind::Anthropic => {
+            let model = model.or_else(|| Some(crate::anthropic::DEFAULT_MODEL.to_owned()));
+            Engine::Anthropic(Arc::new(Anthropic::start(root, cache_dir, model, timeout).await?))
+        }
+        Kind::OpenAi => {
+            let cfg = crate::openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, timeout };
+            Engine::OpenAi(Arc::new(OpenAi::start(root, cache_dir, cfg).await?))
+        }
+    })
+}
+
+/// The models `kind` offers. Codex asks the running engine when it is Codex, else a
+/// short-lived app-server; Claude Code takes its aliases; the OpenAI-compatible server
+/// lists its own. Any other name can still be typed.
+pub async fn list_models(kind: Kind, current: &Engine, o: &EngineOpts, root: &Path) -> Result<Vec<ModelInfo>, String> {
+    match kind {
+        Kind::Codex => match current {
+            Engine::Codex(c) => c.list_models().await,
+            _ => {
+                let cfg = crate::codex::CodexConfig { bin: o.codex.clone(), model: None, timeout: o.timeout };
+                Codex::start(cfg, root).await?.list_models().await
+            }
+        },
+        Kind::Claude => Ok(vec![
+            ModelInfo::plain("sonnet", Some("latest Sonnet"), false),
+            ModelInfo::plain("opus", Some("latest Opus"), false),
+            ModelInfo::plain("haiku", Some("latest Haiku"), false),
+        ]),
+        Kind::Anthropic => Ok(vec![ModelInfo::plain(crate::anthropic::DEFAULT_MODEL, None, true)]),
+        Kind::OpenAi => {
+            let ids = crate::openai::list_models(&o.openai_base_url, o.openai_api_key.as_deref()).await?;
+            let only = ids.len() == 1;
+            Ok(ids.iter().map(|id| ModelInfo::plain(id, None, only)).collect())
+        }
+    }
+}
+
+/// Whether an engine looks usable right now, and why (shown next to it).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Availability {
+    pub ready: bool,
+    pub note: String,
+    /// Whether review-master can run the engine's sign-in for you.
+    pub can_login: bool,
+}
+
+fn on_path(bin: &str) -> bool {
+    if bin.contains('/') {
+        return Path::new(bin).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+}
+
+fn env_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
+}
+
+fn quiet(bin: &str, args: &[&str]) -> Option<std::process::Output> {
+    Command::new(bin).args(args).stdin(Stdio::null()).output().ok()
+}
+
+/// What a status command said (`codex login status` writes to stderr).
+fn said(out: &std::process::Output) -> String {
+    let text = if out.stdout.iter().any(|b| !b.is_ascii_whitespace()) { &out.stdout } else { &out.stderr };
+    one_line(String::from_utf8_lossy(text).trim(), 80)
+}
+
+/// Checks each engine's prerequisites: the CLI and its login, or credentials, or the server.
+pub fn availability(kind: Kind, o: &EngineOpts) -> Availability {
+    let (ready, note, can_login) = match kind {
+        Kind::Codex if !on_path(&o.codex) => (false, format!("`{}` not found on PATH", o.codex), false),
+        Kind::Codex => match quiet(&o.codex, &["login", "status"]) {
+            Some(out) if out.status.success() => (true, Some(said(&out)).filter(|s| !s.is_empty()).unwrap_or_else(|| "signed in".to_owned()), true),
+            _ => (false, "not signed in".to_owned(), true),
+        },
+        Kind::Claude if !on_path(&o.claude) => (false, format!("`{}` not found on PATH", o.claude), false),
+        Kind::Claude => {
+            let status = quiet(&o.claude, &["auth", "status"]).and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok());
+            match status {
+                Some(s) if s["loggedIn"].as_bool() == Some(true) => {
+                    (true, format!("signed in{}", s["authMethod"].as_str().map(|m| format!(" ({m})")).unwrap_or_default()), true)
+                }
+                Some(_) => (false, "not signed in".to_owned(), true),
+                None => (true, "found".to_owned(), false),
+            }
+        }
+        Kind::Anthropic if env_set("ANTHROPIC_API_KEY") || env_set("ANTHROPIC_OAUTH_TOKEN") => (true, "credentials in the environment".to_owned(), false),
+        Kind::Anthropic if crate::anthropic_auth::credentials_path().is_ok_and(|p| p.is_file()) => (true, "signed in".to_owned(), true),
+        Kind::Anthropic => (false, "not signed in".to_owned(), true),
+        Kind::OpenAi => (true, format!("server {}", o.openai_base_url), false),
+    };
+    Availability { ready, note, can_login }
 }
 
 pub struct Outcome<T> {
@@ -73,14 +232,9 @@ impl Engine {
         }
     }
 
-    /// Levels to offer for this engine; the engine itself has the last word (Codex
-    /// models and OpenAI-compatible servers differ), so others can still be given.
+    /// Levels to offer for this engine (see [`Kind::effort_levels`]).
     pub fn effort_levels(&self) -> &'static [&'static str] {
-        match self {
-            Engine::Codex(_) => &["minimal", "low", "medium", "high", "xhigh"],
-            Engine::Claude(_) | Engine::Anthropic(_) => &["low", "medium", "high", "xhigh", "max"],
-            Engine::OpenAi(_) => &["none", "minimal", "low", "medium", "high"],
-        }
+        self.kind().effort_levels()
     }
 
     /// Reject an effort the engine can be told up front it will not take: blank or

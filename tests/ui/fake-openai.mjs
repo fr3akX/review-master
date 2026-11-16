@@ -1,18 +1,19 @@
-// Fake OpenAI-compatible server: answers every chat completion with a JSON answer and
-// records each request's reasoning_effort (`-` when absent) next to $FAKE_GH_OUT.
+// Fake OpenAI-compatible server: serves models `fake` and `fake-2`, answers every chat
+// completion with a JSON answer and records each request's `model effort` (effort `-`
+// when absent) next to $FAKE_GH_OUT.
 import http from 'node:http';
 import { appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 const port = +process.argv[2] || 8765;
-const effortLog = process.env.FAKE_GH_OUT && join(dirname(process.env.FAKE_GH_OUT), 'efforts.log');
+const requestLog = process.env.FAKE_GH_OUT && join(dirname(process.env.FAKE_GH_OUT), 'requests.log');
 http.createServer((req, res) => {
   let body = '';
   req.on('data', c => (body += c));
   req.on('end', async () => {
     res.setHeader('Content-Type', 'application/json');
-    if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'fake' }] }));
+    if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'fake' }, { id: 'fake-2' }] }));
     const j = JSON.parse(body || '{}');
-    if (effortLog) appendFileSync(effortLog, `${j.reasoning_effort ?? '-'}\n`);
+    if (requestLog) appendFileSync(requestLog, `${j.model} ${j.reasoning_effort ?? '-'}\n`);
     const last = [...(j.messages || [])].reverse().find(m => m.role === 'user');
     const text = String(last && last.content || '');
     const isSummary = text.includes('Write the summary a reviewer');

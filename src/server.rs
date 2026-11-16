@@ -3,11 +3,11 @@
 //! Engine turns run as background jobs the UI polls.
 
 use crate::diff::{Diff, Kind, Model, Side, Status};
-use crate::engine::Engine;
+use crate::engine::{self, Engine, EngineOpts, Kind as EngineKind};
 use crate::lsp::Lsp;
 use crate::pr::{PrMeta, PrRef};
 use crate::review::{self, Finding};
-use crate::{findings, flows, post, search, verify};
+use crate::{findings, flows, login, post, search, verify};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -47,10 +47,20 @@ pub struct AppState {
     flows: Mutex<FlowsState>,
     flows_file: PathBuf,
     findings: Mutex<findings::Store>,
-    pub engine: Engine,
+    /// The engine for new turns; switching replaces it while turns already running
+    /// finish on the one they started with.
+    engine: Mutex<Arc<Engine>>,
     /// Reasoning effort for the next engine turns (`--effort`/config at start, the UI
     /// after); `None`: the engine's own default. Running turns keep theirs.
     effort: Mutex<Option<String>>,
+    /// How engines are reached (CLI paths, the OpenAI-compatible server), for switching.
+    engine_opts: Mutex<EngineOpts>,
+    /// Where native engines keep their sessions.
+    cache_dir: PathBuf,
+    /// One engine switch at a time.
+    switching: tokio::sync::Mutex<()>,
+    /// A sign-in the UI started (`codex login`, `claude auth login`, `--anthropic-login`).
+    login: Mutex<Option<Arc<login::LoginRun>>>,
     /// The forge login (`gh` / `glab`), for own-request hints in the UI.
     pub viewer: Option<String>,
     pub lsp: Lsp,
@@ -83,6 +93,14 @@ struct StoredScope {
     excluded: Vec<String>,
 }
 
+/// The engine a run starts with, and what switching to another needs.
+pub struct EngineSetup {
+    pub engine: Engine,
+    pub effort: Option<String>,
+    pub opts: EngineOpts,
+    pub cache_dir: PathBuf,
+}
+
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -93,8 +111,7 @@ impl AppState {
         dirty: bool,
         model: Model,
         skipped: Vec<String>,
-        engine: Engine,
-        effort: Option<String>,
+        engine: EngineSetup,
         viewer: Option<String>,
         drafts_file: PathBuf,
         scope_file: PathBuf,
@@ -132,8 +149,12 @@ impl AppState {
             flows: Mutex::new(FlowsState { flows: stored_flows, job: None }),
             flows_file,
             findings: Mutex::new(findings::Store::load(findings_file)),
-            engine,
-            effort: Mutex::new(effort),
+            engine: Mutex::new(Arc::new(engine.engine)),
+            effort: Mutex::new(engine.effort),
+            engine_opts: Mutex::new(engine.opts),
+            cache_dir: engine.cache_dir,
+            switching: tokio::sync::Mutex::new(()),
+            login: Mutex::new(None),
             viewer,
             lsp,
             drafts: Mutex::new(DraftStore::load(drafts_file)),
@@ -154,6 +175,11 @@ impl AppState {
 
     fn effort(&self) -> Option<String> {
         self.effort.lock().unwrap().clone()
+    }
+
+    /// The engine new turns run on.
+    fn engine(&self) -> Arc<Engine> {
+        self.engine.lock().unwrap().clone()
     }
 
     /// Import an LLM review (Markdown) as findings, replacing an earlier import of the same name.
@@ -253,6 +279,10 @@ struct Thread {
     id: u64,
     anchor: Option<Anchor>,
     session: String,
+    /// The engine the session belongs to (absent in threads saved before engines
+    /// could be switched: taken to be the current one).
+    #[serde(default)]
+    engine: Option<EngineKind>,
     /// (role, text)
     messages: Vec<(String, String)>,
     #[serde(skip)]
@@ -375,7 +405,12 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/lsp/references", post_to(lsp_references))
         .route("/api/lsp/outline", get(lsp_outline))
         .route("/api/shutdown", post_to(shutdown))
-        .route("/api/effort", post_to(set_effort))
+        .route("/api/engines", get(engines_state))
+        .route("/api/engine", post_to(switch_engine))
+        .route("/api/models", post_to(models))
+        .route("/api/login", get(login_state).post(start_login))
+        .route("/api/login/input", post_to(login_input))
+        .route("/api/login/cancel", post_to(cancel_login))
         .with_state(state.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -396,20 +431,176 @@ async fn shutdown(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({}))
 }
 
-#[derive(Deserialize)]
-struct EffortRequest {
-    /// `null` (or empty): back to the engine's default.
-    effort: Option<String>,
+// ---- engines: switch, models, sign-in ----------------------------------------
+
+/// The engine new turns run on, with its effort and the levels it offers.
+fn engine_json(st: &AppState) -> Value {
+    let engine = st.engine();
+    json!({
+        "kind": engine.kind().id(), "model": engine.model(),
+        "effort": st.effort(), "effort_levels": engine.effort_levels(),
+    })
 }
 
-/// Change the reasoning effort for the next engine turns of this run.
-async fn set_effort(State(st): State<Arc<AppState>>, Json(req): Json<EffortRequest>) -> ApiResult {
-    let effort = req.effort.map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty());
-    if let Some(e) = &effort {
-        st.engine.check_effort(e).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+/// Every engine with whether it is usable, the OpenAI-compatible server, and a
+/// sign-in in progress. The checks run the CLIs (`codex login status`, …).
+async fn engines_state(State(st): State<Arc<AppState>>) -> ApiResult {
+    let opts = st.engine_opts.lock().unwrap().clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        EngineKind::ALL.iter().map(|k| (*k, engine::availability(*k, &opts))).collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let opts = st.engine_opts.lock().unwrap().clone();
+    let engines: Vec<Value> = checked
+        .into_iter()
+        .map(|(k, a)| {
+            json!({
+                "kind": k.id(), "describe": k.describe(), "ready": a.ready, "note": a.note,
+                "can_login": a.can_login && login::command_for(k, &opts).is_some(), "effort_levels": k.effort_levels(),
+            })
+        })
+        .collect();
+    let login = st.login.lock().unwrap().as_ref().map(|l| l.json());
+    Ok(Json(json!({
+        "current": engine_json(&st),
+        "engines": engines,
+        "openai": { "base_url": opts.openai_base_url, "has_key": opts.openai_api_key.is_some() },
+        "login": login,
+    })))
+}
+
+#[derive(Deserialize)]
+struct EngineRequest {
+    kind: EngineKind,
+    /// Empty or absent: the engine's default.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    /// OpenAI-compatible server; absent keeps the current one.
+    #[serde(default)]
+    openai_base_url: Option<String>,
+    /// Absent keeps the current key, empty removes it.
+    #[serde(default)]
+    openai_api_key: Option<String>,
+    /// Also make this the configured default for later runs.
+    #[serde(default)]
+    save: bool,
+}
+
+fn clean(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+/// OpenAI settings as a request changes them.
+fn openai_opts(mut opts: EngineOpts, base_url: Option<String>, api_key: Option<String>) -> Result<EngineOpts, String> {
+    if let Some(url) = clean(base_url) {
+        reqwest::Url::parse(&url).map_err(|_| format!("`{url}` is not a URL (e.g. http://localhost:8080)"))?;
+        opts.openai_base_url = url;
     }
-    *st.effort.lock().unwrap() = effort.clone();
-    Ok(Json(json!({ "effort": effort })))
+    if let Some(key) = api_key {
+        opts.openai_api_key = clean(Some(key));
+    }
+    Ok(opts)
+}
+
+/// Switch the engine, model or effort for the next turns. A new engine starts first, so
+/// a failed switch leaves the current one in place; turns already running finish on
+/// the engine they started with.
+async fn switch_engine(State(st): State<Arc<AppState>>, Json(req): Json<EngineRequest>) -> ApiResult {
+    let _one_at_a_time = st.switching.lock().await;
+    let current = st.engine();
+    let old_opts = st.engine_opts.lock().unwrap().clone();
+    let opts = openai_opts(old_opts.clone(), req.openai_base_url.clone(), req.openai_api_key.clone()).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let model = clean(req.model.clone());
+    let effort = clean(req.effort.clone()).map(|e| e.to_ascii_lowercase());
+    let openai_changed = req.kind == EngineKind::OpenAi && (opts.openai_base_url != old_opts.openai_base_url || opts.openai_api_key != old_opts.openai_api_key);
+    // Only the effort changes: keep the running engine (a model the engine picked
+    // itself, e.g. a server's only one, counts as asked for when the UI sends it back).
+    let same = current.kind() == req.kind && model.as_deref() == current.model() && !openai_changed;
+    let engine = if same {
+        current
+    } else {
+        let started = engine::start(req.kind, model.clone(), &opts, &st.root, &st.cache_dir).await;
+        Arc::new(started.map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("{} did not start: {e}", req.kind.id())))?)
+    };
+    if let Some(e) = &effort {
+        engine.check_effort(e).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    }
+    if req.save {
+        let mut cfg = crate::config::load().map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?.unwrap_or_default();
+        cfg.engine = Some(req.kind);
+        cfg.model = model.clone();
+        cfg.effort = effort.clone();
+        if req.kind == EngineKind::OpenAi {
+            cfg.openai_base_url = Some(opts.openai_base_url.clone());
+            if req.openai_api_key.is_some() {
+                cfg.openai_api_key = opts.openai_api_key.clone();
+            }
+        }
+        crate::config::save(&cfg).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("switched, but not saved: {e}")))?;
+    }
+    *st.engine_opts.lock().unwrap() = opts;
+    *st.engine.lock().unwrap() = engine;
+    *st.effort.lock().unwrap() = effort;
+    Ok(Json(engine_json(&st)))
+}
+
+#[derive(Deserialize)]
+struct ModelsRequest {
+    kind: EngineKind,
+    #[serde(default)]
+    openai_base_url: Option<String>,
+    #[serde(default)]
+    openai_api_key: Option<String>,
+}
+
+/// The models an engine offers (the OpenAI-compatible server as the request names it).
+async fn models(State(st): State<Arc<AppState>>, Json(req): Json<ModelsRequest>) -> ApiResult {
+    let opts = st.engine_opts.lock().unwrap().clone();
+    let opts = openai_opts(opts, req.openai_base_url, req.openai_api_key).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let list = engine::list_models(req.kind, &st.engine(), &opts, &st.root).await.map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(json!({ "models": list })))
+}
+
+async fn login_state(State(st): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({ "login": st.login.lock().unwrap().as_ref().map(|l| l.json()) }))
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    kind: EngineKind,
+}
+
+/// Run an engine's own sign-in; one at a time (a new one cancels the old).
+async fn start_login(State(st): State<Arc<AppState>>, Json(req): Json<LoginRequest>) -> ApiResult {
+    let opts = st.engine_opts.lock().unwrap().clone();
+    let (program, args) = login::command_for(req.kind, &opts).ok_or_else(|| fail(StatusCode::BAD_REQUEST, format!("{} has no sign-in to run", req.kind.id())))?;
+    let run = login::LoginRun::start(req.kind, &program, &args).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    if let Some(old) = st.login.lock().unwrap().replace(run.clone()) {
+        old.cancel();
+    }
+    Ok(Json(json!({ "login": run.json() })))
+}
+
+#[derive(Deserialize)]
+struct LoginInput {
+    text: String,
+}
+
+/// A code the provider showed, for the running sign-in.
+async fn login_input(State(st): State<Arc<AppState>>, Json(req): Json<LoginInput>) -> ApiResult {
+    let run = st.login.lock().unwrap().clone().filter(|r| r.running()).ok_or_else(|| fail(StatusCode::CONFLICT, "no sign-in is running"))?;
+    run.send(&req.text).await.map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(json!({})))
+}
+
+async fn cancel_login(State(st): State<Arc<AppState>>) -> Json<Value> {
+    if let Some(run) = st.login.lock().unwrap().as_ref() {
+        run.cancel();
+    }
+    Json(json!({}))
 }
 
 async fn asset(content_type: &'static str, body: &'static str) -> Response {
@@ -458,10 +649,7 @@ async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "head": st.head_sha,
         "branch": st.branch,
         "dirty": st.dirty,
-        "engine": {
-            "kind": st.engine.kind().id(), "model": st.engine.model(),
-            "effort": st.effort(), "effort_levels": st.engine.effort_levels(),
-        },
+        "engine": engine_json(&st),
         "viewer": st.viewer,
         "files": files,
         "skipped": st.cli_skipped,
@@ -761,21 +949,67 @@ code spans for identifiers, fenced blocks only for real code.\n",
     p
 }
 
+/// The first turn of a conversation that moves to another engine: the usual context,
+/// then the conversation so far, then the new question.
+fn handover_prompt(st: &AppState, anchor: Option<&Anchor>, history: &[(String, String)], question: &str) -> String {
+    let mut p = chat_prompt(st, anchor, None, question);
+    let mut earlier = String::from("\nEarlier in this conversation (answered by another engine; check its claims yourself):\n<conversation>\n");
+    for (role, text) in history {
+        let who = if role == "assistant" { "Assistant" } else { "Reviewer" };
+        earlier.push_str(&format!("{who}: {}\n\n", text.trim()));
+    }
+    earlier.push_str("</conversation>\n");
+    let at = p.rfind("\nQuestion: ").unwrap_or(p.len());
+    p.insert_str(at, &earlier);
+    p
+}
+
 async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> ApiResult {
     if req.question.trim().is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "the question is empty"));
     }
+    // The engine this turn runs on, also after a switch while it runs.
+    let engine = st.engine();
+    let kind = engine.kind();
     // Resolve or create the thread (session creation must happen outside the lock).
     let (thread_id, session, prompt) = match req.thread {
         Some(id) => {
+            let (anchor, history, session, moved) = {
+                let mut threads = st.threads.lock().unwrap();
+                let t = threads.by_id.get_mut(&id).ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no thread {id}")))?;
+                if t.busy {
+                    return Err(fail(StatusCode::CONFLICT, "this thread is already answering"));
+                }
+                t.busy = true;
+                let moved = t.engine.is_some_and(|k| k != kind);
+                (t.anchor.clone(), t.messages.clone(), t.session.clone(), moved)
+            };
+            // Another engine cannot continue this session: it starts its own with the
+            // conversation so far.
+            let (session, prompt) = if moved {
+                let name = match &anchor {
+                    Some(a) => format!("review-master: chat {}", a.location()),
+                    None => "review-master: chat".to_owned(),
+                };
+                match engine.start_session(&name).await {
+                    Ok(s) => (s, handover_prompt(&st, anchor.as_ref(), &history, &req.question)),
+                    Err(e) => {
+                        if let Some(t) = st.threads.lock().unwrap().by_id.get_mut(&id) {
+                            t.busy = false;
+                        }
+                        return Err(fail(StatusCode::BAD_GATEWAY, e));
+                    }
+                }
+            } else {
+                (session, format!("Follow-up question from the reviewer: {}\n", req.question))
+            };
             let mut threads = st.threads.lock().unwrap();
-            let t = threads.by_id.get_mut(&id).ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no thread {id}")))?;
-            if t.busy {
-                return Err(fail(StatusCode::CONFLICT, "this thread is already answering"));
+            if let Some(t) = threads.by_id.get_mut(&id) {
+                t.session = session.clone();
+                t.engine = Some(kind);
+                t.messages.push(("user".to_owned(), req.question.clone()));
             }
-            t.busy = true;
-            t.messages.push(("user".to_owned(), req.question.clone()));
-            (id, t.session.clone(), format!("Follow-up question from the reviewer: {}\n", req.question))
+            (id, session, prompt)
         }
         None => {
             let anchor = match &req.path {
@@ -790,14 +1024,22 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> 
                 Some(a) => format!("review-master: chat {}", a.location()),
                 None => "review-master: chat".to_owned(),
             };
-            let session = st.engine.start_session(&name).await.map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+            let session = engine.start_session(&name).await.map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
             let prompt = chat_prompt(&st, anchor.as_ref(), req.snippet.as_deref(), &req.question);
             let mut threads = st.threads.lock().unwrap();
             threads.next += 1;
             let id = threads.next;
             threads.by_id.insert(
                 id,
-                Thread { id, anchor, session: session.clone(), messages: vec![("user".to_owned(), req.question.clone())], busy: true, job: None },
+                Thread {
+                    id,
+                    anchor,
+                    session: session.clone(),
+                    engine: Some(kind),
+                    messages: vec![("user".to_owned(), req.question.clone())],
+                    busy: true,
+                    job: None,
+                },
             );
             (id, session, prompt)
         }
@@ -815,7 +1057,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> 
     tokio::spawn(async move {
         let progress = |line: String| job.push(line);
         let effort = st2.effort();
-        let out = st2.engine.turn::<ChatAnswer>(&session, &prompt, &chat_schema(), effort.as_deref(), &job.cancel, progress).await;
+        let out = engine.turn::<ChatAnswer>(&session, &prompt, &chat_schema(), effort.as_deref(), &job.cancel, progress).await;
         let mut threads = st2.threads.lock().unwrap();
         let thread = threads.by_id.get_mut(&thread_id);
         let result = out.map(|out| {
@@ -1211,13 +1453,14 @@ fn spawn_summary(st: Arc<AppState>) -> ApiResult {
         None => format!("review-master: summary {}", st.branch),
     };
     let st2 = st.clone();
+    let engine = st.engine();
     tokio::spawn(async move {
         let prompt = summary_prompt(&st2);
         let result = async {
-            let session = st2.engine.start_session(&name).await?;
+            let session = engine.start_session(&name).await?;
             let progress = |line: String| job.push(line);
             let effort = st2.effort();
-            let out = st2.engine.turn::<SummaryAnswer>(&session, &prompt, &summary_schema(), effort.as_deref(), &job.cancel, progress).await?;
+            let out = engine.turn::<SummaryAnswer>(&session, &prompt, &summary_schema(), effort.as_deref(), &job.cancel, progress).await?;
             Ok::<String, String>(out.answer.summary)
         }
         .await;
@@ -1282,13 +1525,14 @@ async fn generate_flows(State(st): State<Arc<AppState>>) -> ApiResult {
         None => format!("review-master: flows {}", st.branch),
     };
     let st2 = st.clone();
+    let engine = st.engine();
     tokio::spawn(async move {
         let prompt = flows::prompt(&subject_block(&st2), &diff_block(&st2.full));
         let result = async {
-            let session = st2.engine.start_session(&name).await?;
+            let session = engine.start_session(&name).await?;
             let progress = |line: String| job.push(line);
             let effort = st2.effort();
-            let out = st2.engine.turn::<flows::Flows>(&session, &prompt, &flows::schema(), effort.as_deref(), &job.cancel, progress).await?;
+            let out = engine.turn::<flows::Flows>(&session, &prompt, &flows::schema(), effort.as_deref(), &job.cancel, progress).await?;
             Ok::<flows::Flows, String>(out.answer)
         }
         .await;

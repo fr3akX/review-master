@@ -49,7 +49,7 @@ const S = {
   fileCache: new Map(), // path → FileState, reused across scope changes
   scopeChain: Promise.resolve(), // serializes POST /api/scope
   scopePop: null, // open "N excluded" restore popover
-  effortPop: null, // open reasoning-effort picker
+  engineDlg: null, // open engine dialog (engine, model, effort, sign-in)
   io: null, // IntersectionObserver that lazily loads diffs
   sym: null, // { el } — open symbol (LSP) popup
   foldOverrides: new Map(), // "path|foldKey" → open: per-fold choices since the last tests-toggle flip (persisted)
@@ -392,54 +392,312 @@ function renderHeader() {
   renderEngineChip();
 }
 
-// ───────────── reasoning effort ─────────────
-// For the next engine turns of this run (chat, summary, flows); running turns keep theirs.
-// `--effort` / the configuration sets the starting value.
+// ───────────── engine dialog ─────────────
+// Engine, model and reasoning effort for the next turns of this run (chat, summary,
+// flows; running turns keep theirs), the OpenAI-compatible server, and the engines'
+// own sign-in. Inputs are built once per opening, so polling never eats typing.
 
 function renderEngineChip() {
   const e = S.info.engine;
   $('#engine-chip').textContent = e ? [e.kind, e.model, e.effort && `effort ${e.effort}`].filter(Boolean).join(' · ') : 'no engine';
 }
 
-function closeEffortPop() {
-  if (!S.effortPop) return;
-  S.effortPop.remove();
-  S.effortPop = null;
+function closeEngineDialog() {
+  const d = S.engineDlg;
+  if (!d) return;
+  clearTimeout(d.loginTimer);
+  d.el.remove();
+  S.engineDlg = null;
 }
 
-async function setEffort(value) {
+function toggleEngineDialog() {
+  if (S.engineDlg) return closeEngineDialog();
+  const cur = S.info.engine || {};
+  const d = S.engineDlg = {
+    sel: cur.kind || 'codex', model: cur.model || '', effort: cur.effort || null,
+    state: null, models: new Map(), loginTimer: null,
+  };
+  const input = (attrs, oninput) => {
+    const el = h('input', { type: 'text', spellcheck: 'false', autocomplete: 'off', ...attrs });
+    el.addEventListener('input', () => oninput(el.value));
+    return el;
+  };
+  d.list = h('div', { class: 'engine-list', role: 'radiogroup', 'aria-label': 'Engine' });
+  d.url = input({ class: 'engine-input', 'aria-label': 'OpenAI-compatible server URL', placeholder: 'https://api.openai.com/v1' }, () => {});
+  d.key = input({ class: 'engine-input', type: 'password', 'aria-label': 'API key' }, () => {});
+  d.openai = h('div', { class: 'engine-field engine-openai' },
+    h('label', {}, 'Server', d.url),
+    h('label', {}, 'API key', d.key),
+    h('button', { class: 'btn small', type: 'button', onclick: () => loadModels('openai') }, 'List models'));
+  d.modelSel = h('select', { class: 'engine-input', 'aria-label': 'Model' });
+  d.modelSel.addEventListener('change', () => { d.model = d.modelSel.value; d.modelText.value = d.model; renderEfforts(); });
+  d.modelText = input({ class: 'engine-input', 'aria-label': 'Model name', placeholder: 'or type a model name' }, v => {
+    d.model = v.trim();
+    renderModels();
+  });
+  d.modelText.value = d.model;
+  d.modelNote = h('div', { class: 'hint' });
+  d.efforts = h('div', { class: 'effort-list' });
+  d.effortText = input({ class: 'effort-custom', 'aria-label': 'Other effort level', placeholder: 'other level' }, v => {
+    d.effort = v.trim() || null;
+    renderEfforts(false);
+  });
+  d.login = h('div', { class: 'engine-login' });
+  d.code = input({ class: 'engine-input', 'aria-label': 'Code from the sign-in page', placeholder: 'Paste a code the page shows, if asked' }, () => {});
+  d.code.addEventListener('keydown', ev => { if (ev.key === 'Enter') sendLoginCode(); });
+  d.save = h('input', { type: 'checkbox' });
+  d.error = h('div', { class: 'engine-error', role: 'alert' });
+  d.apply = h('button', { class: 'btn primary', type: 'button', onclick: applyEngine }, 'Apply');
+  d.el = h('div', { class: 'modal', onclick: e => { if (e.target === d.el) closeEngineDialog(); } },
+    h('div', { class: 'modal-box engine-box', role: 'dialog', 'aria-label': 'Engine' },
+      h('div', { class: 'drawer-head' }, h('h2', {}, 'Engine'), h('span', { class: 'spacer' }),
+        h('button', { class: 'icon-btn', 'aria-label': 'Close', onclick: closeEngineDialog }, '×')),
+      h('div', { class: 'engine-body' },
+        d.list,
+        d.login,
+        d.openai,
+        h('div', { class: 'engine-field' }, h('span', { class: 'engine-label' }, 'Model'), d.modelSel, d.modelText),
+        d.modelNote,
+        h('div', { class: 'engine-field' }, h('span', { class: 'engine-label' }, 'Effort'), d.efforts, d.effortText),
+        h('div', { class: 'hint' }, 'Applies to the next chat, summary and flows turns; running ones finish on their engine. A chat continued on another engine gets the conversation so far.'),
+        d.error,
+        h('div', { class: 'engine-actions' },
+          h('label', { class: 'engine-save' }, d.save, 'Save as default for later runs'),
+          h('span', { class: 'spacer' }),
+          h('button', { class: 'btn', type: 'button', onclick: closeEngineDialog }, 'Cancel'),
+          d.apply))));
+  document.body.append(d.el);
+  renderEngineDialog();
+  refreshEngines();
+}
+
+async function refreshEngines() {
+  const d = S.engineDlg;
+  if (!d) return;
+  try {
+    d.state = await api('GET', '/api/engines', undefined, true);
+  } catch (e) {
+    if (S.engineDlg === d) d.error.textContent = e.message;
+    return;
+  }
+  if (S.engineDlg !== d) return;
+  if (!d.url.value) d.url.value = d.state.openai.base_url;
+  d.key.placeholder = d.state.openai.has_key ? 'a key is set (leave empty to keep it)' : 'none (local servers rarely need one)';
+  renderEngineDialog();
+  if (!d.models.has(d.sel)) loadModels(d.sel);
+  if (d.state.login && d.state.login.running) pollLogin();
+}
+
+function engineState(kind) {
+  const d = S.engineDlg;
+  return d.state && d.state.engines.find(e => e.kind === kind);
+}
+
+function renderEngineDialog() {
+  const d = S.engineDlg;
+  if (!d) return;
+  const kinds = d.state ? d.state.engines : ['codex', 'claude', 'anthropic', 'openai'].map(kind => ({ kind }));
+  d.list.replaceChildren(...kinds.map(e => {
+    const inUse = S.info.engine && S.info.engine.kind === e.kind;
+    const status = e.note == null ? h('span', { class: 'engine-note' }, 'checking…')
+      : h('span', { class: `engine-note ${e.ready ? 'ok' : 'warn'}` }, e.note);
+    const signIn = e.can_login && h('button', {
+      class: 'btn small', type: 'button', onclick: ev => { ev.stopPropagation(); startLogin(e.kind); },
+    }, e.ready ? 'Sign in again' : 'Sign in');
+    return h('div', {
+      class: `engine-row${d.sel === e.kind ? ' on' : ''}`, role: 'radio', tabindex: '0', 'data-kind': e.kind,
+      'aria-checked': String(d.sel === e.kind), onclick: () => selectEngine(e.kind),
+      onkeydown: ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectEngine(e.kind); } },
+    },
+    h('div', { class: 'engine-row-head' }, h('strong', {}, e.kind), inUse && h('span', { class: 'engine-inuse' }, 'in use'), status, h('span', { class: 'spacer' }), signIn),
+    e.describe && h('div', { class: 'engine-desc' }, e.describe));
+  }));
+  d.openai.hidden = d.sel !== 'openai';
+  renderModels();
+  renderLogin();
+}
+
+function selectEngine(kind) {
+  const d = S.engineDlg;
+  if (d.sel === kind) return;
+  const cur = S.info.engine || {};
+  d.sel = kind;
+  d.model = kind === cur.kind ? cur.model || '' : '';
+  d.effort = kind === cur.kind ? cur.effort || null : null;
+  d.modelText.value = d.model;
+  d.error.textContent = '';
+  renderEngineDialog();
+  if (!d.models.has(kind)) loadModels(kind);
+}
+
+async function loadModels(kind) {
+  const d = S.engineDlg;
+  const body = { kind };
+  if (kind === 'openai') {
+    body.openai_base_url = d.url.value.trim() || null;
+    if (d.key.value.trim()) body.openai_api_key = d.key.value.trim();
+  }
+  d.models.set(kind, { loading: true });
+  renderModels();
+  let entry;
+  try {
+    entry = { list: (await api('POST', '/api/models', body, true)).models || [] };
+  } catch (e) {
+    entry = { error: e.message };
+  }
+  if (S.engineDlg !== d) return;
+  d.models.set(kind, entry);
+  // A server with exactly one model: that is the one.
+  if (d.sel === kind && !d.model && entry.list && entry.list.length === 1 && kind === 'openai') {
+    d.model = entry.list[0].id;
+    d.modelText.value = d.model;
+  }
+  renderModels();
+}
+
+// The model the selection resolves to (the engine's default when none is chosen).
+function chosenModel() {
+  const d = S.engineDlg;
+  const entry = d.models.get(d.sel);
+  const list = (entry && entry.list) || [];
+  return list.find(m => m.id === d.model) || (!d.model && list.find(m => m.default)) || null;
+}
+
+function renderModels() {
+  const d = S.engineDlg;
+  if (!d) return;
+  const entry = d.models.get(d.sel) || {};
+  const list = entry.list || [];
+  const opts = [h('option', { value: '' }, 'engine default')];
+  for (const m of list) opts.push(h('option', { value: m.id }, m.label ? `${m.id} — ${m.label}` : m.id));
+  if (d.model && !list.some(m => m.id === d.model)) opts.push(h('option', { value: d.model }, d.model));
+  d.modelSel.replaceChildren(...opts);
+  d.modelSel.value = d.model;
+  d.modelNote.textContent = entry.loading ? 'Loading models…' : entry.error ? `Cannot list models: ${entry.error}` : '';
+  renderEfforts();
+}
+
+function renderEfforts(syncText = true) {
+  const d = S.engineDlg;
+  const m = chosenModel();
+  const engine = engineState(d.sel);
+  const levels = [...(m && m.efforts && m.efforts.length ? m.efforts : (engine && engine.effort_levels) || [])];
+  const choice = value => h('button', {
+    class: `effort-item${(d.effort || null) === value ? ' on' : ''}`, type: 'button',
+    title: value ? `Reason with effort ${value}` : 'The engine\'s own default',
+    onclick: () => { d.effort = value; d.effortText.value = ''; renderEfforts(); },
+  }, value || 'default');
+  d.efforts.replaceChildren(choice(null), ...levels.map(choice));
+  if (syncText) d.effortText.value = d.effort && !levels.includes(d.effort) ? d.effort : '';
+}
+
+function renderLogin() {
+  const d = S.engineDlg;
+  const run = d.state && d.state.login;
+  if (!run || run.kind !== d.sel) {
+    d.login.hidden = true;
+    return;
+  }
+  d.login.hidden = false;
+  const status = run.running ? `Signing in to ${run.kind}: finish in the browser.`
+    : run.ok ? `Signed in to ${run.kind}.` : `Sign-in did not finish: ${run.error || 'failed'}`;
+  const kids = [h('div', { class: `engine-login-status ${run.running ? '' : run.ok ? 'ok' : 'warn'}` }, status)];
+  for (const url of run.links || []) {
+    kids.push(h('a', { class: 'engine-link', href: url, target: '_blank', rel: 'noopener noreferrer' }, url));
+  }
+  if (run.lines && run.lines.length) kids.push(h('pre', { class: 'engine-login-out' }, run.lines.slice(-12).join('\n')));
+  if (run.running) {
+    kids.push(h('div', { class: 'engine-field' }, d.code,
+      h('button', { class: 'btn small', type: 'button', onclick: sendLoginCode }, 'Send code'),
+      h('button', { class: 'btn small', type: 'button', onclick: cancelLogin }, 'Cancel')));
+  }
+  // Keep the code box (and what is typed in it) across polls.
+  const focused = document.activeElement === d.code;
+  d.login.replaceChildren(...kids);
+  if (focused) d.code.focus();
+}
+
+async function startLogin(kind) {
+  const d = S.engineDlg;
+  if (d.sel !== kind) selectEngine(kind);
   let r;
   try {
-    r = await post('/api/effort', { effort: value });
+    r = await post('/api/login', { kind });
   } catch {
-    return; // toasted; the picker stays open
+    return;
   }
-  S.info.engine.effort = r.effort;
-  closeEffortPop();
-  renderEngineChip();
-  toast(r.effort ? `Effort ${r.effort} for the next turns` : 'The engine\'s default effort for the next turns', 'ok', 3000);
+  if (S.engineDlg !== d) return;
+  d.state.login = r.login;
+  d.code.value = '';
+  renderLogin();
+  pollLogin();
 }
 
-function toggleEffortPop() {
-  if (S.effortPop) return closeEffortPop();
-  const e = S.info.engine;
-  if (!e) return;
-  const levels = [...(e.effort_levels || [])];
-  if (e.effort && !levels.includes(e.effort)) levels.push(e.effort);
-  const choice = value => h('button', {
-    class: `effort-item${(e.effort || null) === value ? ' on' : ''}`, type: 'button',
-    title: value ? `Reason with effort ${value}` : `The ${e.kind} engine's own default`, onclick: () => setEffort(value),
-  }, value || 'default');
-  const custom = h('input', { class: 'effort-custom', type: 'text', placeholder: 'Other level, Enter to set', 'aria-label': 'Other effort level', spellcheck: 'false' });
-  custom.addEventListener('keydown', ev => {
-    if (ev.key === 'Enter' && custom.value.trim()) setEffort(custom.value.trim());
-  });
-  S.effortPop = h('div', { class: 'effort-pop', role: 'dialog', 'aria-label': 'Reasoning effort' },
-    h('div', { class: 'scope-pop-title' }, `Reasoning effort · ${e.kind}`),
-    h('div', { class: 'effort-list' }, choice(null), levels.map(choice)),
-    custom,
-    h('div', { class: 'hint' }, 'For the next chat, summary and flows turns of this run. --effort or --configure sets the starting value.'));
-  $('#topbar .top-actions').append(S.effortPop);
+function pollLogin() {
+  const d = S.engineDlg;
+  clearTimeout(d.loginTimer);
+  d.loginTimer = setTimeout(async () => {
+    if (S.engineDlg !== d) return;
+    let r;
+    try {
+      r = await api('GET', '/api/login', undefined, true);
+    } catch {
+      return pollLogin();
+    }
+    if (S.engineDlg !== d) return;
+    d.state.login = r.login;
+    renderLogin();
+    if (r.login && r.login.running) pollLogin();
+    else refreshEngines(); // signed in (or not): the status changed
+  }, 1000);
+}
+
+async function sendLoginCode() {
+  const d = S.engineDlg;
+  const text = d.code.value.trim();
+  if (!text) return;
+  try {
+    await post('/api/login/input', { text });
+  } catch {
+    return;
+  }
+  d.code.value = '';
+}
+
+async function cancelLogin() {
+  try {
+    await post('/api/login/cancel');
+  } catch {
+    return;
+  }
+  pollLogin();
+}
+
+async function applyEngine() {
+  const d = S.engineDlg;
+  const body = { kind: d.sel, model: d.model || null, effort: d.effort || null, save: d.save.checked };
+  if (d.sel === 'openai') {
+    body.openai_base_url = d.url.value.trim() || null;
+    if (d.key.value.trim()) body.openai_api_key = d.key.value.trim();
+  }
+  d.apply.disabled = true;
+  d.apply.textContent = 'Starting…';
+  d.error.textContent = '';
+  let r;
+  try {
+    r = await api('POST', '/api/engine', body, true);
+  } catch (e) {
+    if (S.engineDlg !== d) return;
+    d.error.textContent = e.message;
+    d.apply.disabled = false;
+    d.apply.textContent = 'Apply';
+    return;
+  }
+  S.info.engine = r;
+  renderEngineChip();
+  closeEngineDialog();
+  const what = [r.kind, r.model, r.effort && `effort ${r.effort}`].filter(Boolean).join(' · ');
+  toast(`${what} for the next turns${body.save ? ' (saved as default)' : ''}`, 'ok', 3000);
 }
 
 function submittedNode() {
@@ -2025,7 +2283,6 @@ function onDocMouseDown(e) {
   if (!(e.target instanceof Element)) return;
   if (S.sym && !e.target.closest('.sym-popup')) closeSym();
   if (S.scopePop && !e.target.closest('.scope-pop, .scope-link')) closeScopePop();
-  if (S.effortPop && !e.target.closest('.effort-pop, #engine-chip')) closeEffortPop();
   if (S.viewer && S.viewer.outlineEl && !e.target.closest('.outline-pop, .outline-btn')) closeOutline();
   const codeCell = (e.metaKey || e.ctrlKey || e.altKey) && e.target.closest('tr.ln-row td.code');
   if (codeCell && paneOf(codeCell)) {
@@ -3428,7 +3685,7 @@ function onKeyDown(e) {
     if (S.help) toggleHelp();
     else if (S.sym) closeSym();
     else if (S.scopePop) closeScopePop();
-    else if (S.effortPop) closeEffortPop();
+    else if (S.engineDlg) closeEngineDialog();
     else if (S.viewer && S.viewer.outlineEl) closeOutline();
     else if (S.walk) exitWalk();
     else if (S.viewer) closeViewer();
@@ -3442,7 +3699,7 @@ function onKeyDown(e) {
     return;
   }
   if (e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || !S.info) return;
-  if (S.help && e.key !== '?') return;
+  if ((S.help && e.key !== '?') || S.engineDlg) return;
   const cur = S.current || S.order[0];
   const inDiff = !S.viewer; // these act on the diff column behind the file viewer
   if (e.key === 'j' || e.key === 'k') stepFile(e.key === 'j' ? 1 : -1);
@@ -3556,7 +3813,7 @@ function wire() {
   document.addEventListener('keydown', onKeyDown);
   wireResizers();
   $('#btn-help').addEventListener('click', toggleHelp);
-  $('#engine-chip').addEventListener('click', toggleEffortPop);
+  $('#engine-chip').addEventListener('click', toggleEngineDialog);
 
   const filter = $('#file-filter');
   const setFilter = value => {

@@ -244,6 +244,12 @@ impl Codex {
         self.named(result, name).await
     }
 
+    /// Models the Codex login offers (`model/list`), with their reasoning efforts.
+    pub async fn list_models(&self) -> Result<Vec<crate::engine::ModelInfo>, String> {
+        let result = self.request("model/list", json!({})).await?;
+        Ok(parse_models(&result))
+    }
+
     /// A new persisted session that starts with everything `parent` has seen.
     pub async fn fork(&self, parent: &str, name: &str) -> Result<String, String> {
         let mut params = self.session_params();
@@ -442,4 +448,47 @@ fn unwrap_shell(command: &str) -> String {
         }
     }
     word
+}
+
+/// `model/list` result → models, hidden ones left out.
+fn parse_models(result: &Value) -> Vec<crate::engine::ModelInfo> {
+    result["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| !m["hidden"].as_bool().unwrap_or(false))
+        .filter_map(|m| {
+            let id = m["model"].as_str().or(m["id"].as_str())?.to_owned();
+            Some(crate::engine::ModelInfo {
+                label: m["displayName"].as_str().filter(|l| *l != id).map(str::to_owned),
+                default: m["isDefault"].as_bool().unwrap_or(false),
+                efforts: m["supportedReasoningEfforts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["reasoningEffort"].as_str().map(str::to_owned))
+                    .collect(),
+                id,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_list_keeps_visible_models_with_their_efforts() {
+        let result = json!({ "data": [
+            { "id": "gpt-6", "model": "gpt-6", "displayName": "GPT-6", "isDefault": true, "hidden": false,
+              "supportedReasoningEfforts": [{ "reasoningEffort": "low" }, { "reasoningEffort": "high" }] },
+            { "id": "old", "model": "old", "displayName": "old", "hidden": true },
+            { "id": "mini", "displayName": "mini" },
+        ] });
+        let models = parse_models(&result);
+        assert_eq!(models.iter().map(|m| (m.id.as_str(), m.label.as_deref(), m.default)).collect::<Vec<_>>(), [("gpt-6", Some("GPT-6"), true), ("mini", None, false)]);
+        assert_eq!(models[0].efforts, ["low", "high"]);
+        assert!(models[1].efforts.is_empty());
+    }
 }

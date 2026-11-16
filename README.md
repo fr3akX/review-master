@@ -178,12 +178,30 @@ default. The word goes to the engine, which checks it:
 A configured effort belongs to its engine: `--engine claude` does not inherit the
 effort configured for `codex`. The startup line and the header chip show it.
 
-In the web UI, click the engine chip in the header to change the effort while you
-review: pick a level offered for the engine, `default` for the engine's own, or type
-another the engine accepts. It applies to the next chat, summary and flows turns of
-this run; a turn already running keeps its effort, and the next start goes back to
-`--effort` / the configuration. Levels that cannot work are refused right away (a
-multi-word value, or one this native Anthropic model does not take).
+### Switching engines while you review
+
+Click the engine chip in the header (`openai · fake · effort high`) for the **Engine**
+dialog:
+
+- **Engines** with their state: `codex` / `claude` signed in or not (`codex login
+  status`, `claude auth status`), `anthropic` credentials, the OpenAI-compatible server.
+- **Sign in** runs the engine's own login: `codex login`, `claude auth login` or
+  `review-master --anthropic-login`. The dialog shows its sign-in link and output; when the
+  provider shows a code to paste instead of returning to the browser, paste it there.
+  The CLIs store their credentials as usual; review-master never sees them.
+- **Model**: Codex lists the models of your login (`model/list`, with each one's effort
+  levels), Claude Code its aliases (`sonnet`, `opus`, `haiku`), the OpenAI-compatible
+  server its `/models`; any other name can be typed. For `openai` set the server URL and
+  API key here too (**List models** checks them).
+- **Effort**: the levels the model or engine offers, `default` for the engine's own, or
+  another word the engine accepts.
+- **Save as default** also writes the choice to the configuration for later runs.
+
+**Apply** starts the new engine first: if it cannot start (not signed in, server down,
+unknown model, a level the model refuses) the dialog says why and the current one stays.
+It applies to the next chat, summary and flows turns; turns already running finish on
+their engine. A chat continued on another engine starts a new session there with the
+conversation so far.
 
 ## Flags
 
@@ -356,9 +374,9 @@ in subgroups (`group/sub/project`) are fine.
 ## Tests
 
 `cargo test` covers the Rust side. `tests/ui/run.sh` drives the real binary and
-web UI in headless Chrome against a demo repository, a fake `gh`, a fake `glab` and a fake
-engine — no network, nothing is posted (needs node ≥ 22 and Chrome; `$CHROME`
-overrides the macOS default path, `--keep` leaves screenshots behind).
+web UI in headless Chrome against a demo repository, a fake `gh`, a fake `glab`, a fake
+`codex` sign-in and a fake engine — no network, nothing is posted (needs node ≥ 22 and
+Chrome; `$CHROME` overrides the macOS default path, `--keep` leaves screenshots behind).
 
 ## Notes
 

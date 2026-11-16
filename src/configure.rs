@@ -4,10 +4,8 @@
 use crate::config::{self, Config};
 use crate::engine::Kind;
 use crate::term::{prompt, prompt_hidden};
-use crate::{anthropic, anthropic_auth, openai};
-use std::process::{Command, Stdio};
+use crate::{anthropic, anthropic_auth, engine, openai};
 
-const ENGINES: [Kind; 4] = [Kind::Codex, Kind::Claude, Kind::Anthropic, Kind::OpenAi];
 const MAX_LISTED_MODELS: usize = 40;
 
 fn on_path(bin: &str) -> bool {
@@ -18,38 +16,16 @@ fn env_set(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
 }
 
-fn describe(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Codex => "Codex CLI (codex app-server)",
-        Kind::Claude => "Claude Code CLI (claude -p)",
-        Kind::Anthropic => "built-in agent: Claude subscription or Anthropic API key",
-        Kind::OpenAi => "built-in agent: OpenAI-compatible server (OpenAI, OpenRouter, llama.cpp, vLLM, Ollama, …)",
-    }
-}
-
-/// Whether an engine looks usable right now.
+/// Whether an engine looks usable right now (see [`engine::availability`]).
 fn status(kind: Kind, cfg: &Config) -> String {
-    match kind {
-        Kind::Codex if !on_path("codex") => "not found on PATH".into(),
-        Kind::Codex => {
-            let logged_in = Command::new("codex")
-                .args(["login", "status"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if logged_in { "found, logged in".into() } else { "found; run `codex login`".into() }
-        }
-        Kind::Claude => if on_path("claude") { "found".into() } else { "not found on PATH".into() },
-        Kind::Anthropic if env_set("ANTHROPIC_API_KEY") || env_set("ANTHROPIC_OAUTH_TOKEN") => "credentials in the environment".into(),
-        Kind::Anthropic if anthropic_signed_in() => "signed in".into(),
-        Kind::Anthropic => "not signed in yet".into(),
-        Kind::OpenAi => match cfg.openai_base_url.clone().or_else(|| std::env::var("OPENAI_BASE_URL").ok()) {
-            Some(url) => format!("server {url}"),
-            None => "needs a server URL".into(),
-        },
-    }
+    let opts = engine::EngineOpts {
+        codex: "codex".into(),
+        claude: "claude".into(),
+        openai_base_url: cfg.openai_base_url.clone().or_else(|| std::env::var("OPENAI_BASE_URL").ok()).unwrap_or_else(|| openai::DEFAULT_BASE_URL.to_owned()),
+        openai_api_key: None,
+        timeout: std::time::Duration::from_secs(60),
+    };
+    engine::availability(kind, &opts).note
 }
 
 fn anthropic_signed_in() -> bool {
@@ -81,19 +57,19 @@ fn text(question: &str, current: Option<&str>, empty_means: &str) -> Result<Opti
 
 fn pick_engine(title: &str, default: Kind, cfg: &Config) -> Result<Kind, String> {
     println!("\n{title}");
-    for (i, kind) in ENGINES.iter().enumerate() {
-        println!("  {}) {:<9} {} — {}", i + 1, kind.id(), describe(*kind), status(*kind, cfg));
+    for (i, kind) in Kind::ALL.iter().enumerate() {
+        println!("  {}) {:<9} {} — {}", i + 1, kind.id(), kind.describe(), status(*kind, cfg));
     }
     loop {
-        let answer = prompt(&format!("Choose 1-{} [{}]: ", ENGINES.len(), default.id()))?;
+        let answer = prompt(&format!("Choose 1-{} [{}]: ", Kind::ALL.len(), default.id()))?;
         if answer.is_empty() {
             return Ok(default);
         }
-        let by_number = answer.parse::<usize>().ok().filter(|n| (1..=ENGINES.len()).contains(n)).map(|n| ENGINES[n - 1]);
-        if let Some(kind) = by_number.or_else(|| ENGINES.iter().copied().find(|k| k.id() == answer)) {
+        let by_number = answer.parse::<usize>().ok().filter(|n| (1..=Kind::ALL.len()).contains(n)).map(|n| Kind::ALL[n - 1]);
+        if let Some(kind) = by_number.or_else(|| Kind::ALL.iter().copied().find(|k| k.id() == answer)) {
             return Ok(kind);
         }
-        println!("  type a number from 1 to {}, or an engine name", ENGINES.len());
+        println!("  type a number from 1 to {}, or an engine name", Kind::ALL.len());
     }
 }
 
