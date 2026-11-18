@@ -10,7 +10,8 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/review-master-ui.XXXXXX")
 UI_PORT=${UI_PORT:-17981}
 ENGINE_PORT=${ENGINE_PORT:-18765}
 export FAKE_GH_REPO=$WORK/demo FAKE_GH_OUT=$WORK/out/review.json SHOTS=$WORK/shots
-export PATH=$HERE/bin:$PATH OPENAI_API_KEY= OPENAI_MODEL=
+# Its own config dir: the engine dialog writes the configuration.
+export PATH=$HERE/bin:$PATH OPENAI_API_KEY= OPENAI_MODEL= XDG_CONFIG_HOME=$WORK/config
 mkdir -p "$WORK/out" "$SHOTS"
 SERVER=; ENGINE=; FAILED=0
 

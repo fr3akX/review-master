@@ -277,6 +277,8 @@ export default async page => {
   await page.shot('engine');
   await q(() => [...document.querySelectorAll('.engine-box .btn')].find(b => b.textContent === 'Apply').click());
   await page.waitFor(() => !document.querySelector('.engine-box') && document.querySelector('#engine-chip').textContent === 'openai · fake-2 · effort high');
+  const config = () => readFileSync(join(process.env.XDG_CONFIG_HOME, 'review-master', 'config.toml'), 'utf8');
+  check('applied choice saved to the global config', /^engine = "openai"$/m.test(config()) && /^model = "fake-2"$/m.test(config()) && /^effort = "high"$/m.test(config()), config());
   const sent = requests().length;
   await q(() => document.querySelector('#flows-card .icon-btn[aria-label="Regenerate flows"]').click());
   for (let t = 0; t < 80 && requests().length === sent; t++) await page.sleep(100);
@@ -287,12 +289,12 @@ export default async page => {
   await q(() => { const i = document.querySelector('.effort-custom'); i.value = 'two words'; i.dispatchEvent(new Event('input')); });
   await q(() => [...document.querySelectorAll('.engine-box .btn')].find(b => b.textContent === 'Apply').click());
   await page.waitFor(() => document.querySelector('.engine-error').textContent);
-  check('a bad level is refused, the dialog stays', await q(() => !!document.querySelector('.engine-box') && document.querySelector('#engine-chip').textContent.endsWith('effort high')));
+  check('a bad level is refused, the dialog stays, nothing saved', await q(() => !!document.querySelector('.engine-box') && document.querySelector('#engine-chip').textContent.endsWith('effort high')) && /^effort = "high"$/m.test(config()));
   await q(() => { const s = document.querySelector('.engine-box select'); s.value = 'fake'; s.dispatchEvent(new Event('change')); });
   await q(() => [...document.querySelectorAll('.engine-box .effort-item')].find(b => b.textContent === 'default').click());
   await q(() => [...document.querySelectorAll('.engine-box .btn')].find(b => b.textContent === 'Apply').click());
   await page.waitFor(() => document.querySelector('#engine-chip').textContent === 'openai · fake');
-  check('back to model fake and the engine default effort', true);
+  check('back to model fake and the engine default effort, saved', /^model = "fake"$/m.test(config()) && !/^effort/m.test(config()), config());
 
   // ── review drawer: body persists across reload
   await q(() => document.activeElement.blur());

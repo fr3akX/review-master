@@ -264,7 +264,6 @@ button.chip.engine:hover { border-color: var(--fg-faint); color: var(--fg); }
 .engine-error:empty { display: none; }
 .engine-error { color: var(--red); font-size: 12px; white-space: pre-wrap; }
 .engine-actions { display: flex; align-items: center; gap: 8px; }
-.engine-save { display: flex; align-items: center; gap: 6px; color: var(--fg-dim); font-size: 12px; }
 .effort-list { display: flex; flex-wrap: wrap; gap: 4px; }
 .effort-item { padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--fg-dim); font: 12px var(--mono); cursor: pointer; }
 .effort-item:hover { border-color: var(--fg-faint); color: var(--fg); }

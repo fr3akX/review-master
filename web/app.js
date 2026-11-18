@@ -445,7 +445,6 @@ function toggleEngineDialog() {
   d.login = h('div', { class: 'engine-login' });
   d.code = input({ class: 'engine-input', 'aria-label': 'Code from the sign-in page', placeholder: 'Paste a code the page shows, if asked' }, () => {});
   d.code.addEventListener('keydown', ev => { if (ev.key === 'Enter') sendLoginCode(); });
-  d.save = h('input', { type: 'checkbox' });
   d.error = h('div', { class: 'engine-error', role: 'alert' });
   d.apply = h('button', { class: 'btn primary', type: 'button', onclick: applyEngine }, 'Apply');
   d.el = h('div', { class: 'modal', onclick: e => { if (e.target === d.el) closeEngineDialog(); } },
@@ -462,7 +461,7 @@ function toggleEngineDialog() {
         h('div', { class: 'hint' }, 'Applies to the next chat, summary and flows turns; running ones finish on their engine. A chat continued on another engine gets the conversation so far.'),
         d.error,
         h('div', { class: 'engine-actions' },
-          h('label', { class: 'engine-save' }, d.save, 'Save as default for later runs'),
+          h('span', { class: 'hint' }, 'Also saved as the default for later runs.'),
           h('span', { class: 'spacer' }),
           h('button', { class: 'btn', type: 'button', onclick: closeEngineDialog }, 'Cancel'),
           d.apply))));
@@ -675,7 +674,7 @@ async function cancelLogin() {
 
 async function applyEngine() {
   const d = S.engineDlg;
-  const body = { kind: d.sel, model: d.model || null, effort: d.effort || null, save: d.save.checked };
+  const body = { kind: d.sel, model: d.model || null, effort: d.effort || null };
   if (d.sel === 'openai') {
     body.openai_base_url = d.url.value.trim() || null;
     if (d.key.value.trim()) body.openai_api_key = d.key.value.trim();
@@ -693,11 +692,13 @@ async function applyEngine() {
     d.apply.textContent = 'Apply';
     return;
   }
-  S.info.engine = r;
+  const { saved, save_error: saveError, ...engine } = r;
+  S.info.engine = engine;
   renderEngineChip();
   closeEngineDialog();
-  const what = [r.kind, r.model, r.effort && `effort ${r.effort}`].filter(Boolean).join(' · ');
-  toast(`${what} for the next turns${body.save ? ' (saved as default)' : ''}`, 'ok', 3000);
+  const what = [engine.kind, engine.model, engine.effort && `effort ${engine.effort}`].filter(Boolean).join(' · ');
+  if (saveError) toast(`${what} for the next turns, but not saved as the default: ${saveError}`, 'warn', 9000);
+  else toast(`${what} for the next turns, saved to ${saved}`, 'ok', 3000);
 }
 
 function submittedNode() {

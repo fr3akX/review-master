@@ -195,10 +195,13 @@ dialog:
   API key here too (**List models** checks them).
 - **Effort**: the levels the model or engine offers, `default` for the engine's own, or
   another word the engine accepts.
-- **Save as default** also writes the choice to the configuration for later runs.
+- **Saved**: an applied choice is also written to the configuration — engine, model,
+  effort, and for `openai` the server and a key you entered — so later runs start with
+  it; flags still override.
 
 **Apply** starts the new engine first: if it cannot start (not signed in, server down,
-unknown model, a level the model refuses) the dialog says why and the current one stays.
+unknown model, a level the model refuses) the dialog says why and the current one (and
+the configuration) stays.
 It applies to the next chat, summary and flows turns; turns already running finish on
 their engine. A chat continued on another engine starts a new session there with the
 conversation so far.

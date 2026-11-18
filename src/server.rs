@@ -484,9 +484,6 @@ struct EngineRequest {
     /// Absent keeps the current key, empty removes it.
     #[serde(default)]
     openai_api_key: Option<String>,
-    /// Also make this the configured default for later runs.
-    #[serde(default)]
-    save: bool,
 }
 
 fn clean(value: Option<String>) -> Option<String> {
@@ -505,9 +502,10 @@ fn openai_opts(mut opts: EngineOpts, base_url: Option<String>, api_key: Option<S
     Ok(opts)
 }
 
-/// Switch the engine, model or effort for the next turns. A new engine starts first, so
-/// a failed switch leaves the current one in place; turns already running finish on
-/// the engine they started with.
+/// Switch the engine, model or effort for the next turns, and make it the configured
+/// default for later runs. A new engine starts first, so a failed switch leaves the
+/// current one (and the configuration) in place; turns already running finish on the
+/// engine they started with.
 async fn switch_engine(State(st): State<Arc<AppState>>, Json(req): Json<EngineRequest>) -> ApiResult {
     let _one_at_a_time = st.switching.lock().await;
     let current = st.engine();
@@ -528,23 +526,32 @@ async fn switch_engine(State(st): State<Arc<AppState>>, Json(req): Json<EngineRe
     if let Some(e) = &effort {
         engine.check_effort(e).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     }
-    if req.save {
-        let mut cfg = crate::config::load().map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?.unwrap_or_default();
-        cfg.engine = Some(req.kind);
-        cfg.model = model.clone();
-        cfg.effort = effort.clone();
-        if req.kind == EngineKind::OpenAi {
-            cfg.openai_base_url = Some(opts.openai_base_url.clone());
-            if req.openai_api_key.is_some() {
-                cfg.openai_api_key = opts.openai_api_key.clone();
-            }
-        }
-        crate::config::save(&cfg).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("switched, but not saved: {e}")))?;
-    }
-    *st.engine_opts.lock().unwrap() = opts;
+    *st.engine_opts.lock().unwrap() = opts.clone();
     *st.engine.lock().unwrap() = engine;
-    *st.effort.lock().unwrap() = effort;
-    Ok(Json(engine_json(&st)))
+    *st.effort.lock().unwrap() = effort.clone();
+    let saved = save_engine_choice(&req, model, effort, &opts);
+    let mut out = engine_json(&st);
+    match saved {
+        Ok(path) => out["saved"] = json!(path.display().to_string()),
+        Err(e) => out["save_error"] = json!(e),
+    }
+    Ok(Json(out))
+}
+
+/// Write an applied switch to the global configuration; other settings stay. The OpenAI
+/// key is written only when the request set it.
+fn save_engine_choice(req: &EngineRequest, model: Option<String>, effort: Option<String>, opts: &EngineOpts) -> Result<PathBuf, String> {
+    let mut cfg = crate::config::load()?.unwrap_or_default();
+    cfg.engine = Some(req.kind);
+    cfg.model = model;
+    cfg.effort = effort;
+    if req.kind == EngineKind::OpenAi {
+        cfg.openai_base_url = Some(opts.openai_base_url.clone());
+        if req.openai_api_key.is_some() {
+            cfg.openai_api_key = opts.openai_api_key.clone();
+        }
+    }
+    crate::config::save(&cfg)
 }
 
 #[derive(Deserialize)]
