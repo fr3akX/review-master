@@ -233,6 +233,24 @@ conversation so far.
 | `--update` | | install the latest release now (installer installs), then exit |
 | `--no-update` | | skip the check for a newer release (also `REVIEW_MASTER_NO_UPDATE=1`) |
 
+## Markdown files
+
+Changed Markdown files (`.md`, `.markdown`, `.mdx`, …) show **rendered** by default: the
+head version as GitHub-flavoured Markdown (tables, task lists, code with highlighting),
+with ```` ```mermaid ```` blocks drawn as diagrams. Blocks with added lines have a green
+bar, removed text sits in red where it was. Images come from the checkout, links to
+repository files open them, `#anchors` scroll to their heading. Raw HTML is sanitized
+(no scripts, event handlers, styles or forms).
+
+**Rendered / Diff** in the file header (or `m`) switches to the line diff and back; the
+choice is kept per file. Comments, selections and jumps live in the diff: a block's
+**Comment** button opens it with the block's lines selected, and jumping to a line, a
+finding or a flow step there switches by itself. The rendered view says when comments or
+drafts on the file wait in the diff.
+
+Mermaid (loaded only when a file has a diagram), marked and DOMPurify are embedded,
+so this works offline; licenses are in `web/vendor/`.
+
 ## Code navigation
 
 - ⌘/Ctrl-click an identifier (diff or file viewer): jump to its definition when the

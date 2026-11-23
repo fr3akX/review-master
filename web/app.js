@@ -62,6 +62,7 @@ const S = {
   composers: new Map(), // key → { key, path, akey, el, ta, inViewer }
   exiting: false, // the server was told to stop
   viewed: new Map(), // path → file sig it was marked viewed at (persisted per PR)
+  mdDiff: null, // Markdown paths the reviewer switched to the line diff (persisted per PR; rendered is the default)
   filter: '', // sidebar file filter
   remote: { threads: [], show: true, error: null }, // review comments already on the PR
   replies: new Map(), // thread root comment id → { el, ta }: reply boxes being written
@@ -1109,6 +1110,7 @@ function makeFileState(f) {
     html: COPY_ICON,
   });
   fs.head = h('div', { class: 'file-head' }, fs.fold, statusBadge(f.status), fileTitle(f), copy, counts(f), fs.staleTag, h('span', { class: 'spacer' }),
+    isMdFile(f) && mdToggle(fs),
     h('label', { class: 'pill-toggle viewed-toggle', title: 'Mark as viewed and collapse (v)' }, fs.viewedBox, 'Viewed'), full);
   fs.notes = makeNotes();
   fs.body = h('div', { class: 'file-body' }, h('div', { class: 'placeholder' }, 'Loading…'));
@@ -1205,9 +1207,10 @@ async function loadDiff(fs) {
   }
   fs.pane = makePane(fs.path, 'diff', diffTable(fs), fs.notes, fs.section);
   if (fs.file.status !== 'deleted') warmLsp(fs.path);
-  fs.body.replaceChildren(fs.pane.table);
+  if (!isRendered(fs)) fs.body.replaceChildren(fs.pane.table);
   renderAnnotations(fs.pane);
   if (fs.file.status !== 'deleted') attachFolds(fs.pane);
+  if (isRendered(fs)) await showFileBody(fs);
 }
 
 // ───────────── word-level diff inside changed lines ─────────────
@@ -1662,6 +1665,301 @@ function unfoldRow(pane, tr) {
   if (f && !f.open) setFold(pane, f.key, true);
 }
 
+// ───────────── rendered Markdown files ─────────────
+// Changed Markdown files show rendered by default: the HEAD version through marked
+// (GitHub-flavoured), sanitized by DOMPurify, ```mermaid blocks drawn by Mermaid
+// (loaded on first use). Blocks with added lines are marked, removed text sits where
+// it was. Rendered/Diff in the file header switches; the line diff is where comments,
+// selections and jumps happen, and those switch to it by themselves.
+
+const MD_FILE = /\.(md|markdown|mdown|mkd|mdx)$/i;
+const isMdFile = f => MD_FILE.test(f.path);
+const mdViewKey = () => `review-master:md-diff:${prId()}`;
+// Markdown files the reviewer switched to the line diff (rendered is the default).
+const mdDiffSet = () => (S.mdDiff ??= new Set(loadPref(mdViewKey(), [])));
+const isRendered = fs => !!fs.mdToggle && fs.mdView === 'rendered';
+
+function mdToggle(fs) {
+  const btn = (view, label, title) => h('button', {
+    class: 'btn small', type: 'button', 'data-view': view, title, onclick: () => setMdView(fs, view, true),
+  }, label);
+  fs.mdView = mdDiffSet().has(fs.path) ? 'diff' : 'rendered';
+  fs.mdToggle = h('span', { class: 'seg md-toggle', role: 'group', 'aria-label': 'Markdown view' },
+    btn('rendered', 'Rendered', 'Show the Markdown rendered'), btn('diff', 'Diff', 'Show the line diff (comments and selections happen there)'));
+  renderMdToggle(fs);
+  return fs.mdToggle;
+}
+
+function renderMdToggle(fs) {
+  for (const b of fs.mdToggle.children) {
+    const on = b.dataset.view === fs.mdView;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  }
+}
+
+// remember: the reviewer chose it (kept across reloads); jumps into the diff do not.
+async function setMdView(fs, view, remember = false) {
+  if (!fs.mdToggle) return;
+  fs.mdView = view;
+  if (remember) {
+    const set = mdDiffSet();
+    if (view === 'diff') set.add(fs.path);
+    else set.delete(fs.path);
+    savePref(mdViewKey(), [...set]);
+  }
+  renderMdToggle(fs);
+  if (fs.pane) await showFileBody(fs);
+}
+
+// Puts the file's current view (rendered Markdown or the diff table) in its body.
+async function showFileBody(fs) {
+  if (!isRendered(fs)) {
+    if (fs.pane.table.parentNode !== fs.body) fs.body.replaceChildren(fs.pane.table);
+    return;
+  }
+  if (!fs.md) {
+    try {
+      fs.md = await buildMdDoc(fs);
+    } catch (e) {
+      fs.md = { el: h('div', { class: 'load-error' }, `Cannot render this file: ${e.message} `,
+        h('button', { class: 'btn small', onclick: () => setMdView(fs, 'diff', true) }, 'Show diff')), note: null };
+    }
+  }
+  if (!isRendered(fs)) return; // switched while it rendered
+  fs.body.replaceChildren(fs.md.el);
+  renderMdNote(fs);
+  drawMermaid(fs.md.el);
+}
+
+// Rendered view: how many comments, drafts, findings and chats wait in the diff.
+function renderMdNote(fs) {
+  const note = fs.md && fs.md.note;
+  if (!note || !fs.pane) return;
+  let n = 0;
+  for (const b of fs.pane.boxes.values()) {
+    n += b.remote.childElementCount + b.findings.childElementCount + b.drafts.childElementCount + b.chips.childElementCount + b.composers.childElementCount;
+  }
+  note.hidden = !n;
+  note.replaceChildren(n === 1 ? 'A comment, draft or chat on this file is in the diff view. ' : `${n} comments, drafts or chats on this file are in the diff view. `,
+    h('button', { class: 'link-btn', onclick: () => setMdView(fs, 'diff', true) }, 'Show diff'));
+}
+
+// Removed lines of the diff, by the new-file line they followed (as the diff table counts).
+function removedRuns(diff) {
+  const runs = new Map();
+  for (const hk of diff.hunks || []) {
+    const m = /\+(\d+)/.exec(hk.header);
+    let last = m ? +m[1] - 1 : 0;
+    for (const l of hk.lines) {
+      if (l.k === 'del') {
+        if (!runs.has(last)) runs.set(last, []);
+        runs.get(last).push(l.text);
+      }
+      if (l.new != null) last = l.new;
+    }
+  }
+  return runs;
+}
+
+const MD_SANITIZE = { FORBID_TAGS: ['style', 'form', 'button', 'textarea', 'select'], FORBID_ATTR: ['style'] };
+
+// Markdown → blocks with their HEAD line ranges: [{ html, start, end }].
+function mdBlocks(text) {
+  const tokens = marked.lexer(text, { gfm: true });
+  const blocks = [];
+  let line = 1;
+  for (const tok of tokens) {
+    const start = line;
+    const raw = tok.raw || '';
+    line += (raw.match(/\n/g) || []).length;
+    if (tok.type === 'space') continue;
+    const end = start + (raw.replace(/\n+$/, '').match(/\n/g) || []).length;
+    const one = [tok];
+    one.links = tokens.links;
+    blocks.push({ html: marked.parser(one, { gfm: true }), start, end });
+  }
+  return blocks;
+}
+
+const mdHtml = text => marked.parse(text, { gfm: true, async: false });
+
+async function buildMdDoc(fs) {
+  if (!window.marked || !window.DOMPurify) throw new Error('the Markdown renderer did not load');
+  const runs = removedRuns(fs.diff);
+  const deleted = fs.file.status === 'deleted';
+  const parts = [];
+  const removedHtml = lines => `<div class="md-removed"><div class="md-removed-label">Removed</div>${mdHtml(lines.join('\n'))}</div>`;
+  if (deleted) {
+    parts.push(removedHtml([...runs.values()].flat()));
+  } else {
+    const src = await api('GET', `/api/source?path=${qpath(fs.path)}`, undefined, true);
+    const added = new Set(fs.file.status === 'added' ? [] : src.added || []);
+    const pending = [...runs.entries()].sort((a, b) => a[0] - b[0]);
+    const flushBefore = line => {
+      while (pending.length && pending[0][0] < line) parts.push(removedHtml(pending.shift()[1]));
+    };
+    for (const b of mdBlocks(src.text || '')) {
+      flushBefore(b.start);
+      let changed = false;
+      for (let l = b.start; l <= b.end && !changed; l++) changed = added.has(l);
+      parts.push(`<div class="md-block${changed ? ' md-changed' : ''}" data-start="${b.start}" data-end="${b.end}">${b.html}</div>`);
+    }
+    flushBefore(Infinity);
+  }
+  const doc = h('div', { class: 'md-doc', html: DOMPurify.sanitize(parts.join(''), MD_SANITIZE) });
+  finishMdDoc(fs, doc);
+  const note = h('div', { class: 'md-note', hidden: true });
+  return { el: h('div', { class: 'md-view' }, note, doc), note };
+}
+
+// A path relative to the Markdown file (or the repository root for "/…"), or null
+// for URLs and in-page anchors.
+function repoPath(base, ref) {
+  if (!ref || /^([a-z][a-z0-9+.-]*:|\/\/|#)/i.test(ref)) return null;
+  const clean = ref.split(/[?#]/)[0];
+  const parts = clean.startsWith('/') ? [] : base.split('/').slice(0, -1);
+  for (const seg of clean.split('/')) {
+    let s;
+    try {
+      s = decodeURIComponent(seg);
+    } catch {
+      s = seg;
+    }
+    if (s === '..') parts.pop();
+    else if (s && s !== '.') parts.push(s);
+  }
+  return parts.join('/') || null;
+}
+
+const mdSlug = text => text.trim().toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, '').replace(/\s/g, '-');
+
+// Code highlighting, Mermaid placeholders, repository images and links, heading anchors,
+// and Comment buttons on blocks the diff has lines of.
+function finishMdDoc(fs, doc) {
+  for (const code of doc.querySelectorAll('pre > code')) {
+    const lang = ((code.className.match(/language-([\w+#.-]+)/) || [])[1] || '').toLowerCase();
+    const pre = code.parentElement;
+    if (lang === 'mermaid') {
+      const box = h('div', { class: 'mermaid-box' });
+      box.dataset.src = code.textContent;
+      pre.replaceWith(box);
+    } else {
+      pre.classList.add('md-code');
+      code.innerHTML = hlCode(code.textContent, hlLang(lang));
+    }
+  }
+  for (const img of doc.querySelectorAll('img[src]')) {
+    const path = repoPath(fs.path, img.getAttribute('src'));
+    if (path) img.src = `/api/image?path=${qpath(path)}`;
+    img.loading = 'lazy';
+  }
+  for (const a of doc.querySelectorAll('a[href]')) {
+    const href = a.getAttribute('href');
+    const path = repoPath(fs.path, href);
+    if (path) {
+      a.className = 'code-ref';
+      a.dataset.path = path;
+      a.dataset.line = '1';
+      a.href = '#';
+    } else if (href.startsWith('#')) {
+      a.dataset.anchor = mdSlug(decodeURIComponent(href.slice(1)));
+    } else {
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+    }
+  }
+  for (const hd of doc.querySelectorAll('h1, h2, h3, h4, h5, h6')) hd.dataset.slug = mdSlug(hd.textContent);
+  doc.addEventListener('click', e => {
+    const a = e.target.closest('a[data-anchor]');
+    if (!a) return;
+    e.preventDefault();
+    const target = doc.querySelector(`[data-slug="${CSS.escape(a.dataset.anchor)}"]`);
+    if (target) target.scrollIntoView({ block: 'start' });
+  });
+  for (const block of doc.querySelectorAll('.md-block')) {
+    const lines = mdBlockRows(fs, block);
+    if (!lines.length) continue;
+    block.prepend(h('button', {
+      class: 'md-comment', type: 'button', title: 'Comment on or ask about these lines (in the diff)',
+      onclick: () => commentOnMdBlock(fs, block),
+    }, 'Comment'));
+  }
+}
+
+// HEAD lines of a block that the diff shows (only those can carry a comment).
+function mdBlockRows(fs, block) {
+  const lines = [];
+  for (let l = +block.dataset.start; l <= +block.dataset.end; l++) if (fs.pane.rows.has(`RIGHT:${l}`)) lines.push(l);
+  return lines;
+}
+
+// A block's Comment: the diff with its lines selected and the Comment/Ask popover open.
+async function commentOnMdBlock(fs, block) {
+  const lines = mdBlockRows(fs, block);
+  if (!lines.length) return;
+  await setMdView(fs, 'diff');
+  const from = lines[0];
+  const to = lines[lines.length - 1];
+  const tr = fs.pane.rows.get(`RIGHT:${to}`);
+  unfoldRow(fs.pane, tr);
+  setSel(fs.pane, 'RIGHT', from, to);
+  fs.pane.rows.get(`RIGHT:${from}`).scrollIntoView({ block: 'center' });
+  const gutter = tr.cells[1].getBoundingClientRect();
+  showPopover(tr.getBoundingClientRect().bottom, gutter.right + 8);
+}
+
+let mermaidLoad = null;
+let mermaidSeq = 0;
+
+function loadMermaid() {
+  mermaidLoad ??= new Promise((resolve, reject) => {
+    const s = h('script', { src: '/vendor/mermaid.js' });
+    s.onload = () => {
+      const dark = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches;
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default' });
+      resolve(mermaid);
+    };
+    s.onerror = () => {
+      mermaidLoad = null;
+      reject(new Error('Mermaid did not load'));
+    };
+    document.head.append(s);
+  });
+  return mermaidLoad;
+}
+
+// Draws the diagrams not drawn yet; a diagram that does not parse shows its error and source.
+async function drawMermaid(root) {
+  const boxes = [...root.querySelectorAll('.mermaid-box:not([data-drawn])')];
+  if (!boxes.length) return;
+  for (const box of boxes) box.dataset.drawn = 'pending';
+  let m;
+  try {
+    m = await loadMermaid();
+  } catch (e) {
+    for (const box of boxes) mermaidFailed(box, e.message);
+    return;
+  }
+  for (const box of boxes) {
+    const id = `mermaid-${++mermaidSeq}`;
+    try {
+      const { svg } = await m.render(id, box.dataset.src);
+      box.innerHTML = svg;
+      box.dataset.drawn = 'ok';
+    } catch (e) {
+      document.getElementById(`d${id}`)?.remove(); // Mermaid leaves its error diagram behind
+      mermaidFailed(box, (e && e.message) || String(e));
+    }
+  }
+}
+
+function mermaidFailed(box, message) {
+  box.dataset.drawn = 'error';
+  box.replaceChildren(h('div', { class: 'mermaid-error' }, `Mermaid: ${message.split('\n')[0]}`),
+    h('pre', { class: 'md-code' }, h('code', {}, box.dataset.src)));
+}
+
 // ───────────────────────────── file viewer ─────────────────────────────
 // Overlay with a whole HEAD file: a changed file (added-line tints, deleted-line
 // markers) or any other file of the checkout, e.g. one referenced by a chat answer.
@@ -1742,6 +2040,7 @@ function closeViewer() {
 async function jumpToDeleted(fs, after) {
   closeViewer();
   await ensureLoaded(fs);
+  if (isRendered(fs)) await setMdView(fs, 'diff');
   const p = fs.pane;
   const tr = p.table.querySelector(`tr.del[data-after="${after}"]`) ||
     [...p.rows.values()].find(r => r.dataset.new && +r.dataset.new > after);
@@ -1759,7 +2058,9 @@ async function anchorRow(fs, side, line) {
   closeViewer();
   if (fs.collapsed) setCollapsed(fs, false);
   await ensureLoaded(fs);
-  return { pane: fs.pane, tr: fs.pane.rows.get(key) || null };
+  const tr = fs.pane.rows.get(key) || null;
+  if (tr && isRendered(fs)) await setMdView(fs, 'diff'); // the line, its comments and selection live there
+  return { pane: fs.pane, tr };
 }
 
 // Scrolls to and flashes an anchor (lines line..end). New-side lines outside the
@@ -1843,6 +2144,7 @@ function renderAnnotations(pane) {
   }
   pane.notes.root.hidden = boxEmpty(pane.notes);
   refreshFolds(pane);
+  if (pane.kind === 'diff' && pane.fs) renderMdNote(pane.fs);
 }
 
 function renderAllAnnotations() {
@@ -3494,6 +3796,7 @@ async function walkPane(step) {
     }
     if (fs.pane.rows.has(`RIGHT:${step.line}`)) {
       closeViewer();
+      if (isRendered(fs)) await setMdView(fs, 'diff');
       return fs.pane;
     }
   }
@@ -3614,12 +3917,15 @@ function stepFile(dir) {
   jumpToFile(S.order[Math.max(0, Math.min(S.order.length - 1, i))]);
 }
 
-const isChange = tr => !!tr && tr.classList.contains('ln-row') && (tr.classList.contains('add') || tr.classList.contains('del'));
+// A changed diff row, or a changed/removed block of a rendered Markdown file.
+const isChange = el => !!el && ((el.classList.contains('ln-row') && (el.classList.contains('add') || el.classList.contains('del'))) ||
+  el.classList.contains('md-changed') || el.classList.contains('md-removed'));
 
-// Next/previous run of changed lines among the visible diff rows: continues from the
-// run it last landed on while that is still on screen, else from the top of the view.
+// Next/previous run of changes among the visible diff rows and rendered Markdown blocks:
+// continues from the run it last landed on while that is still on screen, else from the
+// top of the view.
 function stepChange(dir) {
-  const starts = [...$('#sections').querySelectorAll('tr.ln-row.add, tr.ln-row.del')]
+  const starts = [...$('#sections').querySelectorAll('tr.ln-row.add, tr.ln-row.del, .md-changed, .md-removed')]
     .filter(tr => tr.offsetParent !== null && !isChange(tr.previousElementSibling));
   const view = $('#main').getBoundingClientRect();
   const top = tr => tr.getBoundingClientRect().top;
@@ -3662,6 +3968,7 @@ function toggleHelp() {
         group('Review', [
           row(['v'], 'Mark the current file viewed (collapses it)'),
           row(['x'], 'Collapse or expand the current file'),
+          row(['m'], 'Markdown file: rendered / line diff'),
           row(['c'], 'Chat'),
           row(['r'], 'Review drawer: summary, drafts, submit'),
           row(['f'], 'LLM findings: import a review, list, restore'),
@@ -3708,6 +4015,7 @@ function onKeyDown(e) {
   else if (e.key === 'v' && inDiff && cur) setViewed(cur, !isViewed(cur));
   else if (e.key === 'x' && inDiff && cur) setCollapsed(cur, !cur.collapsed);
   else if (e.key === 'o' && inDiff && cur && cur.file.status !== 'deleted') openViewer(cur.path);
+  else if (e.key === 'm' && inDiff && cur && cur.mdToggle) setMdView(cur, isRendered(cur) ? 'diff' : 'rendered', true);
   else if (e.key === 'c') toggleDrawer('chat');
   else if (e.key === 'r') toggleDrawer('review');
   else if (e.key === 'f') toggleDrawer('findings');

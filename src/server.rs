@@ -378,6 +378,10 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/style.css", get(|| asset("text/css; charset=utf-8", include_str!("../web/style.css"))))
         .route("/vendor/highlight.js", get(|| asset("text/javascript; charset=utf-8", include_str!("../web/vendor/highlight.js"))))
         .route("/vendor/highlight.css", get(|| asset("text/css; charset=utf-8", include_str!("../web/vendor/highlight.css"))))
+        .route("/vendor/marked.js", get(|| asset("text/javascript; charset=utf-8", include_str!("../web/vendor/marked.js"))))
+        .route("/vendor/purify.js", get(|| asset("text/javascript; charset=utf-8", include_str!("../web/vendor/purify.js"))))
+        .route("/vendor/mermaid.js", get(mermaid_js))
+        .route("/api/image", get(image))
         .route("/api/info", get(info))
         .route("/api/diff", get(file_diff))
         .route("/api/source", get(source))
@@ -826,6 +830,55 @@ async fn source(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> 
         "deleted_after": deleted_after,
         "lang": lang(&q.path),
     })))
+}
+
+/// Mermaid (5.5 MB of JavaScript) is embedded gzip-compressed and sent as is; the UI
+/// loads it only when a Markdown file has a diagram.
+async fn mermaid_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CONTENT_ENCODING, "gzip"), (header::CACHE_CONTROL, "no-cache")],
+        include_bytes!("../web/vendor/mermaid.js.gz").as_slice(),
+    )
+        .into_response()
+}
+
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+fn image_type(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    })
+}
+
+/// An image from the checkout, for pictures in rendered Markdown. The sandbox keeps an
+/// SVG opened on its own from running script next to the UI.
+async fn image(State(st): State<Arc<AppState>>, Query(q): Query<PathQuery>) -> Result<Response, (StatusCode, Json<Value>)> {
+    let content_type = image_type(&q.path).ok_or_else(|| fail(StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("`{}` is not an image", q.path)))?;
+    let (full, shown) = verify::resolve(&st.root, &q.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let meta = fs::metadata(&full).map_err(|e| fail(StatusCode::NOT_FOUND, e.to_string()))?;
+    if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES {
+        return Err(fail(StatusCode::BAD_REQUEST, format!("{shown} is not an image file of at most 20 MiB")));
+    }
+    let bytes = fs::read(&full).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]

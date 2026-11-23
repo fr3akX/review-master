@@ -79,7 +79,8 @@ export function sum(list) {
 }
 JS
 printf 'from src.api.handler import handle\n\n\ndef test_missing_key():\n    assert handle({}, {})["status"] == 400\n' > tests/test_handler.py
-printf '# Demo\n\nA demo service.\n' > docs/guide.md
+printf '# Demo\n\nA demo service.\n\nThe cache never expires entries.\n' > docs/guide.md
+printf '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="teal"/></svg>\n' > docs/logo.svg
 for i in $(seq 1 60); do echo "line $i of the long file" >> src/long.txt; done
 git add -A && git commit -q -m base
 git checkout -q -b feature/ttl-cache
@@ -121,5 +122,28 @@ impl Ttl {
 }
 RS
 printf '\n\ndef test_not_found():\n    assert handle({"key": "x"}, {})["status"] == 404\n' >> tests/test_handler.py
-printf '\n## TTL\n\nEntries expire after a TTL.\n' >> docs/guide.md
+cat > docs/guide.md <<'MD'
+# Demo
+
+A demo service. See [the handler](../src/api/handler.py) and the [TTL section](#ttl).
+
+## TTL
+
+Entries expire after a TTL.
+
+| Setting | Default |
+| --- | --- |
+| `ttl` | 60 s |
+
+```mermaid
+flowchart LR
+  get --> fresh{fresh?}
+  fresh -->|yes| value
+  fresh -->|no| miss
+```
+
+![logo](logo.svg)
+
+<img src="x" onerror="window.__xss = 1"><script>window.__xss = 2</script>
+MD
 git add -A && git commit -q -m "ttl cache"

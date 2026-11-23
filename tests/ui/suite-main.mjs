@@ -41,6 +41,45 @@ export default async page => {
   check('outdated thread in notes', ttl && ttl.inNotes && ttl.outdated, JSON.stringify(ttl));
   await page.shot('top');
 
+  // ── Markdown renders by default: GFM, Mermaid, repository images, sanitized; Diff switches
+  await page.waitFor(() => document.querySelector('section.file .md-doc .md-block'));
+  const mdState = await q(() => {
+    const s = document.querySelector('section.file');
+    const d = s.querySelector('.md-doc');
+    const text = el => el.textContent.replace(/^Comment/, '').trim();
+    return {
+      path: s.querySelector('.file-head .path').textContent, view: s.querySelector('.md-toggle .btn.on').textContent, table: !!s.querySelector('.file-body table.code-table'),
+      h2: [...d.querySelectorAll('h2')].map(text), cells: [...d.querySelectorAll('td')].map(text),
+      changed: [...d.querySelectorAll('.md-changed')].map(text), removed: [...d.querySelectorAll('.md-removed')].map(text),
+      link: d.querySelector('a.code-ref') && d.querySelector('a.code-ref').dataset.path,
+      anchor: d.querySelector('a[data-anchor]') && d.querySelector('a[data-anchor]').dataset.anchor,
+      img: d.querySelector('img') && d.querySelector('img').getAttribute('src'),
+      unsafe: d.querySelectorAll('script, [onerror]').length, xss: window.__xss ?? null,
+    };
+  });
+  check('Markdown file rendered by default', mdState.path.includes('guide.md') && mdState.view === 'Rendered' && !mdState.table, JSON.stringify(mdState));
+  check('GFM heading and table', mdState.h2.includes('TTL') && mdState.cells.includes('60 s'), JSON.stringify(mdState));
+  check('added blocks marked, removed text shown', mdState.changed.some(t => t.startsWith('A demo service. See')) && mdState.removed.some(t => t.includes('The cache never expires entries.')), JSON.stringify(mdState));
+  check('repository links and anchors', mdState.link === 'src/api/handler.py' && mdState.anchor === 'ttl', JSON.stringify(mdState));
+  check('raw HTML sanitized', mdState.unsafe === 0 && mdState.xss === null, JSON.stringify(mdState));
+  check('images come from the checkout', mdState.img === '/api/image?path=docs%2Flogo.svg', mdState.img);
+  await page.waitFor(() => { const i = document.querySelector('.md-doc img'); return i && i.complete && i.naturalWidth === 40; }, 8000);
+  await page.waitFor(() => document.querySelector('.mermaid-box svg') || document.querySelector('.mermaid-error'), 20000);
+  check('Mermaid diagram drawn', await q(() => !!document.querySelector('.mermaid-box svg') && [...document.querySelectorAll('.mermaid-box svg text, .mermaid-box svg .nodeLabel')].some(t => t.textContent.includes('fresh?'))),
+    await q(() => (document.querySelector('.mermaid-box') || {}).textContent));
+  await page.shot('markdown');
+  await q(() => document.querySelector('.md-changed .md-comment').click());
+  await page.waitFor(() => document.querySelector('section.file .file-body table tr.sel'));
+  check('a block\'s Comment selects its lines in the diff', await q(() => {
+    const s = document.querySelector('section.file');
+    return s.querySelector('.md-toggle .btn.on').textContent === 'Diff' && [...s.querySelectorAll('tr.sel')].map(t => t.dataset.new).join() === '3' && !!document.querySelector('.popover:not([hidden])');
+  }), await q(() => [...document.querySelectorAll('tr.sel')].map(t => t.dataset.new).join()));
+  await page.key('Escape', { vk: 27 });
+  await q(() => [...document.querySelectorAll('section.file .md-toggle .btn')].find(b => b.textContent === 'Rendered').click());
+  await page.waitFor(() => document.querySelector('section.file .md-doc'));
+  await q(() => [...document.querySelectorAll('section.file .md-toggle .btn')].find(b => b.textContent === 'Diff').click());
+  check('Diff shows the line diff', await q(() => !!document.querySelector('section.file .file-body table.code-table') && !document.querySelector('section.file .md-doc')));
+
   // ── viewed via checkbox
   await page.clickSel('section.file .viewed-toggle input');
   let v = await q(() => ({ collapsed: document.querySelector('section.file').classList.contains('collapsed'), count: document.querySelector('#viewed-count').textContent, nav: document.querySelectorAll('#file-list li.viewed').length, bodyShown: !!document.querySelector('section.file .file-body').offsetParent }));
@@ -309,6 +348,7 @@ export default async page => {
   await q(() => { window.confirm = () => true; });
   const re = await q(() => ({ viewed: document.querySelector('#viewed-count').textContent, collapsed: document.querySelectorAll('section.file.collapsed').length, cur: document.querySelector('#file-list li.active .file-item').title }));
   check('reload keeps viewed + position', re.viewed === '1/8 viewed' && re.collapsed === 1 && re.cur === 'src/store/cache.rs', JSON.stringify(re));
+  check('reload keeps the Markdown file on Diff', await q(() => document.querySelector('section.file .md-toggle .btn.on').textContent === 'Diff'));
   await page.key('r');
   await page.waitFor(() => document.querySelector('.review-summary'));
   check('reload keeps review summary', await q(() => document.querySelector('.review-summary').value === 'Looks good overall.'));
