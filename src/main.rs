@@ -16,6 +16,7 @@ mod engine;
 mod findings;
 mod flows;
 mod gitlab;
+mod local;
 mod login;
 mod lsp;
 mod native;
@@ -45,8 +46,16 @@ struct Args {
     /// <project>!<number>, or a bare number against the checkout's origin) or a
     /// path to a checkout/worktree, whose branch resolves to its open request.
     /// Omitted: review the --repo worktree (its request if one exists, else its
-    /// diff against the default branch)
+    /// local changes against the default branch)
     target: Option<String>,
+    /// Review the worktree's local changes even when its branch has an open request:
+    /// commits since the default branch, staged and unstaged edits, untracked files
+    #[arg(long)]
+    local: bool,
+    /// Base of a local review (implies --local): a branch, tag or commit; `HEAD`
+    /// reviews only what is not committed yet (default: the default branch)
+    #[arg(long, value_name = "REF")]
+    base: Option<String>,
     /// Where the checkout's origin is hosted, when its name does not say (a
     /// self-hosted GitLab the GitLab CLI is not logged in to)
     #[arg(long, value_enum)]
@@ -147,16 +156,6 @@ fn parse_lsp(raw: &str) -> Result<(String, String), String> {
     Ok((lang, cmd.trim().to_owned()))
 }
 
-/// Drop `--exclude`d files from the model, in place.
-fn apply_excludes(model: &mut diff::Model, exclude: &[String]) -> Result<Vec<String>, String> {
-    let mut set = globset::GlobSetBuilder::new();
-    for glob in exclude {
-        set.add(globset::Glob::new(glob).map_err(|e| format!("--exclude {glob}: {e}"))?);
-    }
-    let set = set.build().map_err(|e| e.to_string())?;
-    Ok(model.retain(|f| !set.is_match(&f.path)))
-}
-
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let opener = "open";
@@ -173,34 +172,41 @@ fn open_browser(url: &str) {
 struct Change {
     /// `Some` in PR mode.
     pr: Option<(pr::PrRef, pr::PrMeta)>,
+    /// `Some` in local mode: what to re-read when the reviewer asks.
+    local: Option<local::Source>,
     /// Directory the agent works in (worktree or the repo itself).
     root: PathBuf,
-    head_sha: String,
     branch: String,
-    dirty: bool,
-    model: diff::Model,
-    skipped: Vec<String>,
+    snapshot: server::Snapshot,
     /// Keeps a temporary worktree alive (and removes it on drop).
     _checkout: Option<pr::Checkout>,
 }
 
-fn acquire(pr_arg: Option<&str>, forced: Option<pr::Forge>, exclude: &[String], repo: &repo::Repo) -> Result<Change, String> {
+/// `local`: review the worktree itself (`--local` / `--base`), even when its branch
+/// has an open request.
+fn acquire(pr_arg: Option<&str>, forced: Option<pr::Forge>, exclude: &[String], repo: &repo::Repo, local: Option<Option<String>>) -> Result<Change, String> {
+    if let (Some(_), Some(raw)) = (&local, pr_arg) {
+        return Err(format!("--local/--base review the worktree; `{raw}` is a request (give a checkout path, or drop it)"));
+    }
     let origin = pr::origin(&repo.root, forced);
     // Nothing given: resolve the open request for this checkout, if any.
-    let resolved = pr_arg.map(str::to_owned).or_else(|| pr::resolve_pr(&repo.root, origin.as_ref()?));
+    let resolved = if local.is_some() { None } else { pr_arg.map(str::to_owned).or_else(|| pr::resolve_pr(&repo.root, origin.as_ref()?)) };
     let Some(raw) = resolved else {
-        // Local mode: the worktree's change against the default branch.
-        let local = pr::local_change(&repo.root)?;
-        let mut model = diff::Model::parse(&local.diff_text);
-        let skipped = apply_excludes(&mut model, exclude)?;
+        // Local mode: the worktree's change against its base.
+        let source = local::Source { base: local.flatten(), exclude: exclude.to_vec() };
+        let change = source.read(&repo.root)?;
+        let untracked = if change.untracked_left_out > 0 { format!("; {} more untracked files left out", change.untracked_left_out) } else { String::new() };
+        let against = if change.base == "HEAD" { "uncommitted changes".to_owned() } else { format!("against {}", change.base) };
+        println!("review-master: local review of `{}` ({against}), {} files{untracked}", change.branch, change.model.files.len());
+        if !change.skipped.is_empty() {
+            eprintln!("  excluded from the reviewed diff: {}", change.skipped.join(", "));
+        }
         return Ok(Change {
             pr: None,
+            local: Some(source),
             root: repo.root.clone(),
-            head_sha: local.head,
-            branch: local.branch,
-            dirty: local.dirty,
-            model,
-            skipped,
+            branch: change.branch.clone(),
+            snapshot: server::Snapshot::local(change),
             _checkout: None,
         });
     };
@@ -217,7 +223,7 @@ fn acquire(pr_arg: Option<&str>, forced: Option<pr::Forge>, exclude: &[String], 
         eprintln!("note: this {} is {state}; reviews can still be posted", pref.forge.noun());
     }
     let mut model = diff::Model::parse(&pr::diff(&pref)?);
-    let skipped = apply_excludes(&mut model, exclude)?;
+    let skipped = diff::apply_excludes(&mut model, exclude)?;
     if !skipped.is_empty() {
         eprintln!("  excluded from the reviewed diff: {}", skipped.join(", "));
     }
@@ -225,12 +231,10 @@ fn acquire(pr_arg: Option<&str>, forced: Option<pr::Forge>, exclude: &[String], 
     let branch = meta.head_ref.clone();
     Ok(Change {
         pr: Some((pref, meta)),
+        local: None,
         root: checkout.root.clone(),
-        head_sha: sha,
         branch,
-        dirty: false,
-        model,
-        skipped,
+        snapshot: server::Snapshot::request(sha, model, skipped),
         _checkout: Some(checkout),
     })
 }
@@ -295,8 +299,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         other => (args.repo.clone(), other.map(str::to_owned)),
     };
     let repo = repo::Repo::open(&repo_path)?;
-    let change = acquire(pr_arg.as_deref(), args.forge, &args.exclude, &repo)?;
-    if change.model.files.is_empty() {
+    let local = (args.local || args.base.is_some()).then(|| args.base.clone());
+    let change = acquire(pr_arg.as_deref(), args.forge, &args.exclude, &repo, local)?;
+    if change.snapshot.full.files.is_empty() {
         return Err("nothing to review: the diff is empty after exclusions".into());
     }
     let reviews: Vec<(String, String)> = args
@@ -348,17 +353,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (lang, cmd) in servers {
         println!("  language server: {lang} = {cmd}");
     }
-    for (lang, hint) in lsp.missing_for(change.model.files.iter().map(|f| f.path.as_str())) {
+    for (lang, hint) in lsp.missing_for(change.snapshot.full.files.iter().map(|f| f.path.as_str())) {
         println!("  language server: {lang} not found, its files use text search; install: {hint}");
     }
     let state = server::AppState::new(
         change.root.clone(),
         change.pr.clone(),
-        change.head_sha.clone(),
         change.branch.clone(),
-        change.dirty,
-        change.model,
-        change.skipped,
+        change.snapshot,
+        change.local,
         server::EngineSetup { engine, effort: choice.effort, opts, cache_dir: cache_dir.clone() },
         viewer,
         cache_dir.join(format!("drafts-{draft_key}.json")),

@@ -70,7 +70,7 @@ const S = {
   help: null, // open shortcuts dialog
   drawer: null, // 'chat' | 'review' | null
   chat: { threadId: null, anchor: null, snippet: null, thread: null, jobs: new Map(), stopId: null }, // jobs: threadId → ChatJob; stopId: job the send button would stop
-  review: { body: '', event: 'comment', submitting: false, list: null },
+  review: { body: '', event: 'comment', submitting: false, list: null, saved: null }, // saved: Markdown of the last saved local review
 };
 
 // ───────────────────────────── small helpers ─────────────────────────────
@@ -383,14 +383,40 @@ function renderHeader() {
     );
     document.title = `${pr.number_label} ${pr.title} · review-master`;
   } else {
+    const { base, dirty } = S.info;
     title.replaceChildren(h('span', {}, `Local review · ${branch}`));
     meta.replaceChildren(
       h('span', { class: 'state state-local' }, mode),
-      h('span', {}, h('code', {}, branch), ' @ ', h('code', {}, String(head || '').slice(0, 10))),
+      h('span', {}, h('code', {}, branch), ' @ ', h('code', {}, String(head || '').slice(0, 10)),
+        base === 'HEAD' ? ' · uncommitted changes' : [' against ', h('code', {}, base || 'the default branch'), dirty ? ' + uncommitted' : '']),
+      h('button', {
+        id: 'btn-reload', class: 'btn small', type: 'button', title: 'Re-read the local changes after editing files (drafts and chats stay)',
+        onclick: e => reloadChanges(e.currentTarget),
+      }, 'Reload changes'),
     );
     document.title = `${branch} · review-master`;
   }
   renderEngineChip();
+}
+
+// Local review: the server re-reads the worktree; the page reloads to show what changed.
+async function reloadChanges(btn) {
+  if (unsavedText() && !confirm('Reloading shows the new changes; comment text you have not saved as a draft will be lost. Reload?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Reading…';
+  let r;
+  try {
+    r = await post('/api/refresh');
+  } catch {
+    r = null;
+  }
+  if (r && r.changed) {
+    location.reload();
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Reload changes';
+  if (r) toast('No changes since the last read', 'info', 3000);
 }
 
 // ───────────── engine dialog ─────────────
@@ -704,9 +730,18 @@ async function applyEngine() {
 
 function submittedNode() {
   const url = S.info.submitted;
+  const local = S.info.mode === 'local';
   return h('div', { class: 'banner ok' },
-    h('strong', {}, 'Review submitted'), ' — ',
-    /^https?:\/\//.test(url) ? h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url) : url);
+    h('strong', {}, local ? 'Review saved' : 'Review submitted'), ' — ',
+    /^https?:\/\//.test(url) ? h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url) : h('code', {}, url),
+    local && ' ',
+    local && h('button', { class: 'link-btn', onclick: () => copyText(url, 'the path') }, 'Copy path'),
+    local && S.review.saved && ' · ',
+    local && S.review.saved && h('button', { class: 'link-btn', onclick: () => copyText(S.review.saved, 'the review') }, 'Copy Markdown'));
+}
+
+function copyText(text, what) {
+  navigator.clipboard.writeText(text).then(() => toast(`Copied ${what}`, 'ok', 2000), () => toast(`Could not copy ${what}`, 'warn'));
 }
 
 function renderBanner() {
@@ -1943,13 +1978,18 @@ async function drawMermaid(root) {
   }
   for (const box of boxes) {
     const id = `mermaid-${++mermaidSeq}`;
+    // Mermaid lays the diagram out in a scratch element; keep it off screen, not at the
+    // bottom of the page.
+    const scratch = h('div', { class: 'mermaid-scratch', 'aria-hidden': 'true' });
+    document.body.append(scratch);
     try {
-      const { svg } = await m.render(id, box.dataset.src);
+      const { svg } = await m.render(id, box.dataset.src, scratch);
       box.innerHTML = svg;
       box.dataset.drawn = 'ok';
     } catch (e) {
-      document.getElementById(`d${id}`)?.remove(); // Mermaid leaves its error diagram behind
       mermaidFailed(box, (e && e.message) || String(e));
+    } finally {
+      scratch.remove(); // with the error diagram Mermaid leaves behind on a failure
     }
   }
 }
@@ -3441,21 +3481,22 @@ function renderReview() {
   });
 
   rv.list = h('div', { class: 'review-drafts' });
-  const submit = h('button', { class: 'btn primary', disabled: local || rv.submitting, onclick: () => submitReview() },
-    rv.submitting ? 'Submitting…' : 'Submit review');
+  const submit = h('button', { class: 'btn primary', disabled: rv.submitting, onclick: () => submitReview() },
+    rv.submitting ? (local ? 'Saving…' : 'Submitting…') : local ? 'Save review' : 'Submit review');
   const submitExit = h('button', {
-    class: 'btn', disabled: local || rv.submitting, title: 'Submit, then stop review-master and close this tab',
+    class: 'btn', disabled: rv.submitting,
+    title: local ? 'Save the review, then stop review-master and close this tab' : 'Submit, then stop review-master and close this tab',
     onclick: () => submitReview(true),
-  }, 'Submit & exit');
+  }, local ? 'Save & exit' : 'Submit & exit');
   const unviewed = S.order.filter(fs => !isViewed(fs)).length;
 
   $('#review-body').replaceChildren(...[
     info.submitted && submittedNode(),
-    local && h('div', { class: 'banner info' }, 'Local mode: this worktree has no known pull or merge request, so submitting is disabled. Chat and drafts still work.'),
+    local && h('div', { class: 'banner info' }, 'Local review: Save review writes the summary and your drafts to a Markdown file — a "### [severity] title (path:line)" section per comment, the shape --findings imports — for you or a coding agent to act on. Reload changes (header) re-reads the worktree after you edit.'),
     h('label', { class: 'field-label' }, 'Summary'),
     summary,
-    h('div', { class: 'field-label' }, 'Event'),
-    h('div', { class: 'radios' }, radios),
+    !local && h('div', { class: 'field-label' }, 'Event'),
+    !local && h('div', { class: 'radios' }, radios),
     own && !local && !gitlab && h('div', { class: 'hint' }, `You authored this ${noun}; GitHub only allows comment reviews on your own PR.`),
     gitlab && !local && h('div', { class: 'hint' }, 'GitLab: the comments are published as one review; Approve then approves the merge request. Request changes is not available through GitLab\'s API.'),
     rv.list,
@@ -3493,7 +3534,9 @@ async function submitReview(andExit = false) {
   const ev = EVENTS.find(e => e.value === S.review.event);
   const n = S.drafts.filter(d => !S.excluded.has(d.path)).length;
   const then = andExit ? ', then stop review-master' : '';
-  if (!confirm(`Submit review as "${ev.label}" with ${plural(n, 'draft comment')}${then}?`)) return;
+  const local = S.info.mode === 'local';
+  const ask = local ? `Save the review with ${plural(n, 'draft comment')} as Markdown${then}?` : `Submit review as "${ev.label}" with ${plural(n, 'draft comment')}${then}?`;
+  if (!confirm(ask)) return;
   S.review.submitting = true;
   renderReview();
   let submitted = false;
@@ -3503,11 +3546,12 @@ async function submitReview(andExit = false) {
     submitted = true;
     warning = r.warning || null;
     if (warning) toast(warning, 'warn', 15000);
-    S.info.submitted = r.url;
+    S.info.submitted = local ? r.path : r.url;
+    S.review.saved = local ? r.markdown : null;
     S.review.body = '';
     saveReviewForm();
     renderBanner();
-    toast('Review submitted', 'ok');
+    toast(local ? `Review saved to ${r.path}` : 'Review submitted', 'ok', local ? 8000 : 6000);
     if (!andExit) {
       refreshDrafts().catch(() => {});
       loadRemote(true); // the comments just posted now live on the PR/MR

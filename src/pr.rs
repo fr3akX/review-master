@@ -525,37 +525,6 @@ pub fn resolve_pr(root: &Path, origin: &Remote) -> Option<String> {
     Some(mark(n))
 }
 
-/// A worktree reviewed without a request: its diff against the merge base with the
-/// default branch, including uncommitted edits.
-pub struct LocalChange {
-    pub diff_text: String,
-    pub head: String,
-    pub branch: String,
-    pub dirty: bool,
-}
-
-pub fn local_change(root: &Path) -> Result<LocalChange, String> {
-    let head = run_git(root, &["rev-parse", "HEAD"]).map_err(|_| format!("{} is not a git checkout", root.display()))?;
-    let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "detached".to_owned());
-    let default = ["refs/remotes/origin/HEAD", "origin/main", "origin/master", "main", "master"]
-        .iter()
-        .find_map(|r| run_git(root, &["rev-parse", "--verify", "--quiet", r]).ok())
-        .ok_or("cannot find the default branch (origin/HEAD, main or master); review a pull/merge request instead")?;
-    let base = run_git(root, &["merge-base", &default, "HEAD"])?;
-    if base == head {
-        let dirty = !run_git(root, &["status", "--porcelain"]).unwrap_or_default().is_empty();
-        if !dirty {
-            return Err("the worktree has no change against the default branch".into());
-        }
-    }
-    let diff_text = run_git(root, &["diff", "-M", &base])?;
-    if diff_text.trim().is_empty() {
-        return Err("the worktree has no change against the default branch".into());
-    }
-    let dirty = !run_git(root, &["status", "--porcelain"]).unwrap_or_default().is_empty();
-    Ok(LocalChange { diff_text, head, branch, dirty })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

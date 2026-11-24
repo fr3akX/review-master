@@ -122,8 +122,8 @@ archives, checksums and `review-master-installer.sh`. After changing
 1. Resolves the request (URL, `owner/repo#N`, `project!N`, or a bare number
    against the checkout's `origin`) and fetches metadata plus the unified diff
    through `gh` (GitHub) or `glab` (GitLab) — your CLI login is the only auth.
-   Without a request, the worktree's change against its merge base with the
-   default branch is shown (browse/chat/draft; submitting needs the request).
+   Without a request (or with `--local` / `--base`), the worktree's local changes are
+   reviewed instead; see [Local changes](#local-changes).
 2. Fetches `pull/N/head` (GitHub) or `merge-requests/N/head` (GitLab) into a
    detached temporary worktree (removed on exit), from whichever remote of the
    checkout points at the project (`origin`, or e.g. `upstream` in a fork); a
@@ -144,6 +144,30 @@ archives, checksums and `review-master-installer.sh`. After changing
    then the temporary worktree is removed. Browsers only let a page close tabs a
    script opened, so the tab the terminal opened stays, saying review-master
    stopped.
+
+## Local changes
+
+Review what is on your disk before there is a request — your own work, or what a
+coding agent just changed:
+
+```sh
+review-master --local             # everything not on the default branch: commits, staged and unstaged edits, untracked files
+review-master --base HEAD         # only what is not committed yet
+review-master --base release/2.4  # against another branch, tag or commit (its merge base with HEAD)
+```
+
+Without a request for the branch, plain `review-master` does the same as `--local`.
+Untracked files come in as new files (`.gitignore` respected; at most 200).
+
+- **Reload changes** in the header re-reads the worktree after you (or an agent) edited
+  it. Drafts, chats and exclusions stay; the summary and flows are regenerated when the
+  change differs.
+- **Save review** in the review drawer writes the summary and the drafts to
+  `<cache dir>/review-<branch>.md`. Each comment is a
+  `### [severity] title (path:line)` section, the shape `--findings` imports and the
+  agent skill writes, so you can hand the file to an agent ("fix what
+  `.review-master/review-my-branch.md` says") or open it in a later review. Saved
+  drafts are done, like submitted ones; the drawer can copy the path or the Markdown.
 
 ## Requirements
 
@@ -211,6 +235,8 @@ conversation so far.
 | Flag | Default | |
 | --- | --- | --- |
 | `PR` | | URL, `owner/repo#N`, `project!N`, `#N`/`!N`, or `N`; omitted = review the worktree |
+| `--local` | | review the worktree's local changes even when its branch has an open request |
+| `--base REF` | default branch | base of a local review (implies `--local`); `HEAD` = uncommitted changes only |
 | `--forge` | from the origin | `github` \| `gitlab`, for an origin whose host name does not say and that `glab` is not logged in to |
 | `--repo DIR` | `.` | local checkout of the repository |
 | `--engine` | configured, else `codex` | `codex` \| `claude` \| `anthropic` \| `openai` |

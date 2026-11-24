@@ -7,7 +7,7 @@ use crate::engine::{self, Engine, EngineOpts, Kind as EngineKind};
 use crate::lsp::Lsp;
 use crate::pr::{PrMeta, PrRef};
 use crate::review::{self, Finding};
-use crate::{findings, flows, login, post, search, verify};
+use crate::{findings, flows, local, login, post, search, verify};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
@@ -32,13 +32,11 @@ pub struct AppState {
     pub root: PathBuf,
     /// `Some` in PR mode; `None` when reviewing a bare worktree.
     pub pr: Option<(PrRef, PrMeta)>,
-    pub head_sha: String,
     pub branch: String,
-    pub dirty: bool,
-    /// The whole change (after command-line excludes); the scope filters it.
-    full: Model,
-    /// Files dropped on the command line, for the chat prompt note.
-    cli_skipped: Vec<String>,
+    /// The change under review; a local review re-reads it (`POST /api/refresh`).
+    change: RwLock<Arc<Snapshot>>,
+    /// `Some` in local mode: what the change is read from.
+    local: Option<local::Source>,
     /// What this review currently covers (runtime exclusions applied).
     scope: Mutex<Scope>,
     scope_file: PathBuf,
@@ -101,16 +99,40 @@ pub struct EngineSetup {
     pub cache_dir: PathBuf,
 }
 
+/// The change a review covers at one point in time.
+pub struct Snapshot {
+    pub head_sha: String,
+    /// Local review: uncommitted edits or untracked files are part of it.
+    pub dirty: bool,
+    /// The whole change (after command-line excludes); the scope filters it.
+    pub full: Model,
+    /// Files dropped on the command line, for the chat prompt note.
+    pub cli_skipped: Vec<String>,
+    /// Local review: what it is diffed against (`HEAD`: uncommitted changes only).
+    pub base: Option<String>,
+    /// Identifies the content, for the cached summary and flows: the head commit, plus
+    /// the diff's fingerprint for local changes (edits do not move the head).
+    pub key: String,
+}
+
+impl Snapshot {
+    pub fn request(head_sha: String, full: Model, cli_skipped: Vec<String>) -> Snapshot {
+        Snapshot { key: head_sha.clone(), head_sha, dirty: false, full, cli_skipped, base: None }
+    }
+
+    pub fn local(c: local::LocalChange) -> Snapshot {
+        Snapshot { head_sha: c.head, dirty: c.dirty, full: c.model, cli_skipped: c.skipped, base: Some(c.base), key: c.key }
+    }
+}
+
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         root: PathBuf,
         pr: Option<(PrRef, PrMeta)>,
-        head_sha: String,
         branch: String,
-        dirty: bool,
-        model: Model,
-        skipped: Vec<String>,
+        change: Snapshot,
+        local: Option<local::Source>,
         engine: EngineSetup,
         viewer: Option<String>,
         drafts_file: PathBuf,
@@ -122,26 +144,24 @@ impl AppState {
         lsp: Lsp,
     ) -> Arc<AppState> {
         let stored: StoredScope = fs::read(&scope_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let excluded: Vec<String> = stored.excluded.into_iter().filter(|p| model.file(p).is_some()).collect();
-        let scope = build_scope(&model, excluded);
+        let excluded: Vec<String> = stored.excluded.into_iter().filter(|p| change.full.file(p).is_some()).collect();
+        let scope = build_scope(&change.full, excluded);
         let summary_text = fs::read(&summary_file)
             .ok()
             .and_then(|b| serde_json::from_slice::<StoredSummary>(&b).ok())
-            .filter(|s| s.head == head_sha)
+            .filter(|s| s.head == change.key)
             .map(|s| s.summary);
         let stored_flows = fs::read(&flows_file)
             .ok()
             .and_then(|b| serde_json::from_slice::<StoredFlows>(&b).ok())
-            .filter(|s| s.head == head_sha && s.version == flows::VERSION)
+            .filter(|s| s.head == change.key && s.version == flows::VERSION)
             .map(|s| s.flows);
         Arc::new(AppState {
             root,
             pr,
-            head_sha,
             branch,
-            dirty,
-            full: model,
-            cli_skipped: skipped,
+            change: RwLock::new(Arc::new(change)),
+            local,
             scope: Mutex::new(scope),
             scope_file,
             summary: Mutex::new(SummaryState { text: summary_text, job: None }),
@@ -166,10 +186,16 @@ impl AppState {
         })
     }
 
+    /// The change as it stands.
+    fn change(&self) -> Arc<Snapshot> {
+        self.change.read().unwrap().clone()
+    }
+
     fn subject(&self) -> review::Subject {
+        let c = self.change();
         match &self.pr {
-            Some((r, m)) => review::Subject::pr(r, m, &self.head_sha),
-            None => review::Subject::local(&self.branch, &self.head_sha, self.dirty),
+            Some((r, m)) => review::Subject::pr(r, m, &c.head_sha),
+            None => review::Subject::local(&self.branch, &c.head_sha, c.dirty, c.base.as_deref().unwrap_or("the default branch")),
         }
     }
 
@@ -185,7 +211,7 @@ impl AppState {
     /// Import an LLM review (Markdown) as findings, replacing an earlier import of the same name.
     pub fn import_findings(&self, name: &str, text: &str) -> findings::Imported {
         let mut store = self.findings.lock().unwrap();
-        let imported = store.import(name, text, &self.root, &self.full);
+        let imported = store.import(name, text, &self.root, &self.change().full);
         store.save();
         imported
     }
@@ -200,7 +226,7 @@ impl AppState {
 
     /// Everything not in this review, for the chat prompt.
     fn out_of_scope(&self, scope: &Scope) -> Vec<String> {
-        self.cli_skipped.iter().chain(scope.excluded.iter()).cloned().collect()
+        self.change().cli_skipped.iter().chain(scope.excluded.iter()).cloned().collect()
     }
 
     fn save_scope(&self, excluded: &[String]) {
@@ -397,6 +423,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/draft/{id}", delete(delete_draft))
         .route("/api/drafts", get(drafts))
         .route("/api/submit", post_to(submit))
+        .route("/api/refresh", post_to(refresh))
         .route("/api/scope", post_to(set_scope))
         .route("/api/summary", get(get_summary).post(regenerate_summary))
         .route("/api/flows", get(get_flows).post(generate_flows))
@@ -654,16 +681,18 @@ async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
             "base_ref": m.base_ref, "head_ref": m.head_ref,
         })
     });
+    let change = st.change();
     Json(json!({
         "mode": if st.pr.is_some() { "pr" } else { "local" },
         "pr": pr,
-        "head": st.head_sha,
+        "head": change.head_sha,
         "branch": st.branch,
-        "dirty": st.dirty,
+        "dirty": change.dirty,
+        "base": change.base,
         "engine": engine_json(&st),
         "viewer": st.viewer,
         "files": files,
-        "skipped": st.cli_skipped,
+        "skipped": change.cli_skipped,
         "excluded": excluded,
         "submitted": *st.submitted.lock().unwrap(),
     }))
@@ -1323,7 +1352,7 @@ struct SubmitRequest {
 
 async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>) -> ApiResult {
     let Some((pref, meta)) = &st.pr else {
-        return Err(fail(StatusCode::BAD_REQUEST, "no pull/merge request: reviewing a local worktree; give it on the command line to submit"));
+        return save_local_review(&st, &req.body);
     };
     let event = match req.event.as_str() {
         "comment" => post::Event::Comment,
@@ -1367,7 +1396,7 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
     if inline.is_empty() && fallback.is_empty() && empty {
         return Err(fail(StatusCode::BAD_REQUEST, format!("nothing to submit: {excluded_drafts} draft(s) sit on files excluded from this review")));
     }
-    let (pref, meta, head, body) = (pref.clone(), meta.clone(), st.head_sha.clone(), req.body.clone());
+    let (pref, meta, head, body) = (pref.clone(), meta.clone(), st.change().head_sha.clone(), req.body.clone());
     let (url, warning) = tokio::task::spawn_blocking(move || post::submit(&pref, &meta, &model, &head, event, &body, &inline, &fallback))
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -1383,6 +1412,37 @@ async fn submit(State(st): State<Arc<AppState>>, Json(req): Json<SubmitRequest>)
     Ok(Json(json!({ "url": url, "not_submitted": excluded_drafts, "warning": warning })))
 }
 
+/// A local review has nowhere to post: its drafts (in scope) and summary are written as
+/// Markdown into the cache directory, in the shape `--findings` imports, and returned for
+/// copying. Saved drafts are done, like submitted ones.
+fn save_local_review(st: &AppState, summary: &str) -> ApiResult {
+    let mut items: Vec<Draft> = {
+        let scope = st.scope.lock().unwrap();
+        st.drafts.lock().unwrap().items.iter().filter(|d| scope.model.file(&d.path).is_some()).cloned().collect()
+    };
+    if items.is_empty() && summary.trim().is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "nothing to save: no drafts and no summary"));
+    }
+    items.sort_by(|a, b| (&a.path, a.start.unwrap_or(a.line), a.line).cmp(&(&b.path, b.start.unwrap_or(b.line), b.line)));
+    let comments: Vec<local::Comment> = items
+        .iter()
+        .map(|d| local::Comment { path: &d.path, start: d.start, line: d.line, left: d.side == "LEFT", severity: &d.severity, body: &d.body })
+        .collect();
+    let change = st.change();
+    let markdown = local::markdown(&st.branch, change.base.as_deref().unwrap_or("the default branch"), &change.head_sha, summary, &comments);
+    let file = st.cache_dir.join(format!("review-{}.md", st.branch.replace(['/', '\\'], "-")));
+    fs::write(&file, &markdown).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write {}: {e}", file.display())))?;
+    let path = file.display().to_string();
+    *st.submitted.lock().unwrap() = Some(path.clone());
+    {
+        let mut drafts = st.drafts.lock().unwrap();
+        let scope = st.scope.lock().unwrap();
+        drafts.items.retain(|d| scope.model.file(&d.path).is_none());
+        drafts.save();
+    }
+    Ok(Json(json!({ "path": path, "markdown": markdown, "comments": items.len() })))
+}
+
 #[derive(Deserialize)]
 struct ScopeRequest {
     excluded: Vec<String>,
@@ -1390,17 +1450,48 @@ struct ScopeRequest {
 
 /// Replace the set of files excluded from this review; persisted across restarts.
 async fn set_scope(State(st): State<Arc<AppState>>, Json(req): Json<ScopeRequest>) -> ApiResult {
-    let mut excluded: Vec<String> = req.excluded.into_iter().filter(|p| st.full.file(p).is_some()).collect();
+    let change = st.change();
+    let mut excluded: Vec<String> = req.excluded.into_iter().filter(|p| change.full.file(p).is_some()).collect();
     excluded.sort();
     excluded.dedup();
-    if excluded.len() == st.full.files.len() {
+    if excluded.len() == change.full.files.len() {
         return Err(fail(StatusCode::BAD_REQUEST, "cannot exclude every file in the review"));
     }
-    let scope = build_scope(&st.full, excluded);
+    let scope = build_scope(&change.full, excluded);
     st.save_scope(&scope.excluded);
-    let response = json!({ "files": files_json(&scope.model), "skipped": st.cli_skipped, "excluded": scope.excluded });
+    let response = json!({ "files": files_json(&scope.model), "skipped": change.cli_skipped, "excluded": scope.excluded });
     *st.scope.lock().unwrap() = scope;
     Ok(Json(response))
+}
+
+/// Re-read a local review's change (the reviewer kept editing). Drafts, chats and
+/// exclusions stay; the summary and flows are dropped when the change differs.
+async fn refresh(State(st): State<Arc<AppState>>) -> ApiResult {
+    let source = st.local.clone().ok_or_else(|| fail(StatusCode::BAD_REQUEST, "only a local review re-reads its change; a request's head is fixed"))?;
+    let root = st.root.clone();
+    let read = tokio::task::spawn_blocking(move || source.read(&root)).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let change = read.map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    if change.model.files.is_empty() {
+        return Err(fail(StatusCode::CONFLICT, "nothing to review: the diff is empty after exclusions"));
+    }
+    if change.key == st.change().key {
+        return Ok(Json(json!({ "changed": false })));
+    }
+    let snapshot = Snapshot::local(change);
+    let files = snapshot.full.files.len();
+    {
+        let mut scope = st.scope.lock().unwrap();
+        let mut excluded: Vec<String> = scope.excluded.iter().filter(|p| snapshot.full.file(p).is_some()).cloned().collect();
+        if excluded.len() == files {
+            excluded.clear();
+        }
+        *scope = build_scope(&snapshot.full, excluded);
+        st.save_scope(&scope.excluded);
+    }
+    *st.change.write().unwrap() = Arc::new(snapshot);
+    st.summary.lock().unwrap().text = None;
+    st.flows.lock().unwrap().flows = None;
+    Ok(Json(json!({ "changed": true, "files": files })))
 }
 
 // ---- summary ----------------------------------------------------------------
@@ -1478,7 +1569,7 @@ written as one human explaining to another.\n\
 Investigate with the repository tools when the diff alone is not enough; verify cited line numbers by \
 reading the files.\n",
     );
-    p.push_str(&diff_block(&st.full));
+    p.push_str(&diff_block(&st.change().full));
     p
 }
 
@@ -1514,6 +1605,8 @@ fn spawn_summary(st: Arc<AppState>) -> ApiResult {
     };
     let st2 = st.clone();
     let engine = st.engine();
+    // A local change re-read meanwhile makes this summary stale: shown, not kept.
+    let key = st.change().key.clone();
     tokio::spawn(async move {
         let prompt = summary_prompt(&st2);
         let result = async {
@@ -1526,13 +1619,16 @@ fn spawn_summary(st: Arc<AppState>) -> ApiResult {
         .await;
         match result {
             Ok(summary) => {
+                let current = st2.change().key == key;
                 {
                     let mut s = st2.summary.lock().unwrap();
-                    s.text = Some(summary.clone());
+                    if current {
+                        s.text = Some(summary.clone());
+                    }
                     s.job = None;
                 }
-                let stored = StoredSummary { head: st2.head_sha.clone(), summary: summary.clone() };
-                if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+                let stored = StoredSummary { head: key, summary: summary.clone() };
+                if let (true, Ok(bytes)) = (current, serde_json::to_vec_pretty(&stored)) {
                     let _ = fs::write(&st2.summary_file, bytes);
                 }
                 job.finish(Ok(json!({ "summary": summary })));
@@ -1586,8 +1682,9 @@ async fn generate_flows(State(st): State<Arc<AppState>>) -> ApiResult {
     };
     let st2 = st.clone();
     let engine = st.engine();
+    let change = st.change();
     tokio::spawn(async move {
-        let prompt = flows::prompt(&subject_block(&st2), &diff_block(&st2.full));
+        let prompt = flows::prompt(&subject_block(&st2), &diff_block(&change.full));
         let result = async {
             let session = engine.start_session(&name).await?;
             let progress = |line: String| job.push(line);
@@ -1598,15 +1695,19 @@ async fn generate_flows(State(st): State<Arc<AppState>>) -> ApiResult {
         .await;
         match result {
             Ok(mut found) => {
-                flows::verify(&st2.root, &st2.full, &mut found);
-                let stored = StoredFlows { head: st2.head_sha.clone(), version: flows::VERSION, flows: found.clone() };
-                if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+                flows::verify(&st2.root, &change.full, &mut found);
+                // A local change re-read meanwhile makes these flows stale: shown, not kept.
+                let current = st2.change().key == change.key;
+                let stored = StoredFlows { head: change.key.clone(), version: flows::VERSION, flows: found.clone() };
+                if let (true, Ok(bytes)) = (current, serde_json::to_vec_pretty(&stored)) {
                     let _ = fs::write(&st2.flows_file, bytes);
                 }
                 let response = json!({ "flows": found.flows });
                 {
                     let mut f = st2.flows.lock().unwrap();
-                    f.flows = Some(found);
+                    if current {
+                        f.flows = Some(found);
+                    }
                     f.job = None;
                 }
                 job.finish(Ok(response));

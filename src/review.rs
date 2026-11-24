@@ -84,15 +84,17 @@ impl Subject {
         }
     }
 
-    pub fn local(branch: &str, sha: &str, dirty: bool) -> Subject {
-        Subject {
-            heading: format!(
-                "The reviewer is reviewing the local change on branch `{branch}` at commit {}{} (diffed against its merge base with the default branch).\n",
-                &sha[..sha.len().min(12)],
-                if dirty { ", plus uncommitted edits" } else { "" },
-            ),
-            description: String::new(),
-        }
+    pub fn local(branch: &str, sha: &str, dirty: bool, base: &str) -> Subject {
+        let sha = &sha[..sha.len().min(12)];
+        let heading = if base == "HEAD" {
+            format!("The reviewer is reviewing the uncommitted changes (staged, unstaged and untracked files) on branch `{branch}`, against commit {sha}.\n")
+        } else {
+            format!(
+                "The reviewer is reviewing the local change on branch `{branch}` at commit {sha}{} (diffed against its merge base with `{base}`).\n",
+                if dirty { ", plus uncommitted edits and untracked files" } else { "" },
+            )
+        };
+        Subject { heading, description: String::new() }
     }
 }
 

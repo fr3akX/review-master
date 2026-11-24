@@ -277,7 +277,7 @@ button.chip.engine:hover { border-color: var(--fg-faint); color: var(--fg); }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   font-size: 13px;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .banner.ok { background: var(--add-bg); border-color: var(--green); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); }
@@ -733,6 +733,7 @@ body.drawer-open .viewer { right: var(--drawer-w); }
 .mermaid-box[data-drawn="pending"]::before { content: "Drawing diagram…"; color: var(--fg-faint); font-size: 12px; }
 .mermaid-box svg { max-width: 100%; height: auto; }
 .mermaid-error { margin-bottom: 4px; color: var(--red); font-size: 12px; }
+.mermaid-scratch { position: fixed; top: 0; left: -100000px; width: 1200px; visibility: hidden; }
 
 .file-notes {
   margin: 8px 12px;

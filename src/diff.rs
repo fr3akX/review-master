@@ -157,6 +157,16 @@ impl Pending {
     }
 }
 
+/// Drop files matching `--exclude` globs from the model, in place; the dropped paths.
+pub fn apply_excludes(model: &mut Model, exclude: &[String]) -> Result<Vec<String>, String> {
+    let mut set = globset::GlobSetBuilder::new();
+    for glob in exclude {
+        set.add(globset::Glob::new(glob).map_err(|e| format!("--exclude {glob}: {e}"))?);
+    }
+    let set = set.build().map_err(|e| e.to_string())?;
+    Ok(model.retain(|f| !set.is_match(&f.path)))
+}
+
 impl Model {
     pub fn parse(text: &str) -> Model {
         let mut model = Model::default();
